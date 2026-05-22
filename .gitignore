@@ -1,0 +1,10 @@
+target/
+.DS_Store
+*~
+*#
+.cargo
+.task
+
+data/store/kv/*
+data/perf-store/*
+data/perf-logs/*

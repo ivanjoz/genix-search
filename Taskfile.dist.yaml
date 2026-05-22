@@ -1,0 +1,54 @@
+# See <https://taskfile.dev/usage> and <https://taskfile.dev/reference/schema>
+# to find all keys and their usage.
+version: "3"
+
+env:
+  SELF: task {{ .ALIAS | default .TASK }} --
+
+tasks:
+  doc:open:
+    desc: Build and open Cargo docs.
+    aliases: [doc]
+    cmd: cargo doc --no-deps --lib --open
+
+  perf:
+    desc: Run the GenixSearch perf rig (1k → 10k → 50k ingest + query phases).
+    cmd: scripts/perf/run_perf.sh
+
+  ci:
+    desc: Runs all CI checks.
+    cmds:
+      - task: lint:deps
+      - cargo fmt --check
+      - cargo clippy --no-default-features
+      - cargo build --locked --no-default-features
+      - cargo test --locked --no-default-features
+
+  lint:deps:
+    desc: Lints the dependency graph (advisories, licenses, supply-chain).
+    cmd: cargo deny check --show-stats
+    sources:
+      - Cargo.toml
+      - Cargo.lock
+    preconditions:
+      - sh: command -v cargo-deny >/dev/null
+        msg: "`cargo deny` is required. Install using `cargo install cargo-deny --locked`."
+
+  lint:md:
+    desc: Lints Markdown files. You can pass a rule name to check it individually.
+    aliases: [lint:md:*]
+    silent: true
+    cmd: markdownlint-cli2 '**/*.md' '!target' '!LICENSE.md' 2>&1{{ if .MATCH }} | { ! grep {{ index .MATCH 0 }}; }{{ end }}
+    preconditions:
+      - sh: command -v markdownlint-cli2 >/dev/null
+        msg: "`markdownlint-cli2` is required. See <https://github.com/DavidAnson/markdownlint-cli2#install>."
+
+  dev:doc:
+    desc: Rebuild Cargo docs on source file changes.
+    aliases: [doc:watch]
+    preconditions:
+      - sh: command -v cargo-watch >/dev/null 2>&1
+        msg: "Install `cargo-watch` using `cargo install cargo-watch`."
+    cmds:
+      - task: doc:open
+      - cmd: cargo watch -x 'doc --no-deps --lib'

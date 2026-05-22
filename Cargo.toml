@@ -1,0 +1,64 @@
+[package]
+name = "genixsearch"
+version = "0.1.0"
+description = "Compact, lossy, ranked search backend optimized for Spanish product names."
+readme = "README.md"
+license = "MPL-2.0"
+edition = "2024"
+rust-version = "1.95.0"
+keywords = ["search", "query", "server", "index"]
+categories = ["database-implementations", "web-programming"]
+authors = [
+    "Ivan J. Angulo <ivan@un.pe>",
+]
+
+[lib]
+name = "genixsearch"
+path = "src/lib.rs"
+doc = true
+
+[[bin]]
+name = "genixsearch"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+log = "0.4"
+clap = { version = "4", features = ["std", "cargo"] }
+lazy_static = "1"
+serde = { version = "1", features = ["derive", "rc"] }
+rand = "0.10"
+radix = "0.6"
+rocksdb = { version = "0.24", features = ["zstd"] }
+hashbrown = "0.17"
+regex = "1"
+config = { version = "0.15", default-features = false, features = ["toml"] }
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", features = ["signal"] }
+tikv-jemallocator = { version = "0.6", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+
+[features]
+default = ["allocator-jemalloc"]
+allocator-jemalloc = ["tikv-jemallocator"]
+benchmark = []
+
+[profile.dev]
+opt-level = 0
+debug = true
+debug-assertions = true
+
+[profile.release]
+opt-level = 3
+lto = true
+debug = false
+debug-assertions = false
+strip = true
+
+[profile.bench]
+opt-level = 3
+debug = false
+debug-assertions = false
