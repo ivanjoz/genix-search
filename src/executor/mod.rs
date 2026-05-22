@@ -13,6 +13,7 @@ mod macros;
 mod direct;
 mod flushb;
 mod flushc;
+mod scoring;
 mod search;
 
 pub struct Executor {

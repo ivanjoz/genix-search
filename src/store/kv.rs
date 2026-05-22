@@ -24,11 +24,11 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use crate::pair::{
-    PairEntry, PairSignatureRef, WordSlot, compact_pair_bucket_prefix,
-    compact_pair_first_word_prefix, compact_pair_first_word_unit_prefix,
-    compact_pair_second_word_unit_prefix, decode_doc_ids, decode_reverse_refs,
-    doc_reverse_bucket_prefix, doc_reverse_key, encode_doc_ids, encode_reverse_refs,
-    extended_pair_bucket_prefix, extended_pair_first_word_prefix,
+    PairEntry, PairSignatureRef, POSTING_WIDTH, PostingMeta, WordSlot,
+    compact_pair_bucket_prefix, compact_pair_first_word_prefix,
+    compact_pair_first_word_unit_prefix, compact_pair_second_word_unit_prefix, decode_postings,
+    decode_reverse_refs, doc_reverse_bucket_prefix, doc_reverse_key, encode_postings,
+    encode_reverse_refs, extended_pair_bucket_prefix, extended_pair_first_word_prefix,
     extended_pair_first_word_unit_prefix, extended_pair_second_word_unit_prefix, pair_key,
     pair_signature_ref, sortable_doc_id,
 };
@@ -625,7 +625,7 @@ impl<'build> StoreGenericActionBuilder for StoreKVActionBuilder<'build> {
 }
 
 impl<'a> StoreKVAction<'a> {
-    pub fn get_pair_doc_ids(&self, entry: PairEntry) -> Result<Option<Vec<i32>>, ()> {
+    pub fn get_pair_postings(&self, entry: PairEntry) -> Result<Option<Vec<(i32, u8)>>, ()> {
         if let Some(ref store) = self.store {
             let store_key = pair_key(
                 store.collection_hash,
@@ -634,7 +634,7 @@ impl<'a> StoreKVAction<'a> {
             );
 
             match store.get(&store_key) {
-                Ok(Some(value)) => decode_doc_ids(&value).ok_or(()).map(Some),
+                Ok(Some(value)) => decode_postings(&value).ok_or(()).map(Some),
                 Ok(None) => Ok(None),
                 Err(err) => {
                     error!("error getting direct pair posting with trace: {}", err);
@@ -647,22 +647,26 @@ impl<'a> StoreKVAction<'a> {
         }
     }
 
-    pub fn set_pair_doc_ids(&self, entry: PairEntry, doc_ids: &[i32]) -> Result<(), ()> {
+    pub fn set_pair_postings(
+        &self,
+        entry: PairEntry,
+        postings: &[(i32, u8)],
+    ) -> Result<(), ()> {
         if let Some(ref store) = self.store {
             let store_key = pair_key(
                 store.collection_hash,
                 bucket_str_to_hash(self.bucket.as_str()),
                 entry,
             );
-            let doc_ids_encoded = encode_doc_ids(doc_ids);
+            let encoded = encode_postings(postings);
 
-            store.put(&store_key, &doc_ids_encoded).or(Err(()))
+            store.put(&store_key, &encoded).or(Err(()))
         } else {
             Err(())
         }
     }
 
-    pub fn delete_pair_doc_ids(&self, entry: PairEntry) -> Result<(), ()> {
+    pub fn delete_pair_postings(&self, entry: PairEntry) -> Result<(), ()> {
         if let Some(ref store) = self.store {
             let store_key = pair_key(
                 store.collection_hash,
@@ -676,11 +680,11 @@ impl<'a> StoreKVAction<'a> {
         }
     }
 
-    pub fn scan_pair_doc_ids_by_first_word(
+    pub fn scan_pair_postings_by_first_word(
         &self,
         word: WordSlot,
         value_budget: usize,
-    ) -> Result<Vec<i32>, ()> {
+    ) -> Result<Vec<(i32, u8)>, ()> {
         if let Some(ref store) = self.store {
             let collection_hash = store.collection_hash;
             let bucket_hash = bucket_str_to_hash(self.bucket.as_str());
@@ -706,17 +710,17 @@ impl<'a> StoreKVAction<'a> {
                 )),
             }
 
-            self.scan_doc_ids_for_prefixes(prefixes, value_budget)
+            self.scan_postings_for_prefixes(prefixes, value_budget)
         } else {
             Ok(Vec::new())
         }
     }
 
-    pub fn scan_pair_doc_ids_by_first_word_units(
+    pub fn scan_pair_postings_by_first_word_units(
         &self,
         units: &[u8],
         value_budget: usize,
-    ) -> Result<Vec<i32>, ()> {
+    ) -> Result<Vec<(i32, u8)>, ()> {
         if let Some(ref store) = self.store {
             let collection_hash = store.collection_hash;
             let bucket_hash = bucket_str_to_hash(self.bucket.as_str());
@@ -743,18 +747,18 @@ impl<'a> StoreKVAction<'a> {
                 units,
             ));
 
-            self.scan_doc_ids_for_prefixes(prefixes, value_budget)
+            self.scan_postings_for_prefixes(prefixes, value_budget)
         } else {
             Ok(Vec::new())
         }
     }
 
-    pub fn scan_pair_doc_ids_by_second_word_units(
+    pub fn scan_pair_postings_by_second_word_units(
         &self,
         first_word: WordSlot,
         second_units: &[u8],
         value_budget: usize,
-    ) -> Result<Vec<i32>, ()> {
+    ) -> Result<Vec<(i32, u8)>, ()> {
         if let Some(ref store) = self.store {
             let collection_hash = store.collection_hash;
             let bucket_hash = bucket_str_to_hash(self.bucket.as_str());
@@ -789,7 +793,7 @@ impl<'a> StoreKVAction<'a> {
                 second_units,
             ));
 
-            self.scan_doc_ids_for_prefixes(prefixes, value_budget)
+            self.scan_postings_for_prefixes(prefixes, value_budget)
         } else {
             Ok(Vec::new())
         }
@@ -846,35 +850,44 @@ impl<'a> StoreKVAction<'a> {
         }
     }
 
-    pub fn insert_pair_doc_id(&self, entry: PairEntry, doc_id: i32) -> Result<(), ()> {
-        let mut doc_ids = self.get_pair_doc_ids(entry)?.unwrap_or_default();
+    pub fn insert_pair_posting(
+        &self,
+        entry: PairEntry,
+        doc_id: i32,
+        meta: PostingMeta,
+    ) -> Result<(), ()> {
+        let mut postings = self.get_pair_postings(entry)?.unwrap_or_default();
+        let meta_byte = meta.pack();
 
-        if !doc_ids.contains(&doc_id) {
-            doc_ids.push(doc_id);
-            doc_ids.sort_by_key(|doc_id| sortable_doc_id(*doc_id));
-            self.set_pair_doc_ids(entry, &doc_ids)?;
+        if !postings
+            .iter()
+            .any(|(existing_id, existing_meta)| *existing_id == doc_id && *existing_meta == meta_byte)
+        {
+            postings.push((doc_id, meta_byte));
+            postings.sort_by_key(|(doc_id, _)| sortable_doc_id(*doc_id));
+            self.set_pair_postings(entry, &postings)?;
         }
 
         Ok(())
     }
 
-    pub fn remove_pair_doc_id(&self, entry: PairEntry, doc_id: i32) -> Result<bool, ()> {
-        let Some(mut doc_ids) = self.get_pair_doc_ids(entry)? else {
+    pub fn remove_pair_postings_for_doc(&self, entry: PairEntry, doc_id: i32) -> Result<bool, ()> {
+        let Some(mut postings) = self.get_pair_postings(entry)? else {
             return Ok(false);
         };
 
-        let original_len = doc_ids.len();
+        let original_len = postings.len();
 
-        doc_ids.retain(|current_doc_id| *current_doc_id != doc_id);
+        postings.retain(|(current_doc_id, _)| *current_doc_id != doc_id);
 
-        if doc_ids.len() == original_len {
+        if postings.len() == original_len {
             return Ok(false);
         }
 
-        if doc_ids.is_empty() {
-            self.delete_pair_doc_ids(entry)?;
+        if postings.is_empty() {
+            self.delete_pair_postings(entry)?;
         } else {
-            self.set_pair_doc_ids(entry, &doc_ids)?;
+            self.set_pair_postings(entry, &postings)?;
         }
 
         Ok(true)
@@ -883,15 +896,18 @@ impl<'a> StoreKVAction<'a> {
     pub fn replace_direct_pair_document(
         &self,
         doc_id: i32,
-        entries: &[PairEntry],
+        entries: &[(PairEntry, PostingMeta)],
     ) -> Result<(), ()> {
         self.delete_direct_pair_document(doc_id)?;
 
-        for entry in entries {
-            self.insert_pair_doc_id(*entry, doc_id)?;
+        for (entry, meta) in entries {
+            self.insert_pair_posting(*entry, doc_id, *meta)?;
         }
 
-        let refs: Vec<PairSignatureRef> = entries.iter().copied().map(pair_signature_ref).collect();
+        let refs: Vec<PairSignatureRef> = entries
+            .iter()
+            .map(|(entry, meta)| pair_signature_ref(*entry, meta.kind))
+            .collect();
 
         self.set_doc_reverse_refs(doc_id, &refs)
     }
@@ -904,7 +920,7 @@ impl<'a> StoreKVAction<'a> {
         let mut removed = 0;
 
         for signature_ref in &refs {
-            if self.remove_pair_doc_id((*signature_ref).into(), doc_id)? {
+            if self.remove_pair_postings_for_doc((*signature_ref).into(), doc_id)? {
                 removed += 1;
             }
         }
@@ -914,39 +930,40 @@ impl<'a> StoreKVAction<'a> {
         Ok(removed)
     }
 
-    fn scan_doc_ids_for_prefixes(
+    fn scan_postings_for_prefixes(
         &self,
         prefixes: Vec<Vec<u8>>,
         value_budget: usize,
-    ) -> Result<Vec<i32>, ()> {
+    ) -> Result<Vec<(i32, u8)>, ()> {
         let Some(ref store) = self.store else {
             return Ok(Vec::new());
         };
-        let mut doc_ids = Vec::new();
+        let posting_budget = value_budget.saturating_mul(POSTING_WIDTH).max(POSTING_WIDTH);
+        let mut postings = Vec::new();
 
         for prefix in prefixes {
             let values = store
-                .scan_prefix_values(&prefix, value_budget)
+                .scan_prefix_values(&prefix, posting_budget)
                 .map_err(|err| {
                     error!("error scanning direct pair prefix with trace: {}", err);
                 })?;
 
             for value in values {
-                if let Some(mut value_doc_ids) = decode_doc_ids(&value) {
-                    doc_ids.append(&mut value_doc_ids);
+                if let Some(mut value_postings) = decode_postings(&value) {
+                    postings.append(&mut value_postings);
                 } else {
                     return Err(());
                 }
 
-                if doc_ids.len() >= value_budget {
-                    doc_ids.truncate(value_budget);
+                if postings.len() >= value_budget {
+                    postings.truncate(value_budget);
 
-                    return Ok(doc_ids);
+                    return Ok(postings);
                 }
             }
         }
 
-        Ok(doc_ids)
+        Ok(postings)
     }
 
     pub fn batch_erase_bucket(&self) -> Result<u32, ()> {
@@ -982,7 +999,6 @@ impl<'a> StoreKVAction<'a> {
 impl From<PairSignatureRef> for PairEntry {
     fn from(signature_ref: PairSignatureRef) -> Self {
         PairEntry {
-            pair_kind: signature_ref.pair_kind,
             word1: signature_ref.word1,
             word2: signature_ref.word2,
         }
@@ -1030,7 +1046,7 @@ fn fnv_hash_32(bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pair::{PairKind, encode_text, pair_entries};
+    use crate::pair::{PairKind, PostingMeta, encode_text, pair_entries};
 
     #[test]
     fn it_acquires_database() {
@@ -1079,18 +1095,25 @@ mod tests {
         let entries = pair_entries(&encode_text("tequila sunrise"));
 
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].pair_kind, PairKind::Adjacent);
-        assert_eq!(entries[1].pair_kind, PairKind::Wrap);
+        assert_eq!(entries[0].1.kind, PairKind::Adjacent);
+        assert_eq!(entries[1].1.kind, PairKind::Wrap);
         assert!(action.replace_direct_pair_document(-7, &entries).is_ok());
 
-        assert_eq!(action.get_pair_doc_ids(entries[0]).unwrap(), Some(vec![-7]));
+        let adjacent_postings = action.get_pair_postings(entries[0].0).unwrap().unwrap();
+        assert_eq!(adjacent_postings.len(), 1);
+        assert_eq!(adjacent_postings[0].0, -7);
+        assert_eq!(
+            PostingMeta::unpack(adjacent_postings[0].1).kind,
+            PairKind::Adjacent
+        );
+
         assert_eq!(
             action.get_doc_reverse_refs(-7).unwrap().unwrap().len(),
             entries.len()
         );
 
         assert_eq!(action.delete_direct_pair_document(-7), Ok(2));
-        assert_eq!(action.get_pair_doc_ids(entries[0]).unwrap(), None);
+        assert_eq!(action.get_pair_postings(entries[0].0).unwrap(), None);
         assert_eq!(action.get_doc_reverse_refs(-7).unwrap(), None);
     }
 
@@ -1121,11 +1144,11 @@ mod tests {
                 .is_ok()
         );
 
-        assert_eq!(action.get_pair_doc_ids(old_entries[0]).unwrap(), None);
-        assert_eq!(
-            action.get_pair_doc_ids(new_entries[0]).unwrap(),
-            Some(vec![42])
-        );
+        assert_eq!(action.get_pair_postings(old_entries[0].0).unwrap(), None);
+
+        let new_postings = action.get_pair_postings(new_entries[0].0).unwrap().unwrap();
+        assert_eq!(new_postings.len(), 1);
+        assert_eq!(new_postings[0].0, 42);
     }
 
     fn test_kv_store_config() -> Arc<crate::config::ConfigStoreKV> {

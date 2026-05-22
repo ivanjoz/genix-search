@@ -7,7 +7,11 @@
 
 use hashbrown::{HashMap, HashSet};
 
-use crate::pair::{PairEntry, PairKind, WordSignature, encode_prefix_text, pair_entries};
+use super::scoring::{
+    ADJACENT_PAIR_SCORE, PREFIX_SCORE, QUERY_FIRST_WORD_BONUS, WRAP_PAIR_SCORE,
+    doc_position_bonus, query_position_bonus, word_base_score,
+};
+use crate::pair::{PairEntry, PairKind, PostingMeta, encode_prefix_text};
 use crate::query::{QuerySearchID, QuerySearchLimit, QuerySearchOffset};
 use crate::store::item::StoreItem;
 use crate::store::kv::{StoreKVAcquireMode, StoreKVActionBuilder};
@@ -46,78 +50,123 @@ impl super::Executor {
 
                 let candidate_budget = usize::from(limit).saturating_mul(10).clamp(500, 5000);
                 let mut scores: HashMap<i32, DirectScore> = HashMap::new();
+                let mut last_word_doc_ids: HashSet<i32> = HashSet::new();
 
-                for word in &words {
-                    let doc_ids =
-                        kv_action.scan_pair_doc_ids_by_first_word(word.slot(), candidate_budget)?;
+                for (position, word) in words.iter().enumerate() {
+                    let mut best_positions: HashMap<i32, u8> = HashMap::new();
 
-                    for doc_id in doc_ids {
-                        let score = scores.entry(doc_id).or_default();
+                    for (doc_id, meta_byte) in kv_action
+                        .scan_pair_postings_by_first_word(word.slot(), candidate_budget)?
+                    {
+                        let w1_pos = PostingMeta::unpack(meta_byte).w1_pos;
 
-                        score.score += match word.signature {
-                            WordSignature::Short(_) => 10,
-                            WordSignature::Long(_) => 12,
-                        };
+                        best_positions
+                            .entry(doc_id)
+                            .and_modify(|current| {
+                                if w1_pos < *current {
+                                    *current = w1_pos;
+                                }
+                            })
+                            .or_insert(w1_pos);
+                    }
+
+                    let delta = word_base_score(&word.token) + query_position_bonus(position);
+
+                    for (doc_id, best_pos) in &best_positions {
+                        let score = scores.entry(*doc_id).or_default();
+
+                        score.score += delta + doc_position_bonus(*best_pos);
                         score.single_matches += 1;
+                    }
+
+                    if position + 1 == words.len() {
+                        last_word_doc_ids = best_positions.keys().copied().collect();
                     }
                 }
 
                 if let Some(prefix) = prefix {
-                    let mut prefix_doc_ids = HashSet::new();
+                    let mut prefix_best_positions: HashMap<i32, u8> = HashMap::new();
+                    let use_second_word_pos = prefix.explicit && words.last().is_some();
 
                     for unit_prefix in prefix.unit_prefixes {
-                        let doc_ids = if let Some(last_word) = words.last() {
-                            kv_action.scan_pair_doc_ids_by_second_word_units(
-                                last_word.slot(),
+                        let postings = match (prefix.explicit, words.last()) {
+                            (true, Some(last_word)) => kv_action
+                                .scan_pair_postings_by_second_word_units(
+                                    last_word.slot(),
+                                    &unit_prefix,
+                                    candidate_budget,
+                                )?,
+                            _ => kv_action.scan_pair_postings_by_first_word_units(
                                 &unit_prefix,
                                 candidate_budget,
-                            )?
-                        } else {
-                            kv_action.scan_pair_doc_ids_by_first_word_units(
-                                &unit_prefix,
-                                candidate_budget,
-                            )?
+                            )?,
                         };
 
-                        prefix_doc_ids.extend(doc_ids);
+                        for (doc_id, meta_byte) in postings {
+                            let meta = PostingMeta::unpack(meta_byte);
+                            let pos = if use_second_word_pos {
+                                meta.w2_pos
+                            } else {
+                                meta.w1_pos
+                            };
+
+                            prefix_best_positions
+                                .entry(doc_id)
+                                .and_modify(|current| {
+                                    if pos < *current {
+                                        *current = pos;
+                                    }
+                                })
+                                .or_insert(pos);
+                        }
                     }
 
-                    for doc_id in &prefix_doc_ids {
+                    let prefix_bonus = if words.is_empty() || (!prefix.explicit && words.len() == 1)
+                    {
+                        QUERY_FIRST_WORD_BONUS
+                    } else {
+                        0
+                    };
+
+                    for (doc_id, best_pos) in &prefix_best_positions {
+                        if !prefix.explicit && last_word_doc_ids.contains(doc_id) {
+                            continue;
+                        }
+
                         let score = scores.entry(*doc_id).or_default();
 
-                        score.score += 15;
+                        score.score += PREFIX_SCORE + prefix_bonus + doc_position_bonus(*best_pos);
                         score.pair_matches += 1;
                     }
 
-                    scores.retain(|doc_id, _| prefix_doc_ids.contains(doc_id));
+                    if prefix.explicit {
+                        let prefix_doc_ids: HashSet<i32> =
+                            prefix_best_positions.keys().copied().collect();
+
+                        scores.retain(|doc_id, _| prefix_doc_ids.contains(doc_id));
+                    }
                 }
 
-                for entry in pair_entries(&words)
-                    .into_iter()
-                    .filter(|entry| entry.pair_kind == PairKind::Adjacent)
-                {
-                    if let Some(doc_ids) = kv_action.get_pair_doc_ids(entry)? {
-                        for doc_id in doc_ids {
-                            let score = scores.entry(doc_id).or_default();
-
-                            score.score += 30;
-                            score.pair_matches += 1;
-                        }
-                    }
-
-                    let wrap_entry = PairEntry {
-                        pair_kind: PairKind::Wrap,
-                        word1: entry.word1,
-                        word2: entry.word2,
+                for window in words.windows(2) {
+                    let entry = PairEntry {
+                        word1: window[0].slot(),
+                        word2: window[1].slot(),
                     };
 
-                    if let Some(doc_ids) = kv_action.get_pair_doc_ids(wrap_entry)? {
-                        for doc_id in doc_ids {
-                            let score = scores.entry(doc_id).or_default();
+                    let Some(postings) = kv_action.get_pair_postings(entry)? else {
+                        continue;
+                    };
 
-                            score.score += 6;
-                            score.pair_matches += 1;
-                        }
+                    for (doc_id, meta_byte) in postings {
+                        let meta = PostingMeta::unpack(meta_byte);
+                        let delta = match meta.kind {
+                            PairKind::Adjacent => ADJACENT_PAIR_SCORE,
+                            PairKind::Wrap => WRAP_PAIR_SCORE,
+                        };
+                        let score = scores.entry(doc_id).or_default();
+
+                        score.score += delta;
+                        score.pair_matches += 1;
                     }
                 }
 
@@ -197,8 +246,8 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert!(result.starts_with("1|50"));
-        assert!(result.contains("2|20"));
+        assert!(result.starts_with("1|39"));
+        assert!(result.contains("2|32"));
     }
 
     #[test]
@@ -235,7 +284,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert!(result.starts_with("10|25"));
+        assert!(result.starts_with("10|26"));
         assert!(!result.contains("20|"));
     }
 
@@ -285,8 +334,8 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert!(adjacent.starts_with("1|50"));
-        assert!(reversed.starts_with("1|26"));
+        assert!(adjacent.starts_with("1|39"));
+        assert!(reversed.starts_with("1|35"));
     }
 
     #[test]
@@ -323,7 +372,7 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        assert_eq!(result, "100|15");
+        assert_eq!(result, "100|12");
     }
 
     #[test]
@@ -417,6 +466,105 @@ mod tests {
         assert!(result.contains(&format!("{}|", i32::MIN)));
         assert!(result.contains("-1|"));
         assert!(result.contains(&format!("{}|", i32::MAX)));
+    }
+
+    #[test]
+    fn it_ranks_first_query_word_above_trailing_stopword_matches() {
+        let executor = test_executor();
+        let collection = "c:test:direct-first-word";
+        let bucket = "b:test:direct-first-word";
+
+        StoreOperationDispatch::dispatch(
+            Query::pushi(collection, bucket, "1", "pimienta negra molida").unwrap(),
+            &executor,
+        )
+        .unwrap();
+        StoreOperationDispatch::dispatch(
+            Query::pushi(collection, bucket, "2", "bateria de cocina").unwrap(),
+            &executor,
+        )
+        .unwrap();
+
+        let result = StoreOperationDispatch::dispatch(
+            Query::search(
+                "query:test:direct-first-word",
+                collection,
+                bucket,
+                "pimienta roja de cocina",
+                10,
+                0,
+            )
+            .unwrap(),
+            &executor,
+        )
+        .unwrap()
+        .unwrap();
+
+        let first_id = result
+            .split_whitespace()
+            .next()
+            .and_then(|token| token.split('|').next())
+            .expect("at least one result");
+        assert_eq!(first_id, "1");
+    }
+
+    #[test]
+    fn it_auto_prefix_matches_last_query_word_partial() {
+        let executor = test_executor();
+        let collection = "c:test:direct-auto-prefix";
+        let bucket = "b:test:direct-auto-prefix";
+
+        StoreOperationDispatch::dispatch(
+            Query::pushi(collection, bucket, "1", "pimienta negra molida").unwrap(),
+            &executor,
+        )
+        .unwrap();
+        StoreOperationDispatch::dispatch(
+            Query::pushi(collection, bucket, "2", "pimienta de cerdo").unwrap(),
+            &executor,
+        )
+        .unwrap();
+
+        let result = StoreOperationDispatch::dispatch(
+            Query::search(
+                "query:test:direct-auto-prefix",
+                collection,
+                bucket,
+                "pimienta moli",
+                10,
+                0,
+            )
+            .unwrap(),
+            &executor,
+        )
+        .unwrap()
+        .unwrap();
+
+        let tokens: Vec<&str> = result.split_whitespace().collect();
+        assert!(
+            tokens.iter().any(|t| t.starts_with("1|")),
+            "doc 1 (with `molida`) should appear: {}",
+            result
+        );
+        assert!(
+            tokens.iter().any(|t| t.starts_with("2|")),
+            "doc 2 (without `moli*`) should still appear: {}",
+            result
+        );
+
+        let score = |prefix: &str| -> u32 {
+            tokens
+                .iter()
+                .find(|t| t.starts_with(prefix))
+                .and_then(|t| t.split('|').nth(1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0)
+        };
+        assert!(
+            score("1|") > score("2|"),
+            "doc 1 (molida) must outrank doc 2 (no moli*): {}",
+            result
+        );
     }
 
     fn test_executor() -> Executor {

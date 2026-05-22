@@ -42,9 +42,48 @@ pub struct PairSignatureRef {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PairEntry {
-    pub pair_kind: PairKind,
     pub word1: WordSlot,
     pub word2: WordSlot,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PostingMeta {
+    pub kind: PairKind,
+    pub w1_pos: u8,
+    pub w2_pos: u8,
+}
+
+impl PostingMeta {
+    pub fn new(kind: PairKind, w1_pos: usize, w2_pos: usize) -> Self {
+        Self {
+            kind,
+            w1_pos: w1_pos.min(3) as u8,
+            w2_pos: w2_pos.min(3) as u8,
+        }
+    }
+
+    pub fn pack(&self) -> u8 {
+        let kind_bit: u8 = match self.kind {
+            PairKind::Adjacent => 0,
+            PairKind::Wrap => 1,
+        };
+
+        (kind_bit << 7) | ((self.w1_pos & 0b11) << 5) | ((self.w2_pos & 0b11) << 3)
+    }
+
+    pub fn unpack(byte: u8) -> Self {
+        let kind = if (byte & 0b1000_0000) != 0 {
+            PairKind::Wrap
+        } else {
+            PairKind::Adjacent
+        };
+
+        Self {
+            kind,
+            w1_pos: (byte >> 5) & 0b11,
+            w2_pos: (byte >> 3) & 0b11,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -58,6 +97,7 @@ pub struct EncodedWord {
 pub struct EncodedPrefix {
     pub token: String,
     pub unit_prefixes: Vec<Vec<u8>>,
+    pub explicit: bool,
 }
 
 pub fn normalize(input: &str) -> Vec<String> {
@@ -99,6 +139,7 @@ pub fn normalize(input: &str) -> Vec<String> {
 pub fn encode_text(input: &str) -> Vec<EncodedWord> {
     normalize(input)
         .into_iter()
+        .filter(|token| !is_spanish_stopword(token))
         .filter_map(|token| encode_normalized_token(&token))
         .collect()
 }
@@ -106,8 +147,11 @@ pub fn encode_text(input: &str) -> Vec<EncodedWord> {
 pub fn encode_prefix_text(input: &str) -> (Vec<EncodedWord>, Option<EncodedPrefix>) {
     let mut complete_terms = Vec::new();
     let mut prefix = None;
+    let mut raw_term_count = 0usize;
 
     for raw_term in input.split_whitespace() {
+        raw_term_count += 1;
+
         if let Some(prefix_term) = raw_term.strip_suffix('*') {
             if prefix.is_none() {
                 prefix = encode_prefix_token(prefix_term);
@@ -116,12 +160,70 @@ pub fn encode_prefix_text(input: &str) -> (Vec<EncodedWord>, Option<EncodedPrefi
             complete_terms.extend(
                 normalize(raw_term)
                     .into_iter()
+                    .filter(|token| !is_spanish_stopword(token))
                     .filter_map(|token| encode_normalized_token(&token)),
             );
         }
     }
 
+    if prefix.is_none() && raw_term_count >= 1 {
+        if let Some(last) = complete_terms.last() {
+            if let Some(mut auto) = encode_prefix_token(&last.token) {
+                auto.explicit = false;
+                prefix = Some(auto);
+            }
+        }
+    }
+
     (complete_terms, prefix)
+}
+
+pub fn is_spanish_stopword(token: &str) -> bool {
+    matches!(
+        token,
+        "a" | "al"
+            | "con"
+            | "de"
+            | "del"
+            | "desde"
+            | "el"
+            | "en"
+            | "es"
+            | "esa"
+            | "ese"
+            | "eso"
+            | "esos"
+            | "esta"
+            | "esto"
+            | "fue"
+            | "ha"
+            | "la"
+            | "las"
+            | "le"
+            | "les"
+            | "lo"
+            | "los"
+            | "me"
+            | "mi"
+            | "mis"
+            | "ni"
+            | "no"
+            | "nos"
+            | "o"
+            | "para"
+            | "por"
+            | "que"
+            | "se"
+            | "ser"
+            | "si"
+            | "sin"
+            | "son"
+            | "soy"
+            | "su"
+            | "sus"
+            | "tu"
+            | "y"
+    )
 }
 
 pub fn encode_prefix_token(input: &str) -> Option<EncodedPrefix> {
@@ -184,30 +286,37 @@ pub fn encode_prefix_token(input: &str) -> Option<EncodedPrefix> {
         Some(EncodedPrefix {
             token,
             unit_prefixes,
+            explicit: true,
         })
     }
 }
 
-pub fn pair_entries(words: &[EncodedWord]) -> Vec<PairEntry> {
+pub fn pair_entries(words: &[EncodedWord]) -> Vec<(PairEntry, PostingMeta)> {
     let mut entries = Vec::new();
 
     if words.is_empty() {
         return entries;
     }
 
-    for pair in words.windows(2) {
-        entries.push(PairEntry {
-            pair_kind: PairKind::Adjacent,
-            word1: pair[0].slot(),
-            word2: pair[1].slot(),
-        });
+    for (index, pair) in words.windows(2).enumerate() {
+        entries.push((
+            PairEntry {
+                word1: pair[0].slot(),
+                word2: pair[1].slot(),
+            },
+            PostingMeta::new(PairKind::Adjacent, index, index + 1),
+        ));
     }
 
-    entries.push(PairEntry {
-        pair_kind: PairKind::Wrap,
-        word1: words[words.len() - 1].slot(),
-        word2: words[0].slot(),
-    });
+    let last_index = words.len() - 1;
+
+    entries.push((
+        PairEntry {
+            word1: words[last_index].slot(),
+            word2: words[0].slot(),
+        },
+        PostingMeta::new(PairKind::Wrap, last_index, 0),
+    ));
 
     entries
 }
@@ -268,16 +377,14 @@ pub fn compact_pair_key(
     bucket_hash: u32,
     word1_sig32: u32,
     word2_sig32: u32,
-    pair_kind: PairKind,
 ) -> Vec<u8> {
-    let mut key = Vec::with_capacity(18);
+    let mut key = Vec::with_capacity(17);
 
     key.push(INDEX_COMPACT_PAIR);
     key.extend_from_slice(&collection_hash.to_be_bytes());
     key.extend_from_slice(&bucket_hash.to_be_bytes());
     key.extend_from_slice(&word1_sig32.to_be_bytes());
     key.extend_from_slice(&word2_sig32.to_be_bytes());
-    key.push(pair_kind as u8);
 
     key
 }
@@ -328,16 +435,14 @@ pub fn extended_pair_key(
     bucket_hash: u32,
     word1: WordSlot,
     word2: WordSlot,
-    pair_kind: PairKind,
 ) -> Vec<u8> {
-    let mut key = Vec::with_capacity(28);
+    let mut key = Vec::with_capacity(27);
 
     key.push(INDEX_EXTENDED_PAIR);
     key.extend_from_slice(&collection_hash.to_be_bytes());
     key.extend_from_slice(&bucket_hash.to_be_bytes());
     encode_word_slot(word1, &mut key);
     encode_word_slot(word2, &mut key);
-    key.push(pair_kind as u8);
 
     key
 }
@@ -391,25 +496,19 @@ pub fn extended_pair_second_word_unit_prefix(
 pub fn pair_key(collection_hash: u32, bucket_hash: u32, entry: PairEntry) -> Vec<u8> {
     match (entry.word1, entry.word2) {
         (WordSlot::Short(word1), WordSlot::Short(word2)) => {
-            compact_pair_key(collection_hash, bucket_hash, word1, word2, entry.pair_kind)
+            compact_pair_key(collection_hash, bucket_hash, word1, word2)
         }
-        _ => extended_pair_key(
-            collection_hash,
-            bucket_hash,
-            entry.word1,
-            entry.word2,
-            entry.pair_kind,
-        ),
+        _ => extended_pair_key(collection_hash, bucket_hash, entry.word1, entry.word2),
     }
 }
 
-pub fn pair_signature_ref(entry: PairEntry) -> PairSignatureRef {
+pub fn pair_signature_ref(entry: PairEntry, pair_kind: PairKind) -> PairSignatureRef {
     PairSignatureRef {
         index: match (entry.word1, entry.word2) {
             (WordSlot::Short(_), WordSlot::Short(_)) => INDEX_COMPACT_PAIR,
             _ => INDEX_EXTENDED_PAIR,
         },
-        pair_kind: entry.pair_kind,
+        pair_kind,
         word1: entry.word1,
         word2: entry.word2,
     }
@@ -434,29 +533,32 @@ pub fn sortable_doc_id(doc_id: i32) -> u32 {
     (doc_id as u32) ^ 0x80000000
 }
 
-pub fn encode_doc_ids(doc_ids: &[i32]) -> Vec<u8> {
-    let mut value = Vec::with_capacity(doc_ids.len() * 4);
+pub const POSTING_WIDTH: usize = 5;
 
-    for doc_id in doc_ids {
+pub fn encode_postings(postings: &[(i32, u8)]) -> Vec<u8> {
+    let mut value = Vec::with_capacity(postings.len() * POSTING_WIDTH);
+
+    for (doc_id, meta) in postings {
         value.extend_from_slice(&sortable_doc_id(*doc_id).to_be_bytes());
+        value.push(*meta);
     }
 
     value
 }
 
-pub fn decode_doc_ids(value: &[u8]) -> Option<Vec<i32>> {
-    if !value.len().is_multiple_of(4) {
+pub fn decode_postings(value: &[u8]) -> Option<Vec<(i32, u8)>> {
+    if !value.len().is_multiple_of(POSTING_WIDTH) {
         return None;
     }
 
     Some(
         value
-            .chunks_exact(4)
+            .chunks_exact(POSTING_WIDTH)
             .map(|chunk| {
                 let sortable =
                     u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) ^ 0x80000000;
 
-                sortable as i32
+                (sortable as i32, chunk[4])
             })
             .collect(),
     )
@@ -516,7 +618,11 @@ pub fn letter_pair_code(first: char, second: char) -> u8 {
     debug_assert!(first.is_ascii_lowercase());
     debug_assert!(second == '$' || second.is_ascii_lowercase());
 
-    let mut code = 0u8;
+    // Code 0 is reserved as the "no unit / padding" byte, so group codes start
+    // at 1. This prevents a 2-unit signature like "soli" → [so, li, 0, 0]
+    // from colliding with a 3-unit signature whose third bigram happens to be
+    // group 0 (e.g. "solear" → [so, le, ar, 0] when code(ar) was 0).
+    let mut code = 1u8;
 
     for (row_first, groups) in LETTER_PAIR_ROWS {
         if row_first.as_bytes()[0] as char == first {
@@ -536,7 +642,7 @@ pub fn letter_pair_code(first: char, second: char) -> u8 {
 }
 
 pub fn compatible_second_letter_codes(first: char, second: char) -> Vec<u8> {
-    let mut code = 0u8;
+    let mut code = 1u8;
     let mut codes = Vec::new();
 
     for (row_first, groups) in LETTER_PAIR_ROWS {
@@ -559,7 +665,7 @@ pub fn compatible_second_letter_codes(first: char, second: char) -> Vec<u8> {
 }
 
 pub fn row_pair_codes(first: char) -> Vec<u8> {
-    let mut code = 0u8;
+    let mut code = 1u8;
 
     for (row_first, groups) in LETTER_PAIR_ROWS {
         if row_first.as_bytes()[0] as char == first {
@@ -573,10 +679,10 @@ pub fn row_pair_codes(first: char) -> Vec<u8> {
 }
 
 pub fn numeric_bucket(number: u64) -> u8 {
-    let mut best_code = 0;
-    let mut best_distance = number;
+    let mut best_code = 1;
+    let mut best_distance = u64::MAX;
 
-    for code in 0..=254 {
+    for code in 1..=254 {
         let boundary = numeric_boundary(code);
         let distance = number.abs_diff(boundary);
 
@@ -590,13 +696,17 @@ pub fn numeric_bucket(number: u64) -> u8 {
 }
 
 pub fn numeric_boundary(code: u8) -> u64 {
+    // Code 0 is reserved as the "no unit / padding" byte (consistent with
+    // letter_pair_code). Code 255 is reserved as NUM_FLAG. The 254 usable
+    // buckets cover the same value ranges as before, shifted up by one code.
     match code {
-        0..=80 => u64::from(code),
-        81..=120 => 80 + (u64::from(code - 80) * 5),
-        121..=180 => 280 + (u64::from(code - 120) * 15),
-        181..=220 => 1180 + (u64::from(code - 180) * 25),
-        221..=240 => 3180 + (u64::from(code - 220) * 50),
-        241..=254 => 8180 + (u64::from(code - 240) * 100),
+        0 => unreachable!("0 is reserved as no-unit / padding"),
+        1..=81 => u64::from(code - 1),
+        82..=121 => 80 + (u64::from(code - 81) * 5),
+        122..=181 => 280 + (u64::from(code - 121) * 15),
+        182..=221 => 1180 + (u64::from(code - 181) * 25),
+        222..=241 => 3180 + (u64::from(code - 221) * 50),
+        242..=254 => 8180 + (u64::from(code - 241) * 100),
         255 => unreachable!("255 is reserved for NUM_FLAG"),
     }
 }
@@ -708,10 +818,10 @@ mod tests {
 
     #[test]
     fn it_assigns_deterministic_letter_pair_codes() {
-        assert_eq!(letter_pair_code('a', 'r'), 0);
-        assert_eq!(letter_pair_code('a', '$'), 24);
-        assert_eq!(letter_pair_code('b', 'o'), 25);
-        assert_eq!(letter_pair_code('z', '$'), 249);
+        assert_eq!(letter_pair_code('a', 'r'), 1);
+        assert_eq!(letter_pair_code('a', '$'), 25);
+        assert_eq!(letter_pair_code('b', 'o'), 26);
+        assert_eq!(letter_pair_code('z', '$'), 250);
         assert_ne!(letter_pair_code('z', '$'), NUM_FLAG);
     }
 
@@ -725,9 +835,9 @@ mod tests {
         );
         assert_eq!(sol.signature, WordSignature::Short(pack_u32(&sol.units)));
 
-        let a = encode_text("a").remove(0);
+        let z = encode_normalized_token("z").unwrap();
 
-        assert_eq!(a.units, vec![letter_pair_code('a', '$')]);
+        assert_eq!(z.units, vec![letter_pair_code('z', '$')]);
     }
 
     #[test]
@@ -746,10 +856,10 @@ mod tests {
 
     #[test]
     fn it_quantizes_numbers_to_nearest_bucket() {
-        assert_eq!(numeric_bucket(0), 0);
-        assert_eq!(numeric_bucket(80), 80);
-        assert_eq!(numeric_bucket(83), 81);
-        assert_eq!(numeric_bucket(85), 81);
+        assert_eq!(numeric_bucket(0), 1);
+        assert_eq!(numeric_bucket(80), 81);
+        assert_eq!(numeric_bucket(83), 82);
+        assert_eq!(numeric_bucket(85), 82);
         assert_eq!(numeric_bucket(9580), 254);
         assert_eq!(numeric_bucket(20_000), 254);
     }
@@ -821,31 +931,69 @@ mod tests {
         let entries = pair_entries(&words);
 
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0].pair_kind, PairKind::Adjacent);
-        assert_eq!(entries[1].pair_kind, PairKind::Adjacent);
-        assert_eq!(entries[2].pair_kind, PairKind::Wrap);
-        assert_eq!(entries[2].word1, words[2].slot());
-        assert_eq!(entries[2].word2, words[0].slot());
+        assert_eq!(entries[0].1.kind, PairKind::Adjacent);
+        assert_eq!(entries[0].1.w1_pos, 0);
+        assert_eq!(entries[0].1.w2_pos, 1);
+        assert_eq!(entries[1].1.kind, PairKind::Adjacent);
+        assert_eq!(entries[1].1.w1_pos, 1);
+        assert_eq!(entries[1].1.w2_pos, 2);
+        assert_eq!(entries[2].1.kind, PairKind::Wrap);
+        assert_eq!(entries[2].1.w1_pos, 2);
+        assert_eq!(entries[2].1.w2_pos, 0);
+        assert_eq!(entries[2].0.word1, words[2].slot());
+        assert_eq!(entries[2].0.word2, words[0].slot());
 
         let one_word = encode_text("tequila");
         let entries = pair_entries(&one_word);
 
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].pair_kind, PairKind::Wrap);
-        assert_eq!(entries[0].word1, one_word[0].slot());
-        assert_eq!(entries[0].word2, one_word[0].slot());
+        assert_eq!(entries[0].1.kind, PairKind::Wrap);
+        assert_eq!(entries[0].1.w1_pos, 0);
+        assert_eq!(entries[0].1.w2_pos, 0);
+        assert_eq!(entries[0].0.word1, one_word[0].slot());
+        assert_eq!(entries[0].0.word2, one_word[0].slot());
+    }
+
+    #[test]
+    fn it_clamps_long_doc_positions_to_three() {
+        let words = encode_text("agua mineral gas con limon caña");
+        let entries = pair_entries(&words);
+        let wrap = entries.last().unwrap();
+
+        assert_eq!(wrap.1.kind, PairKind::Wrap);
+        assert_eq!(wrap.1.w1_pos, 3);
+        assert_eq!(wrap.1.w2_pos, 0);
+
+        let adjacent_at_four = entries.iter().find(|(_, meta)| meta.w1_pos == 3 && meta.kind == PairKind::Adjacent).unwrap();
+        assert_eq!(adjacent_at_four.1.w2_pos, 3);
+    }
+
+    #[test]
+    fn it_packs_and_unpacks_posting_meta() {
+        let cases = [
+            PostingMeta::new(PairKind::Adjacent, 0, 1),
+            PostingMeta::new(PairKind::Adjacent, 3, 3),
+            PostingMeta::new(PairKind::Wrap, 3, 0),
+            PostingMeta::new(PairKind::Wrap, 0, 0),
+        ];
+
+        for meta in cases {
+            assert_eq!(PostingMeta::unpack(meta.pack()), meta);
+        }
+
+        assert_eq!(PostingMeta::new(PairKind::Adjacent, 99, 99).w1_pos, 3);
+        assert_eq!(PostingMeta::new(PairKind::Adjacent, 99, 99).w2_pos, 3);
+
+        let packed = PostingMeta::new(PairKind::Wrap, 2, 1).pack();
+
+        assert_eq!(packed & 0b1000_0000, 0b1000_0000);
+        assert_eq!(packed & 0b0000_0111, 0);
     }
 
     #[test]
     fn it_builds_lexicographic_storage_keys() {
         assert_eq!(
-            compact_pair_key(
-                0x01020304,
-                0x05060708,
-                0x11223344,
-                0x55667788,
-                PairKind::Adjacent
-            ),
+            compact_pair_key(0x01020304, 0x05060708, 0x11223344, 0x55667788),
             vec![
                 INDEX_COMPACT_PAIR,
                 0x01,
@@ -864,7 +1012,6 @@ mod tests {
                 0x66,
                 0x77,
                 0x88,
-                PairKind::Adjacent as u8,
             ]
         );
 
@@ -924,11 +1071,19 @@ mod tests {
 
     #[test]
     fn it_round_trips_doc_id_posting_values() {
-        let doc_ids = vec![i32::MIN, -10, -1, 0, 1, 42, i32::MAX];
-        let encoded = encode_doc_ids(&doc_ids);
+        let postings: Vec<(i32, u8)> = vec![
+            (i32::MIN, 0x00),
+            (-10, PostingMeta::new(PairKind::Adjacent, 0, 1).pack()),
+            (-1, PostingMeta::new(PairKind::Wrap, 3, 0).pack()),
+            (0, 0x00),
+            (1, PostingMeta::new(PairKind::Adjacent, 1, 2).pack()),
+            (42, PostingMeta::new(PairKind::Adjacent, 2, 3).pack()),
+            (i32::MAX, PostingMeta::new(PairKind::Wrap, 3, 3).pack()),
+        ];
+        let encoded = encode_postings(&postings);
 
-        assert_eq!(decode_doc_ids(&encoded), Some(doc_ids));
-        assert_eq!(decode_doc_ids(&encoded[0..encoded.len() - 1]), None);
+        assert_eq!(decode_postings(&encoded), Some(postings));
+        assert_eq!(decode_postings(&encoded[0..encoded.len() - 1]), None);
     }
 
     #[test]
