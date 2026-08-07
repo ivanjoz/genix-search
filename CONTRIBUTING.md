@@ -34,6 +34,17 @@ and the GenixSearch version.
 
 ## Submitting patches
 
+Nothing runs on GitHub: RocksDB builds from source, which is too heavy for a
+hosted runner, so every check is local. Run them yourself before opening a
+pull request:
+
+```sh
+task ci        # cargo deny + fmt --check + clippy + build + test
+```
+
+That needs [Task](https://taskfile.dev) and `cargo-deny`; without them, run the
+steps in `Taskfile.dist.yaml`'s `ci` task by hand.
+
 * Format Rust code with `rustfmt` before opening a pull request.
 * Run `cargo test --lib` and confirm all tests pass.
 * Keep the cleanup principle the rest of the codebase follows: small
