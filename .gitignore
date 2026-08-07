@@ -9,3 +9,5 @@ dist/
 data/store/kv/*
 data/perf-store/*
 data/perf-logs/*
+__pycache__/
+*.pyc
