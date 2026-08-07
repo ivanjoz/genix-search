@@ -43,11 +43,12 @@ machine (x86_64, generic arm64, or arm64 tuned for Ampere Altra / Oracle Cloud
 curl -fsSL https://raw.githubusercontent.com/ivanjoz/genix-search/main/scripts/install.sh | sh
 ```
 
-Or straight into a hardened systemd service:
+Or straight into a hardened systemd service — this one file downloads its own
+binary and config, so nothing else is needed on the host but Python 3:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ivanjoz/genix-search/main/scripts/install.sh \
-    | sudo sh -s -- --service --bind 0.0.0.0:1491
+curl -fsSL https://raw.githubusercontent.com/ivanjoz/genix-search/main/scripts/install_service.py \
+    | sudo python3 - install --bind 0.0.0.0:1491 --auth-password '…'
 ```
 
 See [`PACKAGING.md`](PACKAGING.md) for the asset table, manual downloads and

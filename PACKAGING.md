@@ -144,31 +144,58 @@ glibc, which is fine for development. Container packaging is covered by the
 
 ## systemd
 
-[`scripts/install_service.py`](./scripts/install_service.py) builds the
-binary and installs it as a systemd service. It creates the `genixsearch`
-system user, installs the binary to `/usr/local/bin`, the config to
+[`scripts/install_service.py`](./scripts/install_service.py) installs
+GenixSearch as a hardened systemd service. It creates the `genixsearch` system
+user, installs the binary to `/usr/local/bin`, the config to
 `/etc/genixsearch/`, points `store.kv.path` at `/var/lib/genixsearch/`, and
-writes a hardened unit to `/etc/systemd/system/genixsearch.service`.
+writes the unit to `/etc/systemd/system/genixsearch.service`.
+
+**It compiles nothing by default.** It detects the machine, downloads the
+matching prebuilt binary from the latest GitHub release, and verifies it
+against the release `SHA256SUMS`. The target host needs only Python 3 and
+systemd — no Rust, no C/C++ toolchain, no libclang, and no matching glibc.
+
+The script is self-sufficient: it fetches its own binary *and* its reference
+config, so it needs neither a checkout nor the release tarball. One file is
+enough:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ivanjoz/genix-search/main/scripts/install_service.py \
+    | sudo python3 - install --bind 0.0.0.0:1491 --auth-password '…'
+```
+
+From a checkout or an unpacked tarball it behaves the same way:
 
 ```sh
 sudo python3 scripts/install_service.py --dry-run             # print every action + file
-sudo python3 scripts/install_service.py                       # build, install, enable, start
+sudo python3 scripts/install_service.py                       # download, install, enable, start
 sudo python3 scripts/install_service.py \
     --bind 0.0.0.0:1491 --auth-password '…' --log-level info
 sudo python3 scripts/install_service.py uninstall [--purge]
 ```
 
-Because `librocksdb-sys` compiles RocksDB from source, the host needs a
-C/C++ toolchain and libclang on top of rustup — a bare Rust install fails
-with `linker cc not found`. The script detects and installs them via `dnf`,
-`apt-get`, `zypper`, `pacman` or `apk`; pass `--no-install-build-deps` to
-fail with instructions instead. Installing from a release tarball skips all of
-that, since the binary is already built.
+Selecting what gets installed:
 
-The build runs as `$SUDO_USER`, so `target/` does not become root-owned.
-Use `--no-build --binary <path>` to install a prebuilt or cross-compiled
-artefact (see [`scripts/install.sh`](./scripts/install.sh) and
-[`scripts/cross_compile_ampere_neoverse_n1.sh`](./scripts/cross_compile_ampere_neoverse_n1.sh)),
-and `--name`/`--config-dir`/`--data-dir` to run several instances side by
-side. Re-running the installer overwrites the unit but keeps an existing
-config unless `--force` is passed.
+| Flag | Effect |
+|------|--------|
+| _(none)_ | Download the latest release build for this machine |
+| `--release-version v0.1.0` | Pin a release instead of taking the latest |
+| `--flavor ampere` \| `generic` | Override the aarch64 CPU detection |
+| `--binary ./genixsearch` | Install a local binary, download nothing |
+| `--from-source` | Compile with cargo on this host (the old behaviour) |
+| `--repo OWNER/NAME` | Download from a fork |
+
+On aarch64 the CPU is read from `/proc/cpuinfo`: MIDR part `0xd0c` is Arm
+Neoverse N1 — the Ampere Altra and Altra Max, and also AWS Graviton2 — which
+selects the `neoverse-n1` build. Anything else gets the portable aarch64 build.
+
+`--from-source` is the only path that still needs a toolchain: RocksDB compiles
+from source, so the host needs a C/C++ toolchain and libclang on top of rustup,
+or a bare Rust install fails with `linker cc not found`. The script detects and
+installs them via `dnf`, `apt-get`, `zypper`, `pacman` or `apk`; pass
+`--no-install-build-deps` to fail with instructions instead. That build runs as
+`$SUDO_USER`, so `target/` does not become root-owned.
+
+Use `--name`/`--config-dir`/`--data-dir` to run several instances side by side.
+Re-running the installer overwrites the unit but keeps an existing config unless
+`--force` is passed.

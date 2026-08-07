@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
-"""Compile GenixSearch and install it as a systemd service.
+"""Install GenixSearch as a systemd service.
 
-Installs the native build dependencies if they are missing (RocksDB is
-compiled from source, so a bare rustup install lacks the `cc` linker),
-builds the release binary as the invoking non-root user so `target/` does
-not end up root-owned, installs it plus its config under `/etc`, creates a
-system user and state directory, writes a hardened unit file, then enables
-and starts the service.
+By default nothing is compiled: the script detects the machine, downloads
+the matching prebuilt binary from a GitHub release, verifies it against the
+release's SHA256SUMS, then installs it plus its config under `/etc`, creates
+a system user and state directory, writes a hardened unit file, and enables
+and starts the service. The published binaries are fully static musl builds,
+so there is no toolchain and no glibc requirement on the target host.
+
+This file is self-sufficient — it fetches its own binary and reference
+config — so it can be run straight off the internet:
+
+    curl -fsSL https://raw.githubusercontent.com/ivanjoz/genix-search/main/scripts/install_service.py \
+        | sudo python3 - install --bind 0.0.0.0:1491 --auth-password 'hunter2'
 
 Usage:
-    sudo python3 scripts/install_service.py                       # build + install + start
+    sudo python3 scripts/install_service.py                       # download + install + start
     sudo python3 scripts/install_service.py --dry-run             # print every action and file
     sudo python3 scripts/install_service.py --bind 0.0.0.0:1491 --auth-password 'hunter2'
-    sudo python3 scripts/install_service.py --no-build \
-        --binary ./target/aarch64-unknown-linux-gnu/release/genixsearch
+    sudo python3 scripts/install_service.py --release-version v0.1.0
+    sudo python3 scripts/install_service.py --flavor ampere       # force the Neoverse N1 build
+    sudo python3 scripts/install_service.py --binary ./genixsearch  # install a local binary
+    sudo python3 scripts/install_service.py --from-source         # compile it here instead
     sudo python3 scripts/install_service.py status
     sudo python3 scripts/install_service.py uninstall             # keeps config + data
     sudo python3 scripts/install_service.py uninstall --purge     # removes config, data, user
@@ -27,7 +35,9 @@ Layout installed (defaults):
 """
 
 import argparse
+import atexit
 import grp
+import hashlib
 import json
 import os
 import pathlib
@@ -36,14 +46,28 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
+import urllib.error
+import urllib.request
 
-REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+# Piping this file into `python3 -` leaves __file__ undefined, which is a
+# supported way to run it, so fall back instead of failing at import time.
+try:
+    REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+except NameError:  # pragma: no cover - only when read from stdin
+    REPO_ROOT = pathlib.Path.cwd()
+
+# Only present when running from a checkout or an unpacked release tarball;
+# otherwise the reference config comes from the downloaded release.
 SOURCE_CONFIG = REPO_ROOT / "genixsearch.cfg"
 
 DEFAULT_NAME = "genixsearch"
 DEFAULT_PREFIX = pathlib.Path("/usr/local")
 DEFAULT_LOG_LEVEL = "error"
+
+DEFAULT_REPO = "ivanjoz/genix-search"
 
 NOLOGIN_CANDIDATES = ("/usr/sbin/nologin", "/sbin/nologin", "/usr/bin/false", "/bin/false")
 
@@ -404,6 +428,180 @@ def ensure_build_toolchain(args: argparse.Namespace) -> None:
     log("build dependencies are in place")
 
 
+# -- prebuilt releases -------------------------------------------------------
+
+# Asset suffixes published by scripts/release_binaries.sh. Keep in step with
+# scripts/util/release_targets.sh.
+ASSET_X86_64 = "x86_64-linux-musl"
+ASSET_AARCH64 = "aarch64-linux-musl"
+ASSET_AARCH64_NEOVERSE_N1 = "aarch64-linux-musl-neoverse-n1"
+
+_TEMP_DIRS: list[str] = []
+
+
+def _cleanup_temp_dirs() -> None:
+    for path in _TEMP_DIRS:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+atexit.register(_cleanup_temp_dirs)
+
+
+def is_neoverse_n1() -> bool:
+    """True when this CPU is an Arm Neoverse N1 (Ampere Altra / Altra Max).
+
+    MIDR_EL1 part 0xd0c is Neoverse N1, which is the core Oracle Cloud rents
+    out as the "Ampere A1" (VM.Standard.A1.Flex) shape.
+    """
+    try:
+        cpuinfo = pathlib.Path("/proc/cpuinfo").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return any(
+        line.split(":", 1)[1].strip().lower() == "0xd0c"
+        for line in cpuinfo.splitlines()
+        if line.lower().startswith("cpu part") and ":" in line
+    )
+
+
+def detect_asset_suffix(flavor: str) -> str:
+    """Pick the release asset for this machine."""
+    machine = os.uname().machine
+    if machine in ("x86_64", "amd64"):
+        if flavor != "auto":
+            warn(f"--flavor {flavor} only applies to aarch64; ignoring it on {machine}")
+        return ASSET_X86_64
+    if machine in ("aarch64", "arm64"):
+        if flavor == "ampere" or (flavor == "auto" and is_neoverse_n1()):
+            return ASSET_AARCH64_NEOVERSE_N1
+        return ASSET_AARCH64
+    raise Fail(
+        f"no prebuilt binary is published for {machine}; "
+        "build from source instead with --from-source"
+    )
+
+
+def http_get(url: str, timeout: float = 60.0) -> bytes:
+    # GitHub rejects requests without a User-Agent.
+    request = urllib.request.Request(url, headers={"User-Agent": f"{DEFAULT_NAME}-install-service"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read()
+    except urllib.error.HTTPError as error:
+        raise Fail(f"HTTP {error.code} fetching {url}") from error
+    except urllib.error.URLError as error:
+        raise Fail(f"could not fetch {url}: {error.reason}") from error
+
+
+def resolve_latest_release(repo: str) -> str:
+    log(f"resolving the latest release of {repo}")
+    payload = http_get(f"https://api.github.com/repos/{repo}/releases/latest")
+    try:
+        tag = json.loads(payload)["tag_name"]
+    except (ValueError, KeyError) as error:
+        raise Fail(f"could not read the latest release tag for {repo}") from error
+    if not tag:
+        raise Fail(f"{repo} has no published releases")
+    return tag
+
+
+def _extract_tar(archive: pathlib.Path, dest: pathlib.Path) -> None:
+    with tarfile.open(archive, "r:gz") as tar:
+        try:
+            # Python 3.12+ rejects unsafe members; older versions lack the
+            # parameter entirely, hence the fallback.
+            tar.extractall(dest, filter="data")
+        except TypeError:
+            tar.extractall(dest)
+
+
+def download_release(args: argparse.Namespace) -> tuple[pathlib.Path, pathlib.Path]:
+    """Fetch the release asset for this machine.
+
+    Returns `(binary, reference_config)` inside a temporary directory that is
+    removed when the process exits.
+    """
+    suffix = detect_asset_suffix(args.flavor)
+    version = args.release_version
+    if version in (None, "latest"):
+        version = resolve_latest_release(args.repo)
+    if not version.startswith("v"):
+        version = f"v{version}"
+
+    stem = f"{DEFAULT_NAME}-{version}-{suffix}"
+    archive_name = f"{stem}.tar.gz"
+    base = f"https://github.com/{args.repo}/releases/download/{version}"
+
+    log(f"selected {archive_name} for {os.uname().machine}")
+
+    if args.dry_run:
+        log(f"would download {base}/{archive_name}")
+        log("would verify it against the release SHA256SUMS")
+        # Nothing is on disk in a dry run, so hand back the paths the real run
+        # would use; no caller reads them when dry_run is set.
+        placeholder = pathlib.Path(tempfile.gettempdir()) / stem
+        return placeholder / DEFAULT_NAME, placeholder / f"{DEFAULT_NAME}.cfg"
+
+    workdir = pathlib.Path(tempfile.mkdtemp(prefix=f"{DEFAULT_NAME}-release-"))
+    _TEMP_DIRS.append(str(workdir))
+
+    log(f"downloading {base}/{archive_name}")
+    payload = http_get(f"{base}/{archive_name}")
+    archive = workdir / archive_name
+    archive.write_bytes(payload)
+
+    # Verify against the release manifest. A corrupted or substituted asset is
+    # otherwise only noticed when the service fails to start.
+    digest = hashlib.sha256(payload).hexdigest()
+    try:
+        manifest = http_get(f"{base}/SHA256SUMS").decode("utf-8", errors="replace")
+    except Fail:
+        warn(f"{version} publishes no SHA256SUMS; cannot verify {archive_name}")
+    else:
+        expected = None
+        for line in manifest.splitlines():
+            parts = line.split()
+            if len(parts) == 2 and parts[1] == archive_name:
+                expected = parts[0]
+                break
+        if expected is None:
+            warn(f"SHA256SUMS has no entry for {archive_name}; skipping verification")
+        elif expected != digest:
+            raise Fail(
+                f"checksum mismatch for {archive_name}: "
+                f"expected {expected}, got {digest}"
+            )
+        else:
+            log("checksum verified against the release SHA256SUMS")
+
+    _extract_tar(archive, workdir)
+
+    binary = workdir / stem / DEFAULT_NAME
+    if not binary.is_file():
+        raise Fail(f"{archive_name} did not contain {stem}/{DEFAULT_NAME}")
+    binary.chmod(0o755)
+
+    config = workdir / stem / f"{DEFAULT_NAME}.cfg"
+    return binary, config
+
+
+def resolve_source_config(downloaded: pathlib.Path | None) -> pathlib.Path:
+    """Find the reference config to base the installed one on."""
+    candidates = []
+    if downloaded is not None:
+        candidates.append(downloaded)
+    candidates.append(SOURCE_CONFIG)
+
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    raise Fail(
+        "cannot find a reference genixsearch.cfg. Looked in: "
+        + ", ".join(str(candidate) for candidate in candidates)
+    )
+
+
 # -- build -------------------------------------------------------------------
 
 
@@ -503,10 +701,9 @@ def rewrite_config(source: str, overrides: dict[tuple[str, str], str]) -> str:
     return "\n".join(out).rstrip("\n") + "\n" + "".join(new_sections)
 
 
-def render_config(args: argparse.Namespace, data_dir: pathlib.Path) -> str:
-    if not SOURCE_CONFIG.is_file():
-        raise Fail(f"cannot find the reference config at {SOURCE_CONFIG}")
-
+def render_config(
+    args: argparse.Namespace, data_dir: pathlib.Path, source_config: pathlib.Path
+) -> str:
     overrides: dict[tuple[str, str], str] = {
         ("server", "log_level"): json.dumps(args.log_level),
         ("channel", "inet"): json.dumps(args.bind),
@@ -520,7 +717,7 @@ def render_config(args: argparse.Namespace, data_dir: pathlib.Path) -> str:
         f"# Overrides can also be set as GENIXSEARCH_* variables in the unit's\n"
         f"# EnvironmentFile; see CONFIGURATION.md for the full reference.\n\n"
     )
-    return header + rewrite_config(SOURCE_CONFIG.read_text(encoding="utf-8"), overrides)
+    return header + rewrite_config(source_config.read_text(encoding="utf-8"), overrides)
 
 
 # -- unit --------------------------------------------------------------------
@@ -667,14 +864,16 @@ def cmd_install(args: argparse.Namespace) -> int:
     paths = paths_for(args)
     bind_port(args.bind)  # fail before building rather than half-way through
 
+    downloaded_config: pathlib.Path | None = None
     if args.binary:
         source_binary = pathlib.Path(args.binary).resolve()
         if not source_binary.is_file():
             raise Fail(f"--binary does not exist: {source_binary}")
-    elif args.no_build:
-        raise Fail("--no-build requires --binary <path>")
-    else:
+    elif args.from_source:
         source_binary = cargo_build(args)
+    else:
+        # The default: no compiler on the target host, no glibc requirement.
+        source_binary, downloaded_config = download_release(args)
 
     ensure_group(args.group, dry_run=args.dry_run)
     ensure_user(args.user, args.group, paths["data"], dry_run=args.dry_run)
@@ -690,10 +889,21 @@ def cmd_install(args: argparse.Namespace) -> int:
         dry_run=args.dry_run,
     )
 
-    config = render_config(args, paths["data"])
+    try:
+        source_config = resolve_source_config(downloaded_config)
+    except Fail:
+        # A dry run downloads nothing, so standalone there is no reference
+        # config to preview yet. That is not a reason to refuse the rehearsal.
+        if not args.dry_run:
+            raise
+        source_config = None
+
     if paths["config"].exists() and not args.force:
         log(f"keeping existing config {paths['config']} (pass --force to overwrite)")
+    elif source_config is None:
+        log(f"would write {paths['config']} from the config shipped in the release archive")
     else:
+        config = render_config(args, paths["data"], source_config)
         if paths["config"].exists():
             backup = paths["config"].with_suffix(".cfg.bak")
             log(f"backing up existing config to {backup}")
@@ -862,7 +1072,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    install = subparsers.add_parser("install", help="build and install the service")
+    install = subparsers.add_parser("install", help="download and install the service")
     add_common(install)
     install.add_argument("--bind", default="[::1]:1491", help="channel listen address (default: %(default)s)")
     install.add_argument(
@@ -877,16 +1087,42 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="server log level (default: %(default)s)",
     )
     install.add_argument(
+        "--repo", default=DEFAULT_REPO, help="GitHub repository to download from (default: %(default)s)"
+    )
+    install.add_argument(
+        "--release-version",
+        default="latest",
+        help="release tag to install, e.g. v0.1.0 (default: %(default)s)",
+    )
+    install.add_argument(
+        "--flavor",
+        default="auto",
+        choices=("auto", "generic", "ampere"),
+        help=(
+            "which aarch64 build to take; 'auto' picks the Neoverse N1 build on "
+            "an Ampere Altra (default: %(default)s)"
+        ),
+    )
+    install.add_argument("--binary", default=None, help="install this local binary instead of downloading")
+    install.add_argument(
+        "--from-source",
+        action="store_true",
+        help="compile with cargo instead of downloading a prebuilt release",
+    )
+    install.add_argument(
         "--profile", default="release", choices=("release", "debug"), help="cargo profile (default: %(default)s)"
     )
     install.add_argument("--target", default=None, help="cargo --target triple (for cross-built hosts)")
-    install.add_argument("--binary", default=None, help="install this prebuilt binary instead of building")
-    install.add_argument("--no-build", action="store_true", help="skip cargo; requires --binary")
+    install.add_argument(
+        "--no-build",
+        action="store_true",
+        help="accepted for compatibility; not compiling is now the default",
+    )
     install.add_argument(
         "--no-install-build-deps",
         dest="install_build_deps",
         action="store_false",
-        help="fail instead of installing a missing C/C++ toolchain and libclang",
+        help="with --from-source, fail instead of installing a C/C++ toolchain and libclang",
     )
     install.add_argument("--force", action="store_true", help="overwrite an existing installed config")
     install.add_argument(
