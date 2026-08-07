@@ -1,6 +1,6 @@
 on:
   push:
-    branches: [master]
+    branches: [main]
     # Do not run the workflow if the project hasn't changed.
     paths: &source_paths
       - "src/**"

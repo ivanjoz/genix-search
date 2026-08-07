@@ -31,6 +31,28 @@ ranked `key|score` list over a single TCP connection.
 * Not a string-keyed index. There is no `PUSH`, no `POP`, no `SUGGEST`, no
   `LIST`, no FST graph.
 
+## Install
+
+Prebuilt, fully static Linux binaries are attached to every
+[release](https://github.com/ivanjoz/genix-search/releases) — no glibc
+requirement, nothing to compile. The installer picks the right one for your
+machine (x86_64, generic arm64, or arm64 tuned for Ampere Altra / Oracle Cloud
+`VM.Standard.A1.Flex`), verifies its checksum and installs it:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ivanjoz/genix-search/main/scripts/install.sh | sh
+```
+
+Or straight into a hardened systemd service:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ivanjoz/genix-search/main/scripts/install.sh \
+    | sudo sh -s -- --service --bind 0.0.0.0:1491
+```
+
+See [`PACKAGING.md`](PACKAGING.md) for the asset table, manual downloads and
+how to reproduce the release builds locally.
+
 ## Quick start
 
 ```sh

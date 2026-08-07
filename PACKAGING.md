@@ -1,29 +1,123 @@
 # Packaging
 
-GenixSearch is built as a single static-ish Linux binary plus its config
-file. The release flow is:
+GenixSearch ships as a single fully static Linux binary plus its config file.
+Every published artefact is a `musl` build, so there is no glibc floor, no
+shared-library hunt and nothing to compile on the target host.
 
-1. Update [`CHANGELOG.md`](./CHANGELOG.md) under the active version with
-   the user-facing changes.
+## Published artefacts
+
+Each tagged release attaches three tarballs and a `SHA256SUMS` manifest:
+
+| Asset | Target triple | For |
+|-------|---------------|-----|
+| `genixsearch-<version>-x86_64-linux-musl.tar.gz` | `x86_64-unknown-linux-musl` | Any x86_64 Linux |
+| `genixsearch-<version>-aarch64-linux-musl.tar.gz` | `aarch64-unknown-linux-musl` | Any arm64 Linux — AWS Graviton, Raspberry Pi, generic |
+| `genixsearch-<version>-aarch64-linux-musl-neoverse-n1.tar.gz` | `aarch64-unknown-linux-musl`, `-C target-cpu=neoverse-n1` | Ampere Altra / Altra Max — Oracle Cloud `VM.Standard.A1.Flex` |
+
+Every tarball unpacks to a `genixsearch-<version>-<suffix>/` directory holding
+the binary, `genixsearch.cfg`, `scripts/install_service.py` and the reference
+docs. The `scripts/` nesting is deliberate: `install_service.py` reads the
+reference config from its own parent directory, so it works straight out of the
+archive.
+
+Two aarch64 builds exist because the Ampere one is compiled for Neoverse N1 and
+will fault on older arm64 cores; the generic build targets baseline ARMv8-A.
+
+## Installing a release
+
+The one-liner detects the architecture — including Neoverse N1 through
+`/proc/cpuinfo` — downloads the matching asset, verifies its checksum and
+installs the binary:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ivanjoz/genix-search/main/scripts/install.sh | sh
+```
+
+Install it as a hardened systemd service in one step instead:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ivanjoz/genix-search/main/scripts/install.sh \
+    | sudo sh -s -- --service --bind 0.0.0.0:1491 --auth-password '…'
+```
+
+Useful flags: `--version vX.Y.Z` to pin a release, `--flavor generic|ampere` to
+override CPU detection, `--prefix "$HOME/.local"` for an unprivileged install,
+and `--dry-run` to print every action without touching the system. Anything the
+script does not recognise is forwarded to `install_service.py`, so `--name`,
+`--config-dir` and `--data-dir` work through it too.
+
+By hand:
+
+```sh
+version=v0.1.0
+curl -fsSLO "https://github.com/ivanjoz/genix-search/releases/download/$version/genixsearch-$version-x86_64-linux-musl.tar.gz"
+curl -fsSLO "https://github.com/ivanjoz/genix-search/releases/download/$version/SHA256SUMS"
+sha256sum -c SHA256SUMS --ignore-missing
+tar -xzf "genixsearch-$version-x86_64-linux-musl.tar.gz"
+sudo install -m 0755 "genixsearch-$version-x86_64-linux-musl/genixsearch" /usr/local/bin/
+```
+
+## Cutting a release
+
+1. Update [`CHANGELOG.md`](./CHANGELOG.md) under the active version with the
+   user-facing changes.
 2. Bump the version in `Cargo.toml` (`[package] version = ...`) following
    [Semantic Versioning](https://semver.org/).
-3. Build the release binary:
+3. Tag and push:
 
    ```sh
-   cargo build --release --bin genixsearch
+   git tag -a v0.1.0 -m 'GenixSearch v0.1.0'
+   git push origin v0.1.0
    ```
 
-   The artefact lives at `./target/release/genixsearch`.
+   [`.github/workflows/release.yml`](./.github/workflows/release.yml) builds
+   all three targets in parallel and attaches the tarballs plus `SHA256SUMS`
+   to a GitHub release for the tag.
 
-4. Smoke-test it locally:
+To rehearse the build without publishing, run the workflow manually from the
+Actions tab with `publish` left unchecked — it builds every target and uploads
+the artefacts to the run, creating no release. Re-running with `publish`
+checked and a `tag` set (re)publishes assets for an existing tag.
 
-   ```sh
-   ./target/release/genixsearch -c ./genixsearch.cfg
-   ./scripts/perf/run_perf.sh        # optional: drives the TCP protocol
-   ```
+## Building the artefacts locally
 
-5. Ship `target/release/genixsearch` and `genixsearch.cfg` to the target
-   host. Container packaging is covered by the [`Dockerfile`](./Dockerfile).
+[`scripts/release_binaries.sh`](./scripts/release_binaries.sh) is what CI runs,
+so it reproduces the exact artefacts on any machine with `cargo` and Docker or
+Podman:
+
+```sh
+scripts/release_binaries.sh                          # all three, version from Cargo.toml
+scripts/release_binaries.sh --build=linux-arm64-ampere
+scripts/release_binaries.sh --version=v0.2.0 --out=./dist --keep-dirs
+```
+
+It installs [`cross`](https://github.com/cross-rs/cross) if missing, builds
+each target inside the matching `cross` container — which is where the musl
+C/C++ toolchain that `librocksdb-sys` needs lives — asserts the result is
+statically linked, then writes the tarballs and `SHA256SUMS` under `dist/`.
+
+Three build details matter and are easy to get wrong by hand:
+
+* **`-C target-cpu=neoverse-n1`** goes to the Ampere build only. Both aarch64
+  builds share a target triple, so the script gives each its own
+  `CARGO_TARGET_DIR` to keep them from invalidating one another.
+* **`JEMALLOC_SYS_WITH_LG_PAGE=16`** is set for both aarch64 builds.
+  `tikv-jemalloc-sys` freezes the page size at compile time and defaults to the
+  build host's — 4 KiB on every x86_64 runner. Oracle Linux and RHEL run
+  aarch64 kernels with 64 KiB pages, where a 4 KiB-page binary aborts on its
+  first allocation. A 64 KiB build runs correctly on both. It has to be *unset*
+  for x86_64, not empty: the crate reads it with `env::var().ok()`, so an empty
+  value still reaches configure as a bare `--with-lg-page=`.
+* **`-C link-arg=-Wl,-z,stack-size=2097152`** goes to every musl build. musl
+  defaults new threads to a 128 KiB stack against glibc's 8 MiB. Rust sizes its
+  own `std::thread` stacks, but RocksDB's compaction and flush threads are C++
+  threads that take the libc default. musl seeds that default from the ELF
+  `PT_GNU_STACK` header, so linking with a 2 MiB stack covers them.
+
+For a plain local build, `cargo build --release --bin genixsearch` still
+produces a dynamically linked `./target/release/genixsearch` against the host's
+glibc, which is fine for development. Container packaging is covered by the
+[`Dockerfile`](./Dockerfile).
 
 ## systemd
 
@@ -45,10 +139,12 @@ Because `librocksdb-sys` compiles RocksDB from source, the host needs a
 C/C++ toolchain and libclang on top of rustup — a bare Rust install fails
 with `linker cc not found`. The script detects and installs them via `dnf`,
 `apt-get`, `zypper`, `pacman` or `apk`; pass `--no-install-build-deps` to
-fail with instructions instead.
+fail with instructions instead. Installing from a release tarball skips all of
+that, since the binary is already built.
 
 The build runs as `$SUDO_USER`, so `target/` does not become root-owned.
-Use `--no-build --binary <path>` to install a cross-compiled artefact (see
+Use `--no-build --binary <path>` to install a prebuilt or cross-compiled
+artefact (see [`scripts/install.sh`](./scripts/install.sh) and
 [`scripts/cross_compile_ampere_neoverse_n1.sh`](./scripts/cross_compile_ampere_neoverse_n1.sh)),
 and `--name`/`--config-dir`/`--data-dir` to run several instances side by
 side. Re-running the installer overwrites the unit but keeps an existing

@@ -15,6 +15,19 @@ tasks:
     desc: Run the GenixSearch perf rig (1k → 10k → 50k ingest + query phases).
     cmd: scripts/perf/run_perf.sh
 
+  release:
+    desc: Build the static release tarballs for every published target into dist/.
+    summary: |
+      Reproduces the artefacts that .github/workflows/release.yml publishes:
+      static musl builds for x86_64, aarch64, and aarch64 tuned for the Ampere
+      Altra (Neoverse N1). Pass extra flags after --, for example:
+
+        task release -- --build=linux-arm64-ampere
+    cmd: scripts/release_binaries.sh {{ .CLI_ARGS }}
+    preconditions:
+      - sh: command -v docker >/dev/null || command -v podman >/dev/null
+        msg: "Docker or Podman is required: the builds run inside the `cross` containers."
+
   ci:
     desc: Runs all CI checks.
     cmds:

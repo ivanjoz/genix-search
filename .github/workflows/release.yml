@@ -1,0 +1,208 @@
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  # Lets you rehearse the whole build without publishing anything, and lets you
+  # (re)publish assets for a tag that already exists.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (defaults to the version in Cargo.toml)"
+        required: false
+        type: string
+      publish:
+        description: "Attach the artefacts to a GitHub release"
+        required: false
+        default: false
+        type: boolean
+
+name: Release
+
+# Every published binary is a fully static musl build produced inside the
+# `cross` containers, which ship the musl C/C++ toolchain that RocksDB needs.
+# The artefacts therefore have no glibc floor and run on any Linux of the
+# matching architecture.
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.build }}
+
+    strategy:
+      # One broken target should not hide the state of the others.
+      fail-fast: false
+      matrix:
+        include:
+          - build: linux-amd64
+            target: x86_64-unknown-linux-musl
+          - build: linux-arm64
+            target: aarch64-unknown-linux-musl
+          # Ampere Altra / Altra Max — Oracle Cloud's "Ampere A1" shape.
+          - build: linux-arm64-ampere
+            target: aarch64-unknown-linux-musl
+
+    # The artefact is defined by the `cross` container, not by the runner, so
+    # the runner image can float without changing what ships.
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Resolve version
+        id: version
+        run: |-
+          if [ "${{ github.event_name }}" = "push" ]; then
+            version="${GITHUB_REF#refs/tags/}"
+          elif [ -n "${{ inputs.tag }}" ]; then
+            version="${{ inputs.tag }}"
+          else
+            version="v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          fi
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "Building GenixSearch $version"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master on 2026-05-14
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install cross
+        env:
+          CROSS_VERSION: "0.2.5"
+        run: |-
+          # The prebuilt binary keeps this job from spending a minute on
+          # `cargo install cross`.
+          curl -fsSL \
+            "https://github.com/cross-rs/cross/releases/download/v${CROSS_VERSION}/cross-x86_64-unknown-linux-musl.tar.gz" \
+            | tar -xz -C /usr/local/bin
+          cross --version
+
+      - name: Cache build artifacts
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/release-${{ matrix.build }}
+          # RocksDB is compiled from source, so a cold cache costs several
+          # minutes. Key on the lockfile so dependency bumps rebuild.
+          key: release-${{ matrix.build }}-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: |
+            release-${{ matrix.build }}-cargo-
+
+      - name: Verify versions
+        run: |-
+          rustc --version
+          cargo --version
+          docker --version
+
+      - name: Build and package
+        run: |-
+          ./scripts/release_binaries.sh \
+            --version='${{ steps.version.outputs.version }}' \
+            --build='${{ matrix.build }}' \
+            --out=./dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: genixsearch-${{ matrix.build }}
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: build
+    if: github.event_name == 'push' || inputs.publish
+
+    runs-on: ubuntu-latest
+
+    permissions:
+      # Required by `action-gh-release` to create the release and upload assets.
+      contents: write
+
+    steps:
+      - name: Resolve version
+        id: version
+        run: |-
+          if [ "${{ github.event_name }}" = "push" ]; then
+            version="${GITHUB_REF#refs/tags/}"
+          else
+            version="${{ inputs.tag }}"
+          fi
+          [ -n "$version" ] || { echo "::error::a tag is required to publish"; exit 1; }
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+      - name: Download artifacts
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          path: ./artifacts
+          pattern: genixsearch-*
+          merge-multiple: false
+
+      - name: Collect assets
+        run: |-
+          mkdir -p ./dist
+          find ./artifacts -name '*.tar.gz' -exec mv -t ./dist {} +
+          # Each build job wrote a single-line SHA256SUMS; concatenate them into
+          # one manifest so `install.sh` can verify any asset from one file.
+          find ./artifacts -name SHA256SUMS -print0 \
+            | sort -z \
+            | xargs -0 cat >./dist/SHA256SUMS
+          echo "Assets:"
+          ls -lh ./dist
+          echo
+          cat ./dist/SHA256SUMS
+
+      - name: Publish release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: GenixSearch ${{ steps.version.outputs.version }}
+          # `action-gh-release` recreates the asset list on re-runs.
+          files: |
+            ./dist/*.tar.gz
+            ./dist/SHA256SUMS
+          fail_on_unmatched_files: true
+          body: |
+            Fully static Linux binaries — no glibc requirement, nothing to compile.
+
+            | Asset | For |
+            |-------|-----|
+            | `genixsearch-${{ steps.version.outputs.version }}-x86_64-linux-musl.tar.gz` | Any x86_64 Linux |
+            | `genixsearch-${{ steps.version.outputs.version }}-aarch64-linux-musl.tar.gz` | Any arm64 Linux (Graviton, RPi, generic) |
+            | `genixsearch-${{ steps.version.outputs.version }}-aarch64-linux-musl-neoverse-n1.tar.gz` | Ampere Altra / Altra Max — Oracle Cloud `VM.Standard.A1.Flex`, tuned with `-C target-cpu=neoverse-n1` |
+
+            Install the right one automatically:
+
+            ```sh
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/scripts/install.sh | sh
+            ```
+
+            Or as a hardened systemd service:
+
+            ```sh
+            curl -fsSL https://raw.githubusercontent.com/${{ github.repository }}/main/scripts/install.sh \
+              | sudo sh -s -- --service --bind 0.0.0.0:1491
+            ```
+
+            Verify a download against `SHA256SUMS`:
+
+            ```sh
+            sha256sum -c SHA256SUMS --ignore-missing
+            ```
+
+            See [PACKAGING.md](https://github.com/${{ github.repository }}/blob/main/PACKAGING.md)
+            for the manual route and [CONFIGURATION.md](https://github.com/${{ github.repository }}/blob/main/CONFIGURATION.md)
+            for every config knob.
