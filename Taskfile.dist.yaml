@@ -18,15 +18,30 @@ tasks:
   release:
     desc: Build the static release tarballs for every published target into dist/.
     summary: |
-      Reproduces the artefacts that .github/workflows/release.yml publishes:
-      static musl builds for x86_64, aarch64, and aarch64 tuned for the Ampere
-      Altra (Neoverse N1). Pass extra flags after --, for example:
+      Builds static musl binaries for x86_64, aarch64, and aarch64 tuned for
+      the Ampere Altra (Neoverse N1). RocksDB is compiled from source for each,
+      so this takes a while. Pass extra flags after --, for example:
 
         task release -- --build=linux-arm64-ampere
+
+      Publish what it produces with `task release:publish`.
     cmd: scripts/release_binaries.sh {{ .CLI_ARGS }}
     preconditions:
       - sh: command -v docker >/dev/null || command -v podman >/dev/null
         msg: "Docker or Podman is required: the builds run inside the `cross` containers."
+
+  release:publish:
+    desc: Upload the tarballs already in dist/ to a GitHub release.
+    summary: |
+      Verifies the artefacts in dist/ and uploads them; it never compiles.
+      Check first with a dry run:
+
+        task release:publish -- --dry-run
+        task release:publish -- --create-tag
+    cmd: scripts/publish_release.sh {{ .CLI_ARGS }}
+    preconditions:
+      - sh: command -v gh >/dev/null
+        msg: "The GitHub CLI (`gh`) is required. See <https://cli.github.com>."
 
   ci:
     desc: Runs all CI checks.

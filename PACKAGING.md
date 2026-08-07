@@ -59,31 +59,49 @@ sudo install -m 0755 "genixsearch-$version-x86_64-linux-musl/genixsearch" /usr/l
 
 ## Cutting a release
 
+Releases are built on a developer machine and uploaded to GitHub. Nothing is
+compiled in CI: RocksDB comes from source for all three targets, which is far
+too heavy for a hosted runner.
+
 1. Update [`CHANGELOG.md`](./CHANGELOG.md) under the active version with the
    user-facing changes.
 2. Bump the version in `Cargo.toml` (`[package] version = ...`) following
-   [Semantic Versioning](https://semver.org/).
-3. Tag and push:
+   [Semantic Versioning](https://semver.org/), and commit.
+3. Build all three targets — expect this to take a while:
 
    ```sh
-   git tag -a v0.1.0 -m 'GenixSearch v0.1.0'
-   git push origin v0.1.0
+   scripts/release_binaries.sh          # or: task release
    ```
 
-   [`.github/workflows/release.yml`](./.github/workflows/release.yml) builds
-   all three targets in parallel and attaches the tarballs plus `SHA256SUMS`
-   to a GitHub release for the tag.
+4. Check what you are about to publish, then publish it:
 
-To rehearse the build without publishing, run the workflow manually from the
-Actions tab with `publish` left unchecked — it builds every target and uploads
-the artefacts to the run, creating no release. Re-running with `publish`
-checked and a `tag` set (re)publishes assets for an existing tag.
+   ```sh
+   scripts/publish_release.sh --dry-run
+   scripts/publish_release.sh --create-tag
+   ```
+
+`--dry-run` verifies the artefacts and prints the release notes without
+uploading. `--create-tag` tags `HEAD` and pushes it; drop it if you tagged
+already. Add `--draft` to stage the release privately first.
+
+`publish_release.sh` refuses to publish a half-built or stale release. It
+requires all three tarballs for the version, re-runs `sha256sum -c` over
+`SHA256SUMS`, and inspects the binary inside each tarball to confirm its
+architecture matches the name — the one mistake a checksum cannot catch, since
+it matches the wrong file perfectly. Pass `--allow-missing` to publish a subset
+deliberately.
+
+It also needs `gh` authenticated as an account with push access to the
+repository. If several accounts are configured, switch first:
+
+```sh
+gh auth switch --user <owner>
+```
 
 ## Building the artefacts locally
 
-[`scripts/release_binaries.sh`](./scripts/release_binaries.sh) is what CI runs,
-so it reproduces the exact artefacts on any machine with `cargo` and Docker or
-Podman:
+[`scripts/release_binaries.sh`](./scripts/release_binaries.sh) produces the
+artefacts on any machine with `cargo` and Docker or Podman:
 
 ```sh
 scripts/release_binaries.sh                          # all three, version from Cargo.toml
@@ -95,6 +113,11 @@ It installs [`cross`](https://github.com/cross-rs/cross) if missing, builds
 each target inside the matching `cross` container — which is where the musl
 C/C++ toolchain that `librocksdb-sys` needs lives — asserts the result is
 statically linked, then writes the tarballs and `SHA256SUMS` under `dist/`.
+
+Building one target at a time accumulates into the same `SHA256SUMS`, so a
+release can be assembled across several sessions. What a release consists of
+lives in one place, [`scripts/util/release_targets.sh`](./scripts/util/release_targets.sh),
+so the builder and the publisher cannot disagree about it.
 
 Three build details matter and are easy to get wrong by hand:
 

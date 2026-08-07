@@ -11,6 +11,9 @@
 #  Cross-compilation happens inside the `cross` containers, which ship the
 #  musl C/C++ toolchain that `librocksdb-sys` needs.
 #
+#  RocksDB is compiled from source for each target, so a full run takes a
+#  while. Once it finishes, `publish_release.sh` uploads what lands in dist/.
+#
 #  Usage:
 #    scripts/release_binaries.sh                          # every build, version from Cargo.toml
 #    scripts/release_binaries.sh --version=v0.2.0         # override the version label
@@ -30,12 +33,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 source "$SCRIPT_DIR"/util/die.sh
+source "$SCRIPT_DIR"/util/release_targets.sh
 
 CROSS_VERSION="${CROSS_VERSION:-0.2.5}"
-
-# Every published build. Keep this list in sync with the `build.matrix` of
-# `.github/workflows/release.yml` and with the arch detection in `install.sh`.
-ALL_BUILDS=(linux-amd64 linux-arm64 linux-arm64-ampere)
 
 # Extra files shipped inside every tarball, at their repo-relative paths.
 #
@@ -50,27 +50,6 @@ EXTRA_FILES=(
   PROTOCOL.md
   scripts/install_service.py
 )
-
-# Resolves a build name into `<target> <target-cpu> <asset-suffix>`.
-#
-# `neoverse-n1` is the core of the Ampere Altra / Altra Max, which is what
-# Oracle Cloud rents out as the "Ampere A1" (VM.Standard.A1.Flex) shape.
-build_spec() {
-  case "$1" in
-    linux-amd64)
-      echo "x86_64-unknown-linux-musl - x86_64-linux-musl"
-      ;;
-    linux-arm64)
-      echo "aarch64-unknown-linux-musl - aarch64-linux-musl"
-      ;;
-    linux-arm64-ampere)
-      echo "aarch64-unknown-linux-musl neoverse-n1 aarch64-linux-musl-neoverse-n1"
-      ;;
-    *)
-      die "unknown build '$1' (expected one of: ${ALL_BUILDS[*]})"
-      ;;
-  esac
-}
 
 version=""
 out_dir="$ROOT_DIR/dist"
@@ -89,12 +68,12 @@ for arg in "$@"; do
 done
 
 if [ ${#builds[@]} -eq 0 ]; then
-  builds=("${ALL_BUILDS[@]}")
+  builds=("${RELEASE_BUILDS[@]}")
 fi
 
 # Validate every build name before spending minutes on the first one.
 for build in "${builds[@]}"; do
-  build_spec "$build" >/dev/null
+  release_build_spec "$build" >/dev/null || die "unknown build '$build'"
 done
 
 if [ -z "$version" ]; then
@@ -133,7 +112,7 @@ log_info "  builds:  ${builds[*]}"
 log_info "  output:  $out_dir"
 
 for build in "${builds[@]}"; do
-  read -r target target_cpu suffix <<<"$(build_spec "$build")"
+  read -r target target_cpu suffix <<<"$(release_build_spec "$build")"
 
   # `cross` compiles with the host's rustc against the container's linker and
   # sysroot, so the target's `std` has to exist on the host side.
