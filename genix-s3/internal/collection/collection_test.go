@@ -254,6 +254,93 @@ func TestCompactionNothing(t *testing.T) {
 	}
 }
 
+// TestRegroup: writers configured with another grouping rewrite every bucket
+// in a new epoch, even with nothing to fold, and the next compaction deletes
+// the objects of the old grouping that the new one did not write over.
+func TestRegroup(t *testing.T) {
+	ctx := context.Background()
+	fs, col, c := newTestCollection(t, 1)
+
+	docs := []Doc{
+		{ID: 1, Text: "camisa roja"}, {ID: 2, Text: "camiseta azul"}, {ID: 3, Text: "xilofono"},
+		{ID: 4, Text: "yoyo"}, {ID: 5, Text: "zapato 40"}, {ID: 6, Text: "polo 41"},
+	}
+
+	if _, err := c.Init(ctx, docs); err != nil {
+		t.Fatal(err)
+	}
+
+	// The names of the objects of the index as it is now.
+	objects := func(g *layout.Grouping) map[string]bool {
+		out := map[string]bool{}
+
+		for group := range uint16(g.Groups()) {
+			for _, key := range []string{col.With(g).Idx(group), col.With(g).DB(group)} {
+				if _, _, err := fs.Get(ctx, key); err == nil {
+					out[key] = true
+				}
+			}
+		}
+
+		return out
+	}
+
+	none := objects(layout.GroupingNone)
+
+	for _, step := range []*layout.Grouping{layout.GroupingES100, layout.GroupingNone} {
+		_, before := liveState(t, fs, col, normalize.Default)
+		other := New(fs, col.With(step), normalize.Default, testOptions(1))
+
+		res, err := other.Compact(ctx)
+		if err != nil || !res.Full || res.Epoch <= before.Epoch || res.Ops != 0 {
+			t.Fatalf("%s: compaction %+v %v (epoch before %d)", step, res, err, before.Epoch)
+		}
+
+		byID, base := liveState(t, fs, col, normalize.Default)
+		if len(byID) != len(docs) || base.Grouping != step.ID() {
+			t.Fatalf("%s: %d docs, base %+v", step, len(byID), base)
+		}
+
+		written := objects(step)
+
+		for key := range written {
+			if !strings.HasSuffix(key, ".idx") {
+				continue
+			}
+
+			data, _, _ := fs.Get(ctx, key)
+			if m, err := bucket.ReadMeta(data); err != nil || m.Grouping != step.ID() || m.Epoch != res.Epoch {
+				t.Errorf("%s: %s: %+v %v", step, key, m, err)
+			}
+		}
+
+		// Nothing to fold, but the garbage of the old grouping goes.
+		if res, err := other.Compact(ctx); err != nil || res.Full {
+			t.Fatalf("%s: second compaction %+v %v", step, res, err)
+		}
+
+		if again := objects(step); len(again) != len(written) {
+			t.Errorf("%s: %d objects after the second compaction, %d before", step, len(again), len(written))
+		}
+
+		for _, g := range []*layout.Grouping{layout.GroupingNone, layout.GroupingES100} {
+			for key := range objects(g) {
+				if !written[key] {
+					t.Errorf("%s: %s of %s survived", step, key, g)
+				}
+			}
+		}
+
+		if res, err := other.Compact(ctx); err != nil || res.Seq != 0 {
+			t.Errorf("%s: a third compaction did something: %+v %v", step, res, err)
+		}
+	}
+
+	if got := objects(layout.GroupingNone); len(got) != len(none) {
+		t.Errorf("back to none: %d objects, %d at first", len(got), len(none))
+	}
+}
+
 func newTestCollection(t *testing.T, minIndex int) (*blob.FS, layout.Collection, *Collection) {
 	fs, err := blob.NewFS(t.TempDir())
 	if err != nil {

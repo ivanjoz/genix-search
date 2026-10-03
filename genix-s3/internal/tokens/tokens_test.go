@@ -16,8 +16,9 @@ func TestRoundTrip(t *testing.T) {
 			Epoch:    3,
 			Seq:      41,
 			Expanded: []key5.Key{key5.FromToken("camisa").Key, key5.FromToken("polo").Key},
+			Grouping: 1,
 			Buckets:  map[uint16]Bucket{5: {Hash: 1 << 60, HasDB: true}, 77: {Hash: 9}},
-			Garbage:  []uint16{900, 12, 900},
+			Garbage:  []Garbage{{0, 900}, {1, 12}, {0, 900}, {0, 12}},
 		}
 
 		for i := range n {
@@ -34,8 +35,8 @@ func TestRoundTrip(t *testing.T) {
 			t.Fatalf("%d docs: %v", n, err)
 		}
 
-		if got.Epoch != s.Epoch || got.Seq != s.Seq || !slices.Equal(got.Expanded, s.Expanded) ||
-			!maps.Equal(got.Buckets, s.Buckets) || !slices.Equal(got.Garbage, []uint16{12, 900}) {
+		if got.Epoch != s.Epoch || got.Seq != s.Seq || got.Grouping != 1 || !slices.Equal(got.Expanded, s.Expanded) ||
+			!maps.Equal(got.Buckets, s.Buckets) || !slices.Equal(got.Garbage, []Garbage{{0, 12}, {0, 900}, {1, 12}}) {
 			t.Errorf("%d docs: %+v", n, got)
 		}
 

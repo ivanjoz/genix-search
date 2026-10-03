@@ -112,9 +112,11 @@ type Engine struct {
 	norm  *normalize.Normalizer
 	opts  Options
 
-	// The cache: decoded buckets, valid as of (epoch, seq). A nil Index is a
-	// bucket known to be empty.
+	// The cache: decoded buckets by group, valid as of (epoch, seq). A nil
+	// Index is a bucket known to be empty. grouping is how the index groups
+	// its slots: the collection's, until a p.log base says otherwise.
 	mu         sync.Mutex
+	grouping   *layout.Grouping
 	epoch      uint32
 	seq        uint64
 	cache      map[uint16]*bucket.Index
@@ -138,7 +140,7 @@ func New(store blob.Blob, col layout.Collection, norm *normalize.Normalizer, opt
 		opts.MaxRequest = def.MaxRequest
 	}
 
-	return &Engine{store: store, col: col, norm: norm, opts: opts, cache: map[uint16]*bucket.Index{}}
+	return &Engine{store: store, col: col, norm: norm, opts: opts, grouping: col.Grouping(), cache: map[uint16]*bucket.Index{}}
 }
 
 // ErrNoCollection is returned for a collection without p.log.
@@ -147,6 +149,10 @@ var ErrNoCollection = errors.New("query: the collection does not exist")
 // errStale is a bucket of another version than the p.log read with it: a
 // compaction or a rebuild ran in between. The search starts over.
 var errStale = errors.New("query: the index changed during the search")
+
+// errRegroup: the index is grouped otherwise than the engine thought; the
+// search starts over with its grouping.
+var errRegroup = fmt.Errorf("%w: regrouped", errStale)
 
 // counters are shared by the requests of one search.
 type counters struct {
@@ -175,12 +181,17 @@ func (e *Engine) Search(ctx context.Context, req Request) (Response, error) {
 		return resp, nil
 	}
 
+	var last error
+
 	for attempt := range maxAttempts {
 		if attempt > 0 {
 			resp.Stats.Retries++
 
-			if err := plog.Backoff(ctx, attempt, staleBackoff); err != nil {
-				return resp, err
+			// Following the grouping of the index has nothing to wait for.
+			if last != errRegroup {
+				if err := plog.Backoff(ctx, attempt, staleBackoff); err != nil {
+					return resp, err
+				}
 			}
 		}
 
@@ -188,6 +199,8 @@ func (e *Engine) Search(ctx context.Context, req Request) (Response, error) {
 
 		err := e.attempt(ctx, q, req, &resp, &c)
 		if errors.Is(err, errStale) {
+			last = err
+
 			continue
 		}
 
@@ -205,25 +218,25 @@ func (e *Engine) Search(ctx context.Context, req Request) (Response, error) {
 
 // fetched is an .idx read in this search.
 type fetched struct {
-	slot  uint16
+	group uint16
 	data  []byte
 	found bool
 }
 
 // attempt runs the search once.
 func (e *Engine) attempt(ctx context.Context, q Parsed, req Request, resp *Response, c *counters) error {
-	slots := querySlots(q.Terms)
-
 	// Round 1: p.log, the .idx not cached, and — when every .idx is cached —
 	// the .db ranges they say, speculatively.
-	pinned, missing := e.lookup(slots)
+	grouping, pinned, missing := e.lookup(querySlots(q.Terms))
+	col := e.col.With(grouping)
+	source := func(s uint16) *bucket.Index { return pinned[grouping.Of(s)] }
 
 	var spec *readPlan
 	var specData *dbData
 
 	if len(missing) == 0 {
-		spec = planQuery(q.Terms, func(s uint16) *bucket.Index { return pinned[s] }, e.opts.PrefixBudget, req.Fuzzy)
-		specData = &dbData{}
+		spec = planQuery(q.Terms, source, e.opts.PrefixBudget, req.Fuzzy)
+		specData = &dbData{col: col}
 	}
 
 	var log *plog.Log
@@ -243,8 +256,8 @@ func (e *Engine) attempt(ctx context.Context, q Parsed, req Request, resp *Respo
 
 			return err
 		case i <= len(missing):
-			got[i-1].slot = missing[i-1]
-			got[i-1].data, got[i-1].found, _ = e.fetchIdx(ctx, missing[i-1], c)
+			got[i-1].group = missing[i-1]
+			got[i-1].data, got[i-1].found, _ = e.fetchIdx(ctx, col, missing[i-1], c)
 
 			return nil
 		}
@@ -270,29 +283,30 @@ func (e *Engine) attempt(ctx context.Context, q Parsed, req Request, resp *Respo
 		return e.searchLog(q, req, log, resp)
 	}
 
+	// The index is grouped otherwise than this engine thought: follow it.
+	if base.Grouping != grouping.ID() {
+		return e.regroup(base.Grouping)
+	}
+
 	// Validate what was cached against this base, and what was read.
 	usable := e.sync(base)
 
 	var refetch []uint16
 
-	for _, s := range slots {
-		if _, read := pinned[s]; !read {
-			continue
-		}
-
-		if !usable || !e.still(s, pinned[s]) {
-			delete(pinned, s)
-			refetch = append(refetch, s)
+	for group, x := range pinned {
+		if !usable || !e.still(group, x) {
+			delete(pinned, group)
+			refetch = append(refetch, group)
 		}
 	}
 
 	for _, f := range got {
-		x, err := e.validate(f, base)
+		x, err := e.validate(f, base, grouping)
 		if err != nil {
 			return err
 		}
 
-		pinned[f.slot] = x
+		pinned[f.group] = x
 	}
 
 	if len(refetch) > 0 {
@@ -300,8 +314,8 @@ func (e *Engine) attempt(ctx context.Context, q Parsed, req Request, resp *Respo
 		again := make([]fetched, len(refetch))
 
 		err := parallel.Run(ctx, len(refetch), e.opts.Concurrency, func(ctx context.Context, i int) error {
-			again[i].slot = refetch[i]
-			again[i].data, again[i].found, _ = e.fetchIdx(ctx, refetch[i], c)
+			again[i].group = refetch[i]
+			again[i].data, again[i].found, _ = e.fetchIdx(ctx, col, refetch[i], c)
 
 			return nil
 		})
@@ -313,12 +327,12 @@ func (e *Engine) attempt(ctx context.Context, q Parsed, req Request, resp *Respo
 		}
 
 		for _, f := range again {
-			x, err := e.validate(f, base)
+			x, err := e.validate(f, base, grouping)
 			if err != nil {
 				return err
 			}
 
-			pinned[f.slot] = x
+			pinned[f.group] = x
 		}
 
 		got = append(got, again...)
@@ -326,7 +340,7 @@ func (e *Engine) attempt(ctx context.Context, q Parsed, req Request, resp *Respo
 	}
 
 	if usable {
-		e.remember(got, pinned)
+		e.remember(grouping, got, pinned)
 	}
 
 	resp.Stats.Warm = len(missing) == 0 && spec != nil
@@ -335,8 +349,8 @@ func (e *Engine) attempt(ctx context.Context, q Parsed, req Request, resp *Respo
 	data := specData
 
 	if p == nil {
-		p = planQuery(q.Terms, func(s uint16) *bucket.Index { return pinned[s] }, e.opts.PrefixBudget, req.Fuzzy)
-		data = &dbData{}
+		p = planQuery(q.Terms, source, e.opts.PrefixBudget, req.Fuzzy)
+		data = &dbData{col: col}
 
 		if n, err := e.read(ctx, p.picks, p.pairs, data, c); err != nil {
 			return err
@@ -431,10 +445,10 @@ func (e *Engine) fetchLog(ctx context.Context, c *counters) (*plog.Log, error) {
 	return plog.Parse(data, e.norm.ID())
 }
 
-// fetchIdx reads the .idx of a slot. Errors other than a missing object come
-// back as found with no data, which validate reports.
-func (e *Engine) fetchIdx(ctx context.Context, slot uint16, c *counters) ([]byte, bool, error) {
-	data, _, err := e.store.Get(ctx, e.col.Idx(slot))
+// fetchIdx reads the .idx of a group. Errors other than a missing object
+// come back as found with no data, which validate reports.
+func (e *Engine) fetchIdx(ctx context.Context, col layout.Collection, group uint16, c *counters) ([]byte, bool, error) {
+	data, _, err := e.store.Get(ctx, col.Idx(group))
 	c.requests.Add(1)
 	c.bytes.Add(int64(len(data)))
 	c.idxBytes.Add(int64(len(data)))
@@ -453,8 +467,9 @@ func (e *Engine) fetchIdx(ctx context.Context, slot uint16, c *counters) ([]byte
 // validate decides whether an .idx read belongs to the p.log base read with
 // it (PLAN_BUCKETS.md §7). It returns the decoded index, nil for an empty
 // bucket, or errStale.
-func (e *Engine) validate(f fetched, base plog.Base) (*bucket.Index, error) {
-	touched := base.Touched.Has(int(f.slot))
+func (e *Engine) validate(f fetched, base plog.Base, grouping *layout.Grouping) (*bucket.Index, error) {
+	touched := base.Touched.Has(int(f.group))
+	name := e.col.With(grouping).Idx(f.group)
 
 	if !f.found {
 		// Missing: never written, or written by the last compaction after
@@ -467,7 +482,7 @@ func (e *Engine) validate(f fetched, base plog.Base) (*bucket.Index, error) {
 	}
 
 	if f.data == nil {
-		return nil, fmt.Errorf("query: %s: read failed", e.col.Idx(f.slot))
+		return nil, fmt.Errorf("query: %s: read failed", name)
 	}
 
 	m, err := bucket.ReadMeta(f.data)
@@ -483,7 +498,7 @@ func (e *Engine) validate(f fetched, base plog.Base) (*bucket.Index, error) {
 			return nil, errStale
 		}
 
-		return nil, nil // a bucket of a replaced index, garbage
+		return nil, nil // a bucket of a replaced index or grouping, garbage
 	case m.Seq < base.LastSeq && touched:
 		return nil, errStale
 	}
@@ -493,8 +508,8 @@ func (e *Engine) validate(f fetched, base plog.Base) (*bucket.Index, error) {
 		return nil, err
 	}
 
-	if x.Slot != f.slot {
-		return nil, fmt.Errorf("query: %s holds slot %d", e.col.Idx(f.slot), x.Slot)
+	if x.Group != f.group || x.Grouping != grouping.ID() {
+		return nil, fmt.Errorf("query: %s holds group %d of grouping %d", name, x.Group, x.Grouping)
 	}
 
 	if len(x.Words) == 0 {
@@ -504,8 +519,9 @@ func (e *Engine) validate(f fetched, base plog.Base) (*bucket.Index, error) {
 	return x, nil
 }
 
-// lookup returns the cached buckets of slots and the slots not cached.
-func (e *Engine) lookup(slots []uint16) (map[uint16]*bucket.Index, []uint16) {
+// lookup returns the grouping, the cached buckets of the groups of slots and
+// the groups not cached.
+func (e *Engine) lookup(slots []uint16) (*layout.Grouping, map[uint16]*bucket.Index, []uint16) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
@@ -513,14 +529,40 @@ func (e *Engine) lookup(slots []uint16) (map[uint16]*bucket.Index, []uint16) {
 	var missing []uint16
 
 	for _, s := range slots {
-		if x, ok := e.cache[s]; ok {
-			pinned[s] = x
+		group := e.grouping.Of(s)
+
+		if _, done := pinned[group]; done || slices.Contains(missing, group) {
+			continue
+		}
+
+		if x, ok := e.cache[group]; ok {
+			pinned[group] = x
 		} else {
-			missing = append(missing, s)
+			missing = append(missing, group)
 		}
 	}
 
-	return pinned, missing
+	return e.grouping, pinned, missing
+}
+
+// regroup switches the engine to the grouping a p.log base says, and has
+// the search start over with it.
+func (e *Engine) regroup(id uint8) error {
+	g, err := layout.GroupingByID(id)
+	if err != nil {
+		return err
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.grouping != g {
+		e.grouping = g
+		e.cache, e.cacheBytes = map[uint16]*bucket.Index{}, 0
+		e.epoch, e.seq = 0, 0
+	}
+
+	return errRegroup
 }
 
 // sync moves the cache to base: the buckets the compaction that wrote base
@@ -569,14 +611,19 @@ func (e *Engine) still(s uint16, x *bucket.Index) bool {
 	return ok && have == x
 }
 
-// remember caches the buckets read.
-func (e *Engine) remember(got []fetched, pinned map[uint16]*bucket.Index) {
+// remember caches the buckets read, unless the engine moved to another
+// grouping meanwhile.
+func (e *Engine) remember(grouping *layout.Grouping, got []fetched, pinned map[uint16]*bucket.Index) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
+	if e.grouping != grouping {
+		return
+	}
+
 	for _, f := range got {
-		x := pinned[f.slot]
-		if _, ok := e.cache[f.slot]; ok {
+		x := pinned[f.group]
+		if _, ok := e.cache[f.group]; ok {
 			continue
 		}
 
@@ -594,20 +641,21 @@ func (e *Engine) remember(got []fetched, pinned map[uint16]*bucket.Index) {
 			}
 		}
 
-		e.cache[f.slot] = x
+		e.cache[f.group] = x
 		e.cacheBytes += size
 	}
 }
 
-// dbRange is a byte range of the .db of a slot.
+// dbRange is a byte range of the .db of a group.
 type dbRange struct {
-	slot     uint16
+	group    uint16
 	off, end uint64
 	etag     string // the .idx's DBETag: what the read must come back with
 }
 
-// dbData holds the ranges read, per slot.
+// dbData holds the ranges read, per group, from the objects of col.
 type dbData struct {
+	col    layout.Collection
 	mu     sync.Mutex
 	chunks map[uint16][]chunk
 	bad    bool // a range came back from another version of its .db
@@ -618,9 +666,10 @@ type chunk struct {
 	data []byte
 }
 
-// get returns the data covering [off, end) of slot and the offset it starts at.
-func (d *dbData) get(slot uint16, off, end uint64) ([]byte, uint64, bool) {
-	for _, ch := range d.chunks[slot] {
+// get returns the data covering [off, end) of a group and the offset it
+// starts at.
+func (d *dbData) get(group uint16, off, end uint64) ([]byte, uint64, bool) {
+	for _, ch := range d.chunks[group] {
 		if off >= ch.off && end <= ch.off+uint64(len(ch.data)) {
 			return ch.data, ch.off, true
 		}
@@ -646,18 +695,18 @@ func (e *Engine) ranges(picks []*pick, pairs []pairRead) []dbRange {
 	for _, pk := range picks {
 		if pk.full && (pk.w.Loc == bucket.LocDB || pk.w.Loc == bucket.LocExpanded) {
 			off, end := pk.w.Bytes()
-			want = append(want, dbRange{slot: pk.slot, off: off, end: end, etag: pk.x.DBETag})
+			want = append(want, dbRange{group: pk.x.Group, off: off, end: end, etag: pk.x.DBETag})
 		}
 	}
 
 	for _, pr := range pairs {
 		off := uint64(pr.combo.Off)
-		want = append(want, dbRange{slot: pr.anchor.slot, off: off, end: off + uint64(pr.combo.Len), etag: pr.anchor.x.DBETag})
+		want = append(want, dbRange{group: pr.anchor.x.Group, off: off, end: off + uint64(pr.combo.Len), etag: pr.anchor.x.DBETag})
 	}
 
 	slices.SortFunc(want, func(a, b dbRange) int {
-		if a.slot != b.slot {
-			return int(a.slot) - int(b.slot)
+		if a.group != b.group {
+			return int(a.group) - int(b.group)
 		}
 
 		if a.off != b.off {
@@ -674,7 +723,7 @@ func (e *Engine) ranges(picks []*pick, pairs []pairRead) []dbRange {
 	var out []dbRange
 
 	for _, r := range want {
-		if n := len(out); n > 0 && out[n-1].slot == r.slot && int64(r.off)-int64(out[n-1].end) <= e.opts.CoalesceGap &&
+		if n := len(out); n > 0 && out[n-1].group == r.group && int64(r.off)-int64(out[n-1].end) <= e.opts.CoalesceGap &&
 			int64(max(r.end, out[n-1].end)-out[n-1].off) <= e.opts.MaxRequest {
 			out[n-1].end = max(out[n-1].end, r.end)
 
@@ -698,7 +747,7 @@ func (e *Engine) read(ctx context.Context, picks []*pick, pairs []pairRead, data
 }
 
 func (e *Engine) fetchRange(ctx context.Context, r dbRange, data *dbData, c *counters) error {
-	b, etag, err := e.store.GetRange(ctx, e.col.DB(r.slot), int64(r.off), int64(r.end-r.off))
+	b, etag, err := e.store.GetRange(ctx, data.col.DB(r.group), int64(r.off), int64(r.end-r.off))
 	c.requests.Add(1)
 	c.bytes.Add(int64(len(b)))
 
@@ -713,11 +762,11 @@ func (e *Engine) fetchRange(ctx context.Context, r dbRange, data *dbData, c *cou
 	case errors.Is(err, blob.ErrNotFound):
 		data.bad = true // rewritten without a .db, or dropped
 	case err != nil:
-		return fmt.Errorf("query: %s: %w", e.col.DB(r.slot), err)
+		return fmt.Errorf("query: %s: %w", data.col.DB(r.group), err)
 	case etag != r.etag || uint64(len(b)) != r.end-r.off:
 		data.bad = true
 	default:
-		data.chunks[r.slot] = append(data.chunks[r.slot], chunk{off: r.off, data: b})
+		data.chunks[r.group] = append(data.chunks[r.group], chunk{off: r.off, data: b})
 	}
 
 	return nil

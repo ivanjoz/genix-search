@@ -28,7 +28,8 @@ import (
 // Scale k repeats the catalogue k times under new IDs: random uint32 (the
 // general case, nothing assumed), or dense 1..N (an auto-increment key, and
 // what the previous genix-s3 evaluation used). The rankings, typos and
-// writes are measured with random IDs only.
+// writes are measured with random IDs only. GXS_EVAL_GROUPING=es100 builds
+// the index grouped.
 func TestEval(t *testing.T) {
 	path := os.Getenv("GXS_EVAL_CSV")
 	if path == "" {
@@ -99,8 +100,16 @@ func avgOf(values []int) float64 {
 func evalScale(t *testing.T, docs []collection.Doc, queries []string, r *rand.Rand, all bool) {
 	ctx := context.Background()
 
+	grouping := layout.GroupingNone
+	if name := os.Getenv("GXS_EVAL_GROUPING"); name != "" {
+		var err error
+		if grouping, err = layout.GroupingByName(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	start := time.Now()
-	f := newFixture(t, normalize.Default, docs)
+	f := newFixtureGrouped(t, normalize.Default, docs, testOptions(), grouping)
 	buildTime := time.Since(start)
 
 	t.Logf("%d docs · build %v · %d PUTs %s written", len(docs), buildTime.Round(time.Millisecond),
@@ -560,8 +569,8 @@ func logIndex(t *testing.T, f *fixture) {
 	var biggest string
 	var biggestIdx int
 
-	for slot := range tok.Buckets {
-		x, _, err := f.store.Get(ctx, f.col.Idx(slot))
+	for group := range tok.Buckets {
+		x, _, err := f.store.Get(ctx, f.col.Idx(group))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -569,10 +578,10 @@ func logIndex(t *testing.T, f *fixture) {
 		idx = append(idx, len(x))
 
 		if len(x) > biggestIdx {
-			biggest, biggestIdx = layout.BucketName(slot), len(x)
+			biggest, biggestIdx = f.col.Grouping().Name(group), len(x)
 		}
 
-		if d, _, err := f.store.Get(ctx, f.col.DB(slot)); err == nil {
+		if d, _, err := f.store.Get(ctx, f.col.DB(group)); err == nil {
 			db = append(db, len(d))
 		}
 	}

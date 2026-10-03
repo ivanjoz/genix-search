@@ -16,13 +16,13 @@ import (
 )
 
 // Format is the layout version.
-const Format uint16 = 1
+const Format uint16 = 2
 
 const (
 	magic      = "GXT1"
 	headerSize = 48
 	dirEntry   = 16 // FirstID u32 | Off u32 | Len u32 | CRC32C u32
-	slotEntry  = 12 // slot u16 | 0 u16 | hash u64
+	slotEntry  = 12 // group u16 | flags u8 | grouping u8 (garbage) | hash u64
 	docHead    = 6  // ID u32 | tokLen u16
 	// ChunkDocs is how many documents go in a chunk.
 	ChunkDocs = 1000
@@ -43,11 +43,20 @@ type State struct {
 	Seq      uint64     // the ops up to Seq are in Docs
 	Docs     []Doc      // sorted by ID
 	Expanded []key5.Key // sorted
-	// Buckets are the buckets of the index, by slot.
+	// Grouping is the layout.Grouping ID of Buckets.
+	Grouping uint8
+	// Buckets are the buckets of the index, by group.
 	Buckets map[uint16]Bucket
-	// Garbage are buckets of an older epoch that no query reads anymore, to
-	// delete once the queries that read them before the change are done.
-	Garbage []uint16
+	// Garbage are buckets no query reads anymore — tombstones, and those of
+	// an older epoch or grouping — to delete once the queries that read them
+	// before the change are done.
+	Garbage []Garbage
+}
+
+// Garbage is a bucket to delete: a group of a grouping.
+type Garbage struct {
+	Grouping uint8
+	Group    uint16
 }
 
 // Bucket is what the compaction remembers of a bucket it wrote.
@@ -77,7 +86,9 @@ func Encode(s *State) ([]byte, error) {
 	slices.Sort(slots)
 
 	garbage := slices.Clone(s.Garbage)
-	slices.Sort(garbage)
+	slices.SortFunc(garbage, func(a, b Garbage) int {
+		return int(a.Grouping)<<16 | int(a.Group) - (int(b.Grouping)<<16 | int(b.Group))
+	})
 	garbage = slices.Compact(garbage)
 
 	chunks := (len(docs) + ChunkDocs - 1) / ChunkDocs
@@ -94,20 +105,20 @@ func Encode(s *State) ([]byte, error) {
 	for _, slot := range slots {
 		b := s.Buckets[slot]
 
-		var flags uint16
+		var flags byte
 		if b.HasDB {
 			flags |= flagDB
 		}
 
 		binary.LittleEndian.PutUint16(out[at:], slot)
-		binary.LittleEndian.PutUint16(out[at+2:], flags)
+		out[at+2] = flags
 		binary.LittleEndian.PutUint64(out[at+4:], b.Hash)
 		at += slotEntry
 	}
 
-	for _, slot := range garbage {
-		binary.LittleEndian.PutUint16(out[at:], slot)
-		binary.LittleEndian.PutUint16(out[at+2:], flagGarbage)
+	for _, g := range garbage {
+		binary.LittleEndian.PutUint16(out[at:], g.Group)
+		out[at+2], out[at+3] = flagGarbage, g.Grouping
 		at += slotEntry
 	}
 
@@ -149,6 +160,7 @@ func Encode(s *State) ([]byte, error) {
 	binary.LittleEndian.PutUint32(out[28:], uint32(chunks))
 	binary.LittleEndian.PutUint32(out[32:], uint32(len(s.Expanded)))
 	binary.LittleEndian.PutUint32(out[36:], uint32(entries))
+	out[40] = s.Grouping
 
 	crc := crc32.Update(crc32.Checksum(out[:44], castagnoli), castagnoli, out[headerSize:headerSize+tables])
 	binary.LittleEndian.PutUint32(out[44:], crc)
@@ -168,10 +180,11 @@ func Decode(data []byte, normID uint32) (*State, error) {
 	}
 
 	s := &State{
-		NormID:  binary.LittleEndian.Uint32(data[8:]),
-		Epoch:   binary.LittleEndian.Uint32(data[12:]),
-		Seq:     binary.LittleEndian.Uint64(data[16:]),
-		Buckets: map[uint16]Bucket{},
+		NormID:   binary.LittleEndian.Uint32(data[8:]),
+		Epoch:    binary.LittleEndian.Uint32(data[12:]),
+		Seq:      binary.LittleEndian.Uint64(data[16:]),
+		Grouping: data[40],
+		Buckets:  map[uint16]Bucket{},
 	}
 
 	count := int(binary.LittleEndian.Uint32(data[24:]))
@@ -202,10 +215,10 @@ func Decode(data []byte, normID uint32) (*State, error) {
 	}
 
 	for range slots {
-		slot, flags := binary.LittleEndian.Uint16(data[at:]), binary.LittleEndian.Uint16(data[at+2:])
+		slot, flags := binary.LittleEndian.Uint16(data[at:]), data[at+2]
 
 		if flags&flagGarbage != 0 {
-			s.Garbage = append(s.Garbage, slot)
+			s.Garbage = append(s.Garbage, Garbage{Grouping: data[at+3], Group: slot})
 		} else {
 			s.Buckets[slot] = Bucket{Hash: binary.LittleEndian.Uint64(data[at+4:]), HasDB: flags&flagDB != 0}
 		}

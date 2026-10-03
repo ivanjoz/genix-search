@@ -2,7 +2,7 @@
 
 > Estado: **implementado** (2026-10-03) en `genix-s3`. Reemplaza las secciones 5 a 8 de `PLAN_5BIT.md` (formatos, ruta de consulta, escritura): el diccionario global `k.<gen>`, los postings `p.<gen>`, el snapshot, el manifest y las generaciones desaparecen. **Siguen vigentes** las secciones 2 a 4 de `PLAN_5BIT.md`: el alfabeto de 5 bits, la clave de 8 letras con su cola de 2 bits, los números `NUM_n`, el normalizador y `NormID`.
 > **Qué se optimiza**, en orden: los requests a S3 por consulta, después los bytes leídos por consulta. El tamaño de los archivos no es el objetivo. No se supone nada del corpus ni de los IDs (`uint32` arbitrarios).
-> Lo que la implementación decidió por su cuenta, y lo que quedó para después (cabezas de prefijo, combinaciones de 3 palabras), está en 12. Las mediciones están en 13.
+> Lo que la implementación decidió por su cuenta, y lo que quedó para después (cabezas de prefijo, combinaciones de 3 palabras), está en 12. Las mediciones están en 13. La agrupación opcional de buckets en menos objetos (flag `Grouping`, `es100`) está en 14.
 
 ## 0. Resumen
 
@@ -35,6 +35,7 @@ Semántica de resultados: la de `PLAN_5BIT.md` 13.3, **O con niveles estrictos**
 
 - **Un solo `p.log` para todo el corpus de la partición**, compartido por todos los buckets: no hay log por bucket. `ca` tiene `ca.idx` y `ca.db`, y nada más. Un registro que se agrega antes de la compactación vive solo en `p.log`; los buckets de sus palabras no cambian hasta que se compacta, y toda consulta lee `p.log` en la ronda 1 y le aplica esas ops (6.1).
 - **Nombre del bucket:** las dos primeras unidades de la clave, cada una con un carácter de `0abcdefghijklmnopqrstuvwxyz12345` (unidad 0 = `0`, 1–26 = `a`–`z`, 27–31 = `1`–`5`). `camisa` → `ca`; la palabra de una letra `x` → `x0`; el número 50 (`NUM_2`, unidad alta 1) → `2a`.
+- **Con `Grouping: GroupingES100`** (14) los objetos son por grupo de buckets contiguos: `ca.idx` sigue siendo solo `ca`, y `vo-y0.idx` tiene de `vo` a `y0`. Hay 100 grupos, así que como mucho 200 objetos en vez de 2 048. Por defecto (`GroupingNone`) un objeto es un bucket, como en el resto de este documento.
 - **`<xy>.db` solo existe si alguna lista del bucket no entra en el `.idx`.** Medido en `productos.csv` (10k), sobre 379 buckets: 3 con IDs densos y 42 con IDs aleatorios. A 100k: 126 y 172.
 - Una colección con menos de `MinIndexDocs` documentos (100) no tiene `.idx`, `.db` ni `tokens`: todo está en `p.log` (`PLAN_5BIT.md` 5.8, sin cambios).
 
@@ -81,20 +82,22 @@ por columna:  dup 1 bit | tail 1 bit
 ```
 Header (64 B)
   0   magic "GXI1"
-  4   Format       uint16 = 1
+  4   Format       uint16 = 2
   6   ETagLen      uint16     largo del ETag del .db
   8   NormID       uint32
   12  Epoch        uint32     época del índice (7)
   16  Seq          uint64     la compactación que lo escribió: incluye las ops ≤ Seq
-  24  Slot         uint16
-  26  reservado    uint16
-  28  Keys         uint32     claves del bucket (0 = bucket vacío, una lápida)
+  24  Group        uint16     el grupo (14); sin agrupación, el bucket
+  26  Grouping     uint8      la agrupación con que se escribió (14): 0 = none, 1 = es100
+  27  reservado    uint8
+  28  Keys         uint32     claves del objeto (0 = vacío, una lápida)
   32  DBSize       uint32     0 = no hay .db
   36  DBCombos     uint32     byte donde empieza la zona de combinaciones del .db
   40  KeysLen, FieldsLen, HeadsLen, ExpLen, InlineLen   5 × uint32: largo de cada sección
   60  CRC32C       uint32     del header (0..60) y de todo lo que sigue
 ETag     [ETagLen]B   ETag que S3 devolvió al escribir el .db
-Keys     las claves del bucket, ordenadas (2.3)
+Keys     n u16 | por bucket del grupo que tiene claves: bucket u16 | claves u32
+         y, por bucket en ese orden, sus claves ordenadas (2.3)
 Fields   wCount u8 | wDup u8 | wFirst u8 | wX u8 | base u32, y por clave, en bits:
            count[wCount] | dup[wDup] | first−base[wFirst] | V[2+wX] | loc[2]
 Heads    reservada para las cabezas de prefijo (3.2): hoy siempre vacía
@@ -153,8 +156,8 @@ m entradas, en bits (size bytes): ID−base[wID] | postings−1 (nibbles) | pos[
 ## 4. `<xy>.db`
 
 ```
-Header (32 B): magic "GXD1" | Format uint16 | Slot uint16 | NormID uint32 | Epoch uint32 | Seq uint64
-               | CRC32C del cuerpo uint32 | reservado uint32
+Header (32 B): magic "GXD1" | Format uint16 = 2 | Group uint16 | NormID uint32 | Epoch uint32 | Seq uint64
+               | CRC32C del cuerpo uint32 | Grouping uint8 | reservado 3 B
 Zona de palabras        las listas con loc 2 o 3, pegadas en bits en orden de clave
 Zona de combinaciones   desde DBCombos: los bloques, en orden de palabra expandida y de entrada del directorio
 ```
@@ -228,14 +231,14 @@ Un prefijo o un typo que tiene que leer muchas listas sigue limitado por `Prefix
 ```
 0   magic "GXL1"   4
 4   Format         uint16 = 2
-6   flags          uint16       bit 0 = LogOnly
+6   flags          uint16       bit 0 = LogOnly; byte alto (7) = Grouping del índice (14)
 8   NormID         uint32
 12  Epoch          uint32
 16  LastSeq        uint64       las ops ≤ LastSeq están en el índice (o en Docs, sin índice)
 24  PrevSeq        uint64       el LastSeq de la base anterior (caché en caliente, 10)
 32  UnixMs         int64        cuándo se escribió
 40  Docs           uint32       documentos a LastSeq
-44  Touched        [128]byte    bit s = la compactación que escribió esta base reescribió el bucket s
+44  Touched        [128]byte    bit s = la compactación que escribió esta base reescribió el objeto s (bucket, o grupo con Grouping)
 172 CRC32C         uint32
 ```
 
@@ -354,6 +357,7 @@ Los de construcción son configurables (`collection.Options.Params`). Cambiarlos
 | `plog` | base de 176 B con `Epoch`, `PrevSeq`, `Docs` y `Touched` (7) |
 | `postings` | listas de una palabra (2.1), columnas (2.2) y entradas de cabeza (3.4) |
 | `key5` | streams de claves de cualquier bucket (2.3) |
+| `layout` | nombres de los objetos de una partición y agrupaciones de buckets (14) |
 | `bucket` | formatos `.idx` / `.db` y la construcción de todos los buckets a partir del estado |
 | `tokens` | el objeto `tokens`: estado por chunks de 1 000 documentos con CRC, expandidas, hash por bucket y basura |
 | `collection` | lease, compactación incremental, reescritura completa, `Rebuild`, `Drop`, `Init` |
@@ -513,3 +517,100 @@ Lo que más lo bajaría es que el `.db` sea append‑only, aprovechando el appen
   - Una partición nueva se crea en 2 requests y se consulta en 1 ronda (`LogOnly`).
   - Reconstruir 400 documentos con un alta y una baja concurrentes escribió 21 buckets: 27 escrituras, 14 KB. Las dos escrituras concurrentes se conservaron.
   - `Drop` deja la partición vacía.
+
+---
+
+## 14. Agrupación de buckets (flag `Grouping`)
+
+> Opcional, y apagada por defecto. Con `GroupingNone` un objeto es un bucket y todo lo anterior queda igual.
+
+**Qué cambia:** con `GroupingES100`, los 1 024 buckets se reparten en **100 grupos de buckets contiguos** (en el orden de las unidades de 5 bits), y cada grupo es un par `.idx` / `.db`. Así hay como mucho 200 objetos, en vez de 2 048. A 100k con IDs aleatorios son 185, en vez de 551.
+
+**Cómo se activa:**
+- `genix.Config.Grouping` y `genix.ClientOptions.Grouping` (`GroupingNone` o `GroupingES100`);
+- `gxs -grouping none|es100`.
+
+Solo lo usan los escritores. Un lector sigue al índice, sea cual sea su flag.
+
+### 14.1 La tabla
+
+- **Es fija, está en el código** (`internal/layout/grouping.go`) y no sale del corpus. El nombre del objeto sigue saliendo de la consulta (bucket → grupo), así que la ronda 1 sigue sin directorio.
+- **Cada grupo es una corrida de buckets:**
+  - un grupo de un solo bucket se llama como el bucket: `ca`, `co`, `de`, `pa`, `pr`…;
+  - uno de varios se llama `<primero>-<último>`: `vo-y0` (el resto de la `v`, la `w`, la `x` y `y0`), `ya-z5` (la `y` y la `z`).
+- **Cómo se cortó** (el test `TestES100` la reconstruye y la compara):
+  - **El peso de cada bucket de letras** es la mitad de su parte de las claves distintas y la mitad de su parte de las ocurrencias. Sale de las 50 000 palabras más frecuentes del español de OpenSubtitles 2018 (`hermitdave/FrequencyWords`, `content/2018/es/es_50k.txt`).
+  - **Los números** no aparecen en esas listas. Para ellos, un valor n pesa 1/(n+1), y en conjunto tienen el 20 % del peso. Sin ese peso, todos los números quedaban en un solo grupo de 102 KB.
+  - **El corte:** se busca, por bisección, el peso máximo por grupo más chico que da 100 corridas o menos. Un bucket más pesado que ese máximo queda solo en su grupo.
+  - Quedan 79 grupos de letras y 21 de números.
+
+### 14.2 Formatos
+
+| Objeto | Dónde se anota la agrupación |
+|---|---|
+| Base de `p.log` | byte alto de los flags (7): la agrupación del índice |
+| `.idx` | `Group` (24) y `Grouping` (26) |
+| `.db` | `Group` (6) y `Grouping` (28) |
+| `tokens` | `Grouping` (offset 40); la basura lleva su agrupación |
+
+- **La sección `Keys` de un `.idx`** tiene un directorio de los buckets del grupo con su cantidad de claves, y después el stream de claves de cada bucket (3).
+- **`Touched` marca grupos.**
+- **La construcción decide todo por bucket, igual que antes:** T, las expansiones y `InlineBudget`. Un grupo es la concatenación de lo que tendrían sus buckets por separado. Por eso el `.idx` de un grupo pesa la suma de los `.idx` de sus buckets, y las rondas y los rangos del `.db` no cambian.
+
+### 14.3 Cambiar el flag
+
+- **El escritor manda.** Una compactación con una agrupación distinta de la de la base hace una **reescritura completa en época nueva**, aunque no haya ops.
+- **La basura:**
+  - Los objetos de la agrupación vieja pasan a ser basura, anotada con su agrupación. La compactación siguiente los borra por nombre.
+  - No se borran los que el índice nuevo reescribió con el mismo nombre (`ca.idx` existe en las dos).
+  - Un `.db` viejo se borra si el grupo nuevo del mismo nombre no tiene `.db`.
+- **El lector sigue a la base.** Si la base de `p.log` dice otra agrupación que la del motor:
+  - el motor se cambia a esa agrupación;
+  - vacía su caché;
+  - y la búsqueda vuelve a empezar sin backoff. Es 1 reintento, una sola vez.
+  
+  Una base `LogOnly` no tiene buckets, así que ahí la agrupación no importa.
+- **Todos los escritores de una partición deben usar el mismo flag.** Si no, cada compactación de un escritor distinto reescribe todo.
+
+### 14.4 Medición
+
+Mismo eval que 13, con `GXS_EVAL_GROUPING=es100`.
+
+**Lo que no cambia:**
+- el ranking (idéntico a la fuerza bruta en 3 000/3 000);
+- los typos;
+- las rondas;
+- **todas las consultas en caliente**, byte por byte: no leen el `.idx`.
+
+**Lo que cambia es el `.idx` en frío.**
+
+| IDs aleatorios | none | es100 |
+|---|---|---|
+| Objetos, 10k | 421 (379 `.idx` + 42 `.db`) | 137 (97 + 40) |
+| Objetos, 100k | 551 (379 + 172) | 185 (97 + 88) |
+| `.idx` más grande, 100k | 5,8 KB (`ca`) | 15,8 KB (`ju-l0`) |
+| `.db` más grande, 100k | 757 KB | 800 KB |
+| Build, 100k | 557 PUT · 17,0 MB | 191 PUT · 16,9 MB |
+| En frío, 100k, 1 · 2 · 3 palabras: bytes prom. | 4,9 · 10,8 · 17,8 KB | 8,3 · 18,5 · 29,0 KB |
+| En frío, 100k: requests | 2,90 · 5,06 · 7,64 | 2,89 · 5,03 · 7,59 |
+| En frío, 10k: bytes prom. | 2,7 · 5,0 · 7,8 KB | 4,1 · 8,1 · 12,2 KB |
+| Compactación de 72 ops, 100k | 62 buckets · 128 escrituras · 11,3 MB | 49 grupos · 102 escrituras · 12,4 MB |
+| Compactación de 71 ops, 10k | 14 · 28 · 782 KB | 14 · 29 · 803 KB |
+
+Con IDs densos pasa lo mismo:
+- 100k: 505 → 178 objetos;
+- en frío, 3,7 · 7,7 · 12,3 KB → 6,1 · 13,5 · 20,7 KB.
+
+Qué dicen:
+- **Un tercio de los objetos.** Hay 3 veces menos objetos y 3 veces menos PUT en el build.
+- **En frío se lee unas 1,7 veces más**, porque un `.idx` trae los buckets vecinos.
+  - Los requests bajan apenas: los términos de una consulta casi nunca caen en el mismo grupo.
+  - El costo sigue al `.idx`: solo `.idx`, a 100k se pasa de 3,3 · 6,3 · 9,5 KB a 6,7 · 14,0 · 20,6 KB.
+  - Un grupo ideal, cortado sobre el mismo catálogo, daría 6,0 · 11,9 · 17,6 KB (simulación). Eso dice que la tabla genérica del español queda cerca de la ideal.
+- **En caliente no hay costo**, salvo que la caché invalida por grupo. Una compactación que toca un bucket obliga a releer todo su grupo.
+- **La compactación** hace un 20 % menos de escrituras, pero un 10 % más de bytes, porque los `.db` de grupo son más grandes. No resuelve el costo de escritura de 13.4.
+- **Cuándo conviene:**
+  - muchas particiones (multi-tenant), donde la cantidad de objetos pesa;
+  - consultas casi siempre en caliente: un proceso de vida larga con su caché.
+  
+  Si la mayoría de las consultas son en frío y se paga por byte, conviene `GroupingNone`.

@@ -8,7 +8,6 @@ import (
 	"sync"
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/collection"
-	"github.com/ivanjoz/genix-search/genix-s3/internal/layout"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/normalize"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/query"
 )
@@ -32,9 +31,10 @@ const (
 
 // ClientOptions configure a Client.
 type ClientOptions struct {
-	Root         string  // key prefix in the bucket; default "genix/"
-	Extra        [2]rune // see Config.Extra: the same for every collection
-	MinIndexDocs int     // see Config.MinIndexDocs
+	Root         string   // key prefix in the bucket; default "genix/"
+	Extra        [2]rune  // see Config.Extra: the same for every collection
+	MinIndexDocs int      // see Config.MinIndexDocs
+	Grouping     Grouping // see Config.Grouping: the same for every collection
 	Search       SearchOptions
 	// MaxSearchers bounds the searchers kept, one per partition searched,
 	// each with the .idx it cached. Default 256.
@@ -83,6 +83,10 @@ func NewClient(store Blob, opts ClientOptions) (*Client, error) {
 		return nil, err
 	}
 
+	if _, err := opts.Grouping.layout(); err != nil {
+		return nil, err
+	}
+
 	if opts.Root == "" {
 		opts.Root = "genix/"
 	}
@@ -118,7 +122,7 @@ func NewClient(store Blob, opts ClientOptions) (*Client, error) {
 }
 
 func (c *Client) collection(k partKey) (*collection.Collection, error) {
-	col, err := layout.New(c.opts.Root, k.collection, k.partition)
+	col, err := c.opts.Grouping.collection(c.opts.Root, k.collection, k.partition)
 	if err != nil {
 		return nil, err
 	}
@@ -274,7 +278,7 @@ func (c *Client) searcher(k partKey) (*query.Engine, error) {
 		return el.Value.(*searcherEntry).e, nil
 	}
 
-	col, err := layout.New(c.opts.Root, k.collection, k.partition)
+	col, err := c.opts.Grouping.collection(c.opts.Root, k.collection, k.partition)
 	if err != nil {
 		return nil, err
 	}

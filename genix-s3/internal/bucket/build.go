@@ -12,6 +12,7 @@ import (
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/bits"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/layout"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/postings"
 )
 
@@ -46,9 +47,9 @@ type Doc struct {
 	Tokens []key5.Token
 }
 
-// Built is the index of one bucket, ready to write.
+// Built is the index of one bucket — one group of slots — ready to write.
 type Built struct {
-	Slot     uint16
+	Group    uint16
 	Keys     int
 	sections [5][]byte // keys, fields, node heads, expansions, inline
 	db       []byte    // the .db after its header
@@ -79,11 +80,12 @@ func (b *Built) EncodeDB(m Meta) []byte {
 	out := make([]byte, DBHeader, DBHeader+len(b.db))
 	copy(out, dbMagic)
 	binary.LittleEndian.PutUint16(out[4:], Format)
-	binary.LittleEndian.PutUint16(out[6:], m.Slot)
+	binary.LittleEndian.PutUint16(out[6:], m.Group)
 	binary.LittleEndian.PutUint32(out[8:], m.NormID)
 	binary.LittleEndian.PutUint32(out[12:], m.Epoch)
 	binary.LittleEndian.PutUint64(out[16:], m.Seq)
 	binary.LittleEndian.PutUint32(out[24:], crc32.Checksum(b.db, castagnoli))
+	out[28] = m.Grouping
 
 	return append(out, b.db...)
 }
@@ -112,7 +114,8 @@ func encodeIdx(m Meta, keys int, etag string, dbSize, dbCombos uint32, sections 
 	binary.LittleEndian.PutUint32(out[8:], m.NormID)
 	binary.LittleEndian.PutUint32(out[12:], m.Epoch)
 	binary.LittleEndian.PutUint64(out[16:], m.Seq)
-	binary.LittleEndian.PutUint16(out[24:], m.Slot)
+	binary.LittleEndian.PutUint16(out[24:], m.Group)
+	out[26] = m.Grouping
 	binary.LittleEndian.PutUint32(out[28:], uint32(keys))
 	binary.LittleEndian.PutUint32(out[32:], dbSize)
 	binary.LittleEndian.PutUint32(out[36:], dbCombos)
@@ -134,7 +137,7 @@ func encodeIdx(m Meta, keys int, etag string, dbSize, dbCombos uint32, sections 
 
 // Result is the index of a whole collection.
 type Result struct {
-	Buckets  []*Built   // sorted by slot
+	Buckets  []*Built   // sorted by group
 	Expanded []key5.Key // sorted
 	Docs     int
 }
@@ -151,9 +154,11 @@ type word struct {
 
 func (w *word) bytes() float64 { return float64(w.shape.Bits()) / 8 }
 
-// Build indexes docs, sorted by ID. prev is the expanded words of the index
-// it replaces: one stays expanded until its list falls below T/2.
-func Build(docs []Doc, prev map[key5.Key]bool, p Params) (*Result, error) {
+// Build indexes docs, sorted by ID, into one bucket per group of g. prev is
+// the expanded words of the index it replaces: one stays expanded until its
+// list falls below T/2. T and the inline lists are decided per slot, so a
+// group holds what its slots would hold apart.
+func Build(docs []Doc, prev map[key5.Key]bool, p Params, g *layout.Grouping) (*Result, error) {
 	words := map[key5.Key]*word{}
 
 	for i, d := range docs {
@@ -233,14 +238,27 @@ func Build(docs []Doc, prev map[key5.Key]bool, p Params) (*Result, error) {
 
 	b := &builder{p: p, words: words, docs: docs, byID: byID}
 
-	for i, s := range slots {
-		built, err := b.bucket(keys[s.from:s.to])
+	// The slots of a group are consecutive, and so are their keys.
+	for i := 0; i < len(slots); {
+		group := g.Of(keys[slots[i].from].Slot())
+		j := i + 1
+
+		for j < len(slots) && g.Of(keys[slots[j].from].Slot()) == group {
+			j++
+		}
+
+		built, err := b.bucket(group, keys[slots[i].from:slots[j-1].to])
 		if err != nil {
 			return nil, err
 		}
 
-		built.D, built.T = ds[i], thresholds[i]
+		for k := i; k < j; k++ {
+			built.D += ds[k]
+			built.T = max(built.T, thresholds[k])
+		}
+
 		res.Buckets = append(res.Buckets, built)
+		i = j
 	}
 
 	return res, nil
@@ -259,17 +277,17 @@ func (b *builder) anchored(a, k key5.Key) bool {
 	return !b.words[k].expand || a < k
 }
 
-func (b *builder) bucket(keys []key5.Key) (*Built, error) {
-	slot := keys[0].Slot()
-	built := &Built{Slot: slot, Keys: len(keys)}
+func (b *builder) bucket(group uint16, keys []key5.Key) (*Built, error) {
+	built := &Built{Group: group, Keys: len(keys)}
 	ws := make([]*word, len(keys))
 
 	for i, k := range keys {
 		ws[i] = b.words[k]
 	}
 
-	// Lists in the .idx: the smallest first, while they fit the budget.
-	var small []*word
+	// Lists in the .idx: per slot, the smallest first, while they fit the
+	// budget.
+	small := map[uint16][]*word{}
 
 	for _, w := range ws {
 		switch {
@@ -280,27 +298,50 @@ func (b *builder) bucket(keys []key5.Key) (*Built, error) {
 			built.Expanded++
 		default:
 			w.loc = LocDB
-			small = append(small, w)
+			small[w.key.Slot()] = append(small[w.key.Slot()], w)
 		}
 	}
 
-	slices.SortStableFunc(small, func(x, y *word) int { return cmp.Compare(x.shape.Bits(), y.shape.Bits()) })
+	for _, list := range small {
+		slices.SortStableFunc(list, func(x, y *word) int { return cmp.Compare(x.shape.Bits(), y.shape.Bits()) })
 
-	var inlineBits uint64
+		var inlineBits uint64
 
-	for _, w := range small {
-		if (inlineBits+w.shape.Bits()+7)/8 > uint64(b.p.InlineBudget) {
-			break
+		for _, w := range list {
+			if (inlineBits+w.shape.Bits()+7)/8 > uint64(b.p.InlineBudget) {
+				break
+			}
+
+			inlineBits += w.shape.Bits()
+			w.loc = LocInline
 		}
-
-		inlineBits += w.shape.Bits()
-		w.loc = LocInline
 	}
 
-	// Keys.
-	kw := bits.NewWriter(nil)
-	if err := key5.AppendBucket(kw, keys); err != nil {
-		return nil, err
+	// Keys: the slot directory, then the keys of each slot.
+	var counts []int
+	var dir []byte
+
+	for from := 0; from < len(keys); {
+		to := from + 1
+		for to < len(keys) && keys[to].Slot() == keys[from].Slot() {
+			to++
+		}
+
+		dir = binary.LittleEndian.AppendUint16(dir, keys[from].Slot())
+		dir = binary.LittleEndian.AppendUint32(dir, uint32(to-from))
+		counts = append(counts, to-from)
+		from = to
+	}
+
+	kw := bits.NewWriter(append(binary.LittleEndian.AppendUint16(nil, uint16(len(counts))), dir...))
+
+	at := 0
+	for _, n := range counts {
+		if err := key5.AppendBucket(kw, keys[at:at+n]); err != nil {
+			return nil, err
+		}
+
+		at += n
 	}
 
 	built.sections[0] = kw.Bytes()
@@ -350,13 +391,13 @@ func (b *builder) bucket(keys []key5.Key) (*Built, error) {
 	}
 
 	if uint64(built.DBSize()) > math.MaxUint32 {
-		return nil, fmt.Errorf("bucket %d: .db over 4 GiB: partition the collection", slot)
+		return nil, fmt.Errorf("bucket %d: .db over 4 GiB: partition the collection", group)
 	}
 
 	h := fnv.New64a()
 	var scratch [8]byte
 
-	binary.LittleEndian.PutUint64(scratch[:], uint64(slot)<<32|uint64(len(keys)))
+	binary.LittleEndian.PutUint64(scratch[:], uint64(group)<<32|uint64(len(keys)))
 	h.Write(scratch[:])
 
 	for _, s := range built.sections {

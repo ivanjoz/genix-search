@@ -73,6 +73,40 @@ type Config struct {
 	// documents live in p.log and a search is one request. 0 means the
 	// default, 100; 1 always builds the index.
 	MinIndexDocs int
+	// Grouping is how the writers group the buckets into objects. Searchers
+	// follow the index, whatever theirs. Changing it for an existing
+	// collection rewrites every bucket at the next compaction.
+	Grouping Grouping
+}
+
+// Grouping is how the index groups the 2-letter slots of its keys into
+// objects, a .idx and a .db per group (PLAN_BUCKETS.md §14). Fewer, bigger
+// objects: fewer to write per compaction and to keep cached, more bytes per
+// .idx a search reads.
+type Grouping uint8
+
+const (
+	// GroupingNone is one group per slot: up to 1024 buckets. The default.
+	GroupingNone Grouping = iota
+	// GroupingES100 is 100 groups of contiguous slots, cut from the
+	// frequency of Spanish words so that they weigh about the same: "ca"
+	// alone, "vo" to "y0" (w, x and the rest of v) together; 21 of them for
+	// numbers. Up to 200 objects.
+	GroupingES100
+)
+
+func (g Grouping) layout() (*layout.Grouping, error) { return layout.GroupingByID(uint8(g)) }
+
+// collection returns the layout of a partition grouped as g.
+func (g Grouping) collection(root, name, partition string) (layout.Collection, error) {
+	grouping, err := g.layout()
+	if err != nil {
+		return layout.Collection{}, err
+	}
+
+	col, err := layout.New(root, name, partition)
+
+	return col.With(grouping), err
 }
 
 func (c Config) open() (layout.Collection, *normalize.Normalizer, error) {
@@ -85,7 +119,7 @@ func (c Config) open() (layout.Collection, *normalize.Normalizer, error) {
 		partition = "default"
 	}
 
-	col, err := layout.New(root, c.Collection, partition)
+	col, err := c.Grouping.collection(root, c.Collection, partition)
 	if err != nil {
 		return col, nil, err
 	}

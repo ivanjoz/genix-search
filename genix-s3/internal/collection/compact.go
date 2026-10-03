@@ -11,6 +11,7 @@ import (
 	"github.com/ivanjoz/genix-search/genix-s3/internal/blob"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/bucket"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/layout"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/parallel"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/plog"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/tokens"
@@ -75,13 +76,15 @@ func (c *Collection) Compact(ctx context.Context) (res CompactResult, err error)
 	base := st.log.Base
 	indexed := c.indexed(len(byID))
 	leftover := base.LogOnly && st.tok != nil
+	// The writers asked for another grouping: every bucket is rewritten.
+	regroup := !base.LogOnly && indexed && base.Grouping != c.col.Grouping().ID()
 
-	if len(pending) == 0 && !l.recover && indexed == !base.LogOnly && !leftover && (st.tok == nil || len(st.tok.Garbage) == 0) {
+	if len(pending) == 0 && !l.recover && indexed == !base.LogOnly && !leftover && !regroup && (st.tok == nil || len(st.tok.Garbage) == 0) {
 		return res, nil
 	}
 
 	res.Ops = len(pending)
-	full := l.recover || base.LogOnly || st.tok == nil || st.tok.Epoch != base.Epoch
+	full := l.recover || base.LogOnly || regroup || st.tok == nil || st.tok.Epoch != base.Epoch || st.tok.Grouping != c.col.Grouping().ID()
 
 	return res, c.publish(ctx, l, st, byID, st.log.LastSeq(), full, &res)
 }
@@ -249,14 +252,18 @@ func (c *Collection) publish(ctx context.Context, l *lease, st *state, byID map[
 		docs = append(docs, bucket.Doc{ID: d.ID, Tokens: toks})
 	}
 
-	built, err := bucket.Build(docs, prevExpanded, c.opts.Params)
+	grouping := c.col.Grouping()
+	next.Grouping = grouping.ID()
+
+	built, err := bucket.Build(docs, prevExpanded, c.opts.Params, grouping)
 	if err != nil {
 		return err
 	}
 
-	// What the previous index had, to delete what this one does not.
+	// What the previous index had in this grouping: the .db to delete when a
+	// bucket loses it.
 	var known map[uint16]tokens.Bucket
-	if tok != nil {
+	if tok != nil && tok.Grouping == grouping.ID() {
 		known = tok.Buckets
 	}
 
@@ -264,41 +271,44 @@ func (c *Collection) publish(ctx context.Context, l *lease, st *state, byID map[
 	var write []*bucket.Built
 
 	for _, b := range built.Buckets {
-		now[b.Slot] = tokens.Bucket{Hash: b.Hash, HasDB: b.HasDB()}
+		now[b.Group] = tokens.Bucket{Hash: b.Hash, HasDB: b.HasDB()}
 
-		if old, ok := prev[b.Slot]; full || !ok || old.Hash != b.Hash {
+		if old, ok := prev[b.Group]; full || !ok || old.Hash != b.Hash {
 			write = append(write, b)
 		}
 	}
 
 	var tombs []uint16
-	var garbage []uint16
+	var garbage []tokens.Garbage
 
-	for slot := range prev {
-		if _, ok := now[slot]; !ok {
-			tombs = append(tombs, slot)
+	for group := range prev {
+		if _, ok := now[group]; !ok {
+			tombs = append(tombs, group)
 		}
 	}
 
 	slices.Sort(tombs)
 
-	if full {
-		// Buckets of the index this one replaces, in an older epoch: queries
-		// on the new base take them for empty; the next compaction deletes
-		// them, once no query reads them.
-		for slot := range known {
-			if _, ok := now[slot]; !ok {
-				garbage = append(garbage, slot)
+	if full && tok != nil {
+		// Buckets of the index this one replaces, in an older epoch or
+		// another grouping: queries on the new base take them for empty or
+		// never name them; the next compaction deletes them, once no query
+		// reads them, unless this index wrote over them.
+		for group := range tok.Buckets {
+			if _, ok := now[group]; !ok || tok.Grouping != grouping.ID() {
+				garbage = append(garbage, tokens.Garbage{Grouping: tok.Grouping, Group: group})
 			}
 		}
 	}
 
 	// Tombstones go next time too: a query that read the base that made them
 	// is done by then.
-	garbage = append(garbage, tombs...)
+	for _, group := range tombs {
+		garbage = append(garbage, tokens.Garbage{Grouping: grouping.ID(), Group: group})
+	}
 
 	var touched plog.Touched
-	meta := bucket.Meta{NormID: c.norm.ID(), Epoch: next.Epoch, Seq: target}
+	meta := bucket.Meta{NormID: c.norm.ID(), Epoch: next.Epoch, Seq: target, Grouping: grouping.ID()}
 
 	l.wrote = true
 
@@ -308,22 +318,22 @@ func (c *Collection) publish(ctx context.Context, l *lease, st *state, byID map[
 		m := meta
 
 		if i >= len(write) {
-			slot := tombs[i-len(write)]
-			m.Slot = slot
+			group := tombs[i-len(write)]
+			m.Group = group
 			data := bucket.Tombstone(m)
 
-			if _, err := c.store.Put(ctx, c.col.Idx(slot), data, blob.PutCond{}); err != nil {
-				return fmt.Errorf("collection: put %s: %w", c.col.Idx(slot), err)
+			if _, err := c.store.Put(ctx, c.col.Idx(group), data, blob.PutCond{}); err != nil {
+				return fmt.Errorf("collection: put %s: %w", c.col.Idx(group), err)
 			}
 
 			writes.Add(1)
 			bytes.Add(int64(len(data)))
 
-			return c.deleteDB(ctx, slot, known, &writes)
+			return c.deleteDB(ctx, group, known, &writes)
 		}
 
 		b := write[i]
-		m.Slot = b.Slot
+		m.Group = b.Group
 
 		var etag string
 
@@ -331,8 +341,8 @@ func (c *Collection) publish(ctx context.Context, l *lease, st *state, byID map[
 			data := b.EncodeDB(m)
 
 			var err error
-			if etag, err = c.store.Put(ctx, c.col.DB(b.Slot), data, blob.PutCond{}); err != nil {
-				return fmt.Errorf("collection: put %s: %w", c.col.DB(b.Slot), err)
+			if etag, err = c.store.Put(ctx, c.col.DB(b.Group), data, blob.PutCond{}); err != nil {
+				return fmt.Errorf("collection: put %s: %w", c.col.DB(b.Group), err)
 			}
 
 			writes.Add(1)
@@ -340,15 +350,15 @@ func (c *Collection) publish(ctx context.Context, l *lease, st *state, byID map[
 		}
 
 		data := b.EncodeIdx(m, etag)
-		if _, err := c.store.Put(ctx, c.col.Idx(b.Slot), data, blob.PutCond{}); err != nil {
-			return fmt.Errorf("collection: put %s: %w", c.col.Idx(b.Slot), err)
+		if _, err := c.store.Put(ctx, c.col.Idx(b.Group), data, blob.PutCond{}); err != nil {
+			return fmt.Errorf("collection: put %s: %w", c.col.Idx(b.Group), err)
 		}
 
 		writes.Add(1)
 		bytes.Add(int64(len(data)))
 
 		if !b.HasDB() {
-			return c.deleteDB(ctx, b.Slot, known, &writes)
+			return c.deleteDB(ctx, b.Group, known, &writes)
 		}
 
 		return nil
@@ -362,22 +372,36 @@ func (c *Collection) publish(ctx context.Context, l *lease, st *state, byID map[
 	}
 
 	for _, b := range write {
-		touched.Set(int(b.Slot))
+		touched.Set(int(b.Group))
 	}
 
-	for _, slot := range tombs {
-		touched.Set(int(slot))
+	for _, group := range tombs {
+		touched.Set(int(group))
 	}
 
 	res.Buckets = len(write) + len(tombs)
 
-	// The garbage of the last compaction: no query reads it anymore.
+	// The garbage of the last compaction: no query reads it anymore. What
+	// this index wrote under the same name stays.
 	if tok != nil && len(tok.Garbage) > 0 {
+		inUse := map[string]bool{}
+		for group, b := range now {
+			inUse[c.col.Idx(group)] = true
+			inUse[c.col.DB(group)] = b.HasDB
+		}
+
 		var keys []string
 
-		for _, slot := range tok.Garbage {
-			if _, ok := now[slot]; !ok {
-				keys = append(keys, c.col.Idx(slot), c.col.DB(slot))
+		for _, g := range tok.Garbage {
+			old, err := layout.GroupingByID(g.Grouping)
+			if err != nil {
+				continue
+			}
+
+			for _, key := range []string{c.col.With(old).Idx(g.Group), c.col.With(old).DB(g.Group)} {
+				if !inUse[key] {
+					keys = append(keys, key)
+				}
 			}
 		}
 
@@ -395,7 +419,7 @@ func (c *Collection) publish(ctx context.Context, l *lease, st *state, byID map[
 
 	tokData, err := tokens.Encode(&tokens.State{
 		NormID: c.norm.ID(), Epoch: next.Epoch, Seq: target, Docs: tokDocs,
-		Expanded: built.Expanded, Buckets: now, Garbage: garbage,
+		Expanded: built.Expanded, Grouping: grouping.ID(), Buckets: now, Garbage: garbage,
 	})
 	if err != nil {
 		return err
@@ -421,26 +445,30 @@ func (c *Collection) publish(ctx context.Context, l *lease, st *state, byID map[
 }
 
 // deleteDB deletes the .db of a bucket that had one and has none now.
-func (c *Collection) deleteDB(ctx context.Context, slot uint16, known map[uint16]tokens.Bucket, writes *atomic.Int64) error {
-	if old, ok := known[slot]; !ok || !old.HasDB {
+func (c *Collection) deleteDB(ctx context.Context, group uint16, known map[uint16]tokens.Bucket, writes *atomic.Int64) error {
+	if old, ok := known[group]; !ok || !old.HasDB {
 		return nil
 	}
 
 	writes.Add(1)
 
-	return c.store.Delete(ctx, c.col.DB(slot))
+	return c.store.Delete(ctx, c.col.DB(group))
 }
 
 // dropIndex deletes every bucket of tok and tok itself, best effort.
 func (c *Collection) dropIndex(ctx context.Context, tok *tokens.State, res *CompactResult) {
 	keys := []string{}
 
-	for slot := range tok.Buckets {
-		keys = append(keys, c.col.Idx(slot), c.col.DB(slot))
+	if g, err := layout.GroupingByID(tok.Grouping); err == nil {
+		for group := range tok.Buckets {
+			keys = append(keys, c.col.With(g).Idx(group), c.col.With(g).DB(group))
+		}
 	}
 
-	for _, slot := range tok.Garbage {
-		keys = append(keys, c.col.Idx(slot), c.col.DB(slot))
+	for _, garbage := range tok.Garbage {
+		if g, err := layout.GroupingByID(garbage.Grouping); err == nil {
+			keys = append(keys, c.col.With(g).Idx(garbage.Group), c.col.With(g).DB(garbage.Group))
+		}
 	}
 
 	if err := c.store.Delete(ctx, keys...); err == nil {

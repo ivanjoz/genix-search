@@ -82,7 +82,7 @@ func assemble(terms []Term, p *readPlan, data *dbData, pending map[uint32]plog.O
 			start, end := pk.w.Bytes()
 
 			var ok bool
-			if raw, off, ok = data.get(pk.slot, start, end); !ok {
+			if raw, off, ok = data.get(pk.x.Group, start, end); !ok {
 				return nil, fmt.Errorf("query: list of %s was not read", pk.w.Key)
 			}
 		}
@@ -96,20 +96,20 @@ func assemble(terms []Term, p *readPlan, data *dbData, pending map[uint32]plog.O
 	}
 
 	type blockKey struct {
-		slot uint16
-		off  uint32
+		group uint16
+		off   uint32
 	}
 
 	blocks := map[blockKey]bucket.Block{}
 
 	for _, pr := range p.pairs {
-		k := blockKey{pr.anchor.slot, pr.combo.Off}
+		k := blockKey{pr.anchor.x.Group, pr.combo.Off}
 
 		block, ok := blocks[k]
 		if !ok {
 			start, end := uint64(pr.combo.Off), uint64(pr.combo.Off)+uint64(pr.combo.Len)
 
-			raw, off, ok := data.get(pr.anchor.slot, start, end)
+			raw, off, ok := data.get(pr.anchor.x.Group, start, end)
 			if !ok {
 				return nil, fmt.Errorf("query: combinations of %s were not read", pr.anchor.w.Key)
 			}

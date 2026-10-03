@@ -15,9 +15,9 @@ type use struct {
 	dist uint8
 }
 
-// pick is a word the query reads, with every term it serves.
+// pick is a word the query reads, with every term it serves. x.Group is the
+// bucket, the objects it is read from.
 type pick struct {
-	slot uint16
 	x    *bucket.Index
 	w    *bucket.Word
 	uses []use
@@ -48,7 +48,8 @@ type readPlan struct {
 	df     []int  // per term: documents of every key that matches it
 }
 
-// indexSource gives the decoded bucket of a slot; nil for an empty one.
+// indexSource gives the decoded bucket that holds a slot; nil for an empty
+// one. Several slots may share a bucket.
 type indexSource func(slot uint16) *bucket.Index
 
 // termSlots are the buckets a term needs: its own (exact key and typos) and
@@ -79,7 +80,6 @@ func querySlots(terms []Term) []uint16 {
 
 // candidate is a word a term could read.
 type candidate struct {
-	slot uint16
 	x    *bucket.Index
 	w    *bucket.Word
 	dist uint8
@@ -110,7 +110,7 @@ func planQuery(terms []Term, source indexSource, budget int64, fuzzy bool) *read
 		if !t.Explicit {
 			if x := source(t.Token.Key.Slot()); x != nil {
 				if w, ok := x.Find(t.Token.Key); ok {
-					p.add(candidate{slot: t.Token.Key.Slot(), x: x, w: w}, use{term: i, kind: exactKey})
+					p.add(candidate{x: x, w: w}, use{term: i, kind: exactKey})
 					p.df[i] += int(w.DF)
 					found = true
 				}
@@ -122,23 +122,28 @@ func planQuery(terms []Term, source indexSource, budget int64, fuzzy bool) *read
 		if t.Auto || t.Explicit {
 			if t.prefixable() {
 				for _, r := range t.prefixRanges() {
+					// The slots of a range may share a bucket: each is read once.
+					var seen []*bucket.Index
+
 					for slot := r.lo.Slot(); slot <= r.hi.Slot(); slot++ {
 						x := source(slot)
-						if x == nil {
+						if x == nil || slices.Contains(seen, x) {
 							continue
 						}
+
+						seen = append(seen, x)
 
 						in := x.Range(r.lo, r.hi)
 						for j := range in {
 							if w := &in[j]; w.Key != t.Token.Key || t.Explicit {
-								prefix = append(prefix, candidate{slot: slot, x: x, w: w})
+								prefix = append(prefix, candidate{x: x, w: w})
 							}
 						}
 					}
 				}
 			} else if x := source(t.Token.Key.Slot()); x != nil && t.Explicit {
 				if w, ok := x.Find(t.Token.Key); ok {
-					prefix = append(prefix, candidate{slot: t.Token.Key.Slot(), x: x, w: w})
+					prefix = append(prefix, candidate{x: x, w: w})
 				}
 			}
 		}
@@ -173,7 +178,7 @@ func planQuery(terms []Term, source indexSource, budget int64, fuzzy bool) *read
 		for j := range x.Words {
 			w := &x.Words[j]
 			if kind, d := t.classifyKey(w.Key, true, scratch[:]); kind == fuzzyKey {
-				near = append(near, candidate{slot: t.Token.Key.Slot(), x: x, w: w, dist: d})
+				near = append(near, candidate{x: x, w: w, dist: d})
 				p.df[i] += int(w.DF)
 			}
 		}
@@ -230,7 +235,7 @@ func (p *readPlan) within(words []candidate, budget int64, term int, kind keyKin
 func (p *readPlan) add(c candidate, u use) {
 	pk, ok := p.byKey[c.w.Key]
 	if !ok {
-		pk = &pick{slot: c.slot, x: c.x, w: c.w}
+		pk = &pick{x: c.x, w: c.w}
 		p.byKey[c.w.Key] = pk
 		p.picks = append(p.picks, pk)
 	}

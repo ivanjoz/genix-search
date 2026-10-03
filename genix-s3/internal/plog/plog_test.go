@@ -18,7 +18,7 @@ func tokens(words ...string) []byte {
 }
 
 func TestRoundTrip(t *testing.T) {
-	b := Base{NormID: normID, Epoch: 3, LastSeq: 10, PrevSeq: 4, UnixMs: 99, Docs: 1234}
+	b := Base{NormID: normID, Epoch: 3, LastSeq: 10, PrevSeq: 4, UnixMs: 99, Docs: 1234, Grouping: 1}
 	b.Touched.Set(0)
 	b.Touched.Set(97)
 	b.Touched.Set(Slots - 1)

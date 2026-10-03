@@ -33,7 +33,8 @@ const (
 	tagBatch   = 1
 	tagCompact = 2
 	tagDocs    = 3
-	// baseLogOnly is bit 0 of the Base flags (offset 6).
+	// baseLogOnly is bit 0 of the Base flags (offset 6); the grouping is
+	// their high byte (offset 7).
 	baseLogOnly = 1
 	docHead     = 6 // ID u32 | tokLen u16
 	// MaxTokens is the largest token stream of one document.
@@ -57,15 +58,18 @@ type Base struct {
 	UnixMs  int64
 	// Docs is the number of documents as of LastSeq.
 	Docs uint32
-	// Touched has bit s set for every bucket the compaction that wrote this
-	// base rewrote.
+	// Touched has bit g set for every group (bucket) the compaction that
+	// wrote this base rewrote.
 	Touched Touched
 	// LogOnly: the collection has no index; the Docs frame after the Base
 	// holds every document as of LastSeq.
 	LogOnly bool
+	// Grouping is the layout.Grouping ID the index was written with: how
+	// the slots are grouped into objects. It is the high byte of the flags.
+	Grouping uint8
 }
 
-// Touched is a set of buckets.
+// Touched is a set of groups.
 type Touched [Slots / 8]byte
 
 func (t *Touched) Set(slot int)      { t[slot>>3] |= 1 << (slot & 7) }
@@ -121,9 +125,10 @@ func EncodeBase(b Base) []byte {
 	binary.LittleEndian.PutUint16(out[4:], Format)
 
 	if b.LogOnly {
-		binary.LittleEndian.PutUint16(out[6:], baseLogOnly)
+		out[6] = baseLogOnly
 	}
 
+	out[7] = b.Grouping
 	binary.LittleEndian.PutUint32(out[8:], b.NormID)
 	binary.LittleEndian.PutUint32(out[12:], b.Epoch)
 	binary.LittleEndian.PutUint64(out[16:], b.LastSeq)
@@ -265,13 +270,14 @@ func ParseBase(data []byte) (Base, error) {
 	}
 
 	b := Base{
-		NormID:  binary.LittleEndian.Uint32(data[8:]),
-		Epoch:   binary.LittleEndian.Uint32(data[12:]),
-		LastSeq: binary.LittleEndian.Uint64(data[16:]),
-		PrevSeq: binary.LittleEndian.Uint64(data[24:]),
-		UnixMs:  int64(binary.LittleEndian.Uint64(data[32:])),
-		Docs:    binary.LittleEndian.Uint32(data[40:]),
-		LogOnly: binary.LittleEndian.Uint16(data[6:])&baseLogOnly != 0,
+		NormID:   binary.LittleEndian.Uint32(data[8:]),
+		Epoch:    binary.LittleEndian.Uint32(data[12:]),
+		LastSeq:  binary.LittleEndian.Uint64(data[16:]),
+		PrevSeq:  binary.LittleEndian.Uint64(data[24:]),
+		UnixMs:   int64(binary.LittleEndian.Uint64(data[32:])),
+		Docs:     binary.LittleEndian.Uint32(data[40:]),
+		LogOnly:  binary.LittleEndian.Uint16(data[6:])&baseLogOnly != 0,
+		Grouping: data[7],
 	}
 	copy(b.Touched[:], data[44:])
 

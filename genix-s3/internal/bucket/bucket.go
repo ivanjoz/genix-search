@@ -1,8 +1,9 @@
-// Package bucket is the index of one bucket, the keys that share their first
-// two letters: <xy>.idx, the dictionary with the small lists, the heads and
-// the combinations directory, and <xy>.db, the lists that do not fit in it
-// (PLAN_BUCKETS.md §3–4). Both are plain bytes; every offset is computed
-// from sizes, never stored per key.
+// Package bucket is the index of one bucket, the keys of a group of slots
+// (one slot, the keys that share their first two letters, unless the
+// collection is grouped): <xy>.idx, the dictionary with the small lists, the
+// heads and the combinations directory, and <xy>.db, the lists that do not
+// fit in it (PLAN_BUCKETS.md §3–4, §14). Both are plain bytes; every offset
+// is computed from sizes, never stored per key.
 package bucket
 
 import (
@@ -14,11 +15,12 @@ import (
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/bits"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/layout"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/postings"
 )
 
 // Format is the layout version of .idx and .db. A reader rejects any other.
-const Format uint16 = 1
+const Format uint16 = 2
 
 const (
 	idxMagic = "GXI1"
@@ -124,7 +126,10 @@ type Meta struct {
 	NormID uint32
 	Epoch  uint32
 	Seq    uint64 // the compaction that wrote them includes the ops up to Seq
-	Slot   uint16
+	// Group is the group of slots the bucket holds, in Grouping (a
+	// layout.Grouping ID); with no grouping, the slot.
+	Group    uint16
+	Grouping uint8
 }
 
 // Index is a decoded .idx.
@@ -178,7 +183,7 @@ func (x *Index) read(w *Word, data []byte, at uint64, dst []postings.Posting) ([
 
 	out, err := postings.Read(r, w.Shape, dst)
 	if err != nil {
-		return nil, fmt.Errorf("bucket %d: list of %s: %w", x.Slot, w.Key, err)
+		return nil, fmt.Errorf("bucket %d: list of %s: %w", x.Group, w.Key, err)
 	}
 
 	if r.Pos()-at != w.Shape.Bits() {
@@ -196,12 +201,17 @@ func ReadMeta(data []byte) (Meta, error) {
 		return Meta{}, fmt.Errorf("%w: not a .idx", ErrCorrupt)
 	}
 
+	return idxMeta(data), nil
+}
+
+func idxMeta(data []byte) Meta {
 	return Meta{
-		NormID: binary.LittleEndian.Uint32(data[8:]),
-		Epoch:  binary.LittleEndian.Uint32(data[12:]),
-		Seq:    binary.LittleEndian.Uint64(data[16:]),
-		Slot:   binary.LittleEndian.Uint16(data[24:]),
-	}, nil
+		NormID:   binary.LittleEndian.Uint32(data[8:]),
+		Epoch:    binary.LittleEndian.Uint32(data[12:]),
+		Seq:      binary.LittleEndian.Uint64(data[16:]),
+		Group:    binary.LittleEndian.Uint16(data[24:]),
+		Grouping: data[26],
+	}
 }
 
 // Decode reads a whole .idx. normID is the reader's normalizer.
@@ -220,12 +230,7 @@ func Decode(data []byte, normID uint32) (*Index, error) {
 	}
 
 	x := &Index{
-		Meta: Meta{
-			NormID: binary.LittleEndian.Uint32(data[8:]),
-			Epoch:  binary.LittleEndian.Uint32(data[12:]),
-			Seq:    binary.LittleEndian.Uint64(data[16:]),
-			Slot:   binary.LittleEndian.Uint16(data[24:]),
-		},
+		Meta:     idxMeta(data),
 		DBSize:   binary.LittleEndian.Uint32(data[32:]),
 		DBCombos: binary.LittleEndian.Uint32(data[36:]),
 		Size:     len(data),
@@ -235,8 +240,13 @@ func Decode(data []byte, normID uint32) (*Index, error) {
 		return nil, fmt.Errorf("bucket: NormID %08x, this normalizer is %08x: the collection was indexed with another normalizer or other extra letters", x.NormID, normID)
 	}
 
-	if x.Slot >= key5.Slots {
-		return nil, fmt.Errorf("%w: slot %d", ErrCorrupt, x.Slot)
+	grouping, err := layout.GroupingByID(x.Grouping)
+	if err != nil {
+		return nil, err
+	}
+
+	if int(x.Group) >= grouping.Groups() {
+		return nil, fmt.Errorf("%w: group %d of %s", ErrCorrupt, x.Group, grouping)
 	}
 
 	keys := int(binary.LittleEndian.Uint32(data[28:]))
@@ -268,9 +278,9 @@ func Decode(data []byte, normID uint32) (*Index, error) {
 		at += n
 	}
 
-	words, err := key5.ReadSlot(bits.NewReader(sections[0], 0), x.Slot, keys)
+	words, err := readKeys(sections[0], grouping, x.Group, keys)
 	if err != nil {
-		return nil, fmt.Errorf("bucket %d: keys: %w", x.Slot, err)
+		return nil, fmt.Errorf("bucket %s: keys: %w", grouping.Name(x.Group), err)
 	}
 
 	x.Words = make([]Word, keys)
@@ -319,6 +329,48 @@ func Decode(data []byte, normID uint32) (*Index, error) {
 	}
 
 	return x, nil
+}
+
+// readKeys reads the Keys section: n u16 | per slot, slot u16 | keys u32,
+// in ascending slot order; then the keys of each slot (key5.AppendBucket).
+// Every slot must belong to the group.
+func readKeys(b []byte, g *layout.Grouping, group uint16, keys int) ([]key5.Key, error) {
+	if len(b) < 2 {
+		return nil, ErrCorrupt
+	}
+
+	n := int(binary.LittleEndian.Uint16(b))
+	if len(b) < 2+6*n {
+		return nil, ErrCorrupt
+	}
+
+	r := bits.NewReader(b[2+6*n:], 0)
+	out := make([]key5.Key, 0, keys)
+	lo, hi := g.Slots(group)
+	prev := -1
+
+	for i := range n {
+		e := b[2+6*i:]
+		slot, count := binary.LittleEndian.Uint16(e), int(binary.LittleEndian.Uint32(e[2:]))
+
+		if int(slot) <= prev || slot < lo || slot > hi || count == 0 || count > keys-len(out) {
+			return nil, fmt.Errorf("%w: slot directory", ErrCorrupt)
+		}
+
+		got, err := key5.ReadSlot(r, slot, count)
+		if err != nil {
+			return nil, err
+		}
+
+		out = append(out, got...)
+		prev = int(slot)
+	}
+
+	if len(out) != keys {
+		return nil, fmt.Errorf("%w: %d keys, the header says %d", ErrCorrupt, len(out), keys)
+	}
+
+	return out, nil
 }
 
 func (x *Index) decodeFields(b []byte) error {
@@ -373,7 +425,7 @@ func (x *Index) decodeExpansions(b []byte) error {
 
 		e, err := decodeExpansion(b[8 : 8+size])
 		if err != nil {
-			return fmt.Errorf("bucket %d: expansion of %s: %w", x.Slot, x.Words[word].Key, err)
+			return fmt.Errorf("bucket %d: expansion of %s: %w", x.Group, x.Words[word].Key, err)
 		}
 
 		for i := range e.Combos {
@@ -503,10 +555,11 @@ func CheckDB(data []byte, m Meta) error {
 	}
 
 	got := Meta{
-		Slot:   binary.LittleEndian.Uint16(data[6:]),
-		NormID: binary.LittleEndian.Uint32(data[8:]),
-		Epoch:  binary.LittleEndian.Uint32(data[12:]),
-		Seq:    binary.LittleEndian.Uint64(data[16:]),
+		Group:    binary.LittleEndian.Uint16(data[6:]),
+		NormID:   binary.LittleEndian.Uint32(data[8:]),
+		Epoch:    binary.LittleEndian.Uint32(data[12:]),
+		Seq:      binary.LittleEndian.Uint64(data[16:]),
+		Grouping: data[28],
 	}
 
 	if got != m {

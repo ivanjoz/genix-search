@@ -44,6 +44,12 @@ func newFixture(t testing.TB, norm *normalize.Normalizer, docs []collection.Doc)
 func newFixtureOpts(t testing.TB, norm *normalize.Normalizer, docs []collection.Doc, opts collection.Options) *fixture {
 	t.Helper()
 
+	return newFixtureGrouped(t, norm, docs, opts, layout.GroupingNone)
+}
+
+func newFixtureGrouped(t testing.TB, norm *normalize.Normalizer, docs []collection.Doc, opts collection.Options, g *layout.Grouping) *fixture {
+	t.Helper()
+
 	fs, err := blob.NewFS(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -53,6 +59,8 @@ func newFixtureOpts(t testing.TB, norm *normalize.Normalizer, docs []collection.
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	col = col.With(g)
 
 	f := &fixture{store: &blob.Counting{Blob: fs}, col: col, norm: norm}
 	f.w = collection.New(f.store, col, norm, opts)
@@ -609,15 +617,24 @@ func bruteQueries(r *rand.Rand, n int) []string {
 func TestMatchesBruteForce(t *testing.T) {
 	small := bucket.Params{MinSplit: 64, ExpandCost: 32, HeadSize: 8, InlineBudget: 64, ComboDictBudget: 16}
 
-	for _, tc := range []struct {
-		name   string
-		params bucket.Params
-	}{
-		{"default", bucket.DefaultParams()},
-		{"small", small},
-		{"tiny heads", bucket.Params{MinSplit: 16, ExpandCost: 16, HeadSize: 1, InlineBudget: 0, ComboDictBudget: 4}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
+	type testCase struct {
+		name     string
+		params   bucket.Params
+		grouping *layout.Grouping
+	}
+
+	var cases []testCase
+
+	for _, g := range []*layout.Grouping{layout.GroupingNone, layout.GroupingES100} {
+		cases = append(cases,
+			testCase{"default", bucket.DefaultParams(), g},
+			testCase{"small", small, g},
+			testCase{"tiny heads", bucket.Params{MinSplit: 16, ExpandCost: 16, HeadSize: 1, InlineBudget: 0, ComboDictBudget: 4}, g},
+		)
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.grouping.String()+"/"+tc.name, func(t *testing.T) {
 			ctx := context.Background()
 			r := rand.New(rand.NewPCG(11, 12))
 
@@ -634,7 +651,35 @@ func TestMatchesBruteForce(t *testing.T) {
 
 			opts := testOptions()
 			opts.Params = tc.params
-			f := newFixtureOpts(t, normalize.Default, docs, opts)
+			f := newFixtureGrouped(t, normalize.Default, docs, opts, tc.grouping)
+
+			// With a grouping, buckets of several slots take part.
+			multi := 0
+
+			for group := range uint16(tc.grouping.Groups()) {
+				data, _, err := f.store.Get(ctx, f.col.Idx(group))
+				if err != nil {
+					continue
+				}
+
+				x, err := bucket.Decode(data, normalize.Default.ID())
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				slots := map[uint16]bool{}
+				for _, w := range x.Words {
+					slots[w.Key.Slot()] = true
+				}
+
+				if len(slots) > 1 {
+					multi++
+				}
+			}
+
+			if (multi > 0) != (tc.grouping != layout.GroupingNone) {
+				t.Fatalf("%d buckets of several slots", multi)
+			}
 
 			base := map[uint32]string{}
 			for _, d := range docs {
@@ -846,4 +891,50 @@ func TestStaleBucket(t *testing.T) {
 	if resp := <-done; resp.Stats.Retries == 0 || len(resp.Hits) != 2 {
 		t.Errorf("sp.db of another version: %d retries, hits %v", resp.Stats.Retries, resp.Hits)
 	}
+}
+
+// TestRegroupEngine: an engine follows the grouping of the index, whatever
+// its own, also when a compaction regroups it under its feet.
+func TestRegroupEngine(t *testing.T) {
+	ctx := context.Background()
+	f := newFixtureGrouped(t, normalize.Default, smallDocs, testOptions(), layout.GroupingES100)
+
+	queries := []string{"polo rojo", "spiderman", "agua 500", "choco", "piña"}
+
+	want := map[string][]uint32{}
+	for _, q := range queries {
+		want[q] = ids(search(t, f.engine(DefaultOptions()), q, false).Hits)
+	}
+
+	plain := f.col.With(layout.GroupingNone)
+	e := New(f.store, plain, f.norm, DefaultOptions())
+
+	check := func(step string, retried bool) {
+		t.Helper()
+
+		for i, q := range queries {
+			resp := search(t, e, q, false)
+			if !slices.Equal(ids(resp.Hits), want[q]) {
+				t.Errorf("%s: %q: %v, want %v", step, q, ids(resp.Hits), want[q])
+			}
+
+			if i == 0 && retried != (resp.Stats.Retries > 0) {
+				t.Errorf("%s: %q: %d retries", step, q, resp.Stats.Retries)
+			}
+
+			if i > 0 && resp.Stats.Retries > 0 {
+				t.Errorf("%s: %q: %d retries after the engine followed", step, q, resp.Stats.Retries)
+			}
+		}
+	}
+
+	check("index es100, engine none", true)
+
+	// Writers go back to one bucket per slot.
+	if res, err := collection.New(f.store, plain, f.norm, testOptions()).Compact(ctx); err != nil || !res.Full {
+		t.Fatalf("regroup: %+v %v", res, err)
+	}
+
+	check("index regrouped to none", true)
+	check("warm", false)
 }

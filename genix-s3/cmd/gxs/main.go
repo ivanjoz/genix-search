@@ -40,7 +40,10 @@ commands:
 
 common flags: -root DIR (default data/gxs) -collection NAME -partition NAME -extra CHARS
               -min-index-docs N (default 100): with fewer documents there is no
-              index, only p.log; build, put, del and compact apply it`
+              index, only p.log; build, put, del and compact apply it
+              -grouping none|es100 (default none): how build and compact group
+              the buckets into objects; another than the index's rewrites
+              every bucket. query, log and inspect follow the index`
 
 type env struct {
 	store    blob.Blob
@@ -65,6 +68,7 @@ func main() {
 	limit := flags.Int("limit", 10, "results")
 	fuzzy := flags.Bool("fuzzy", false, "tolerate typos")
 	minIndex := flags.Int("min-index-docs", plog.DefaultMinIndexDocs, "documents below which there is no index, only p.log")
+	grouping := flags.String("grouping", "none", "how the writers group the buckets: none or es100")
 
 	if err := flags.Parse(args); err != nil {
 		fail(err)
@@ -72,7 +76,7 @@ func main() {
 
 	ctx := context.Background()
 
-	e, err := open(*root, *name, *partition, *extra)
+	e, err := open(*root, *name, *partition, *extra, *grouping)
 	if err != nil {
 		fail(err)
 	}
@@ -109,8 +113,13 @@ func fail(err error) {
 	os.Exit(1)
 }
 
-func open(root, name, partition, extra string) (env, error) {
+func open(root, name, partition, extra, grouping string) (env, error) {
 	store, err := blob.NewFS(root)
+	if err != nil {
+		return env{}, err
+	}
+
+	g, err := layout.GroupingByName(grouping)
 	if err != nil {
 		return env{}, err
 	}
@@ -119,6 +128,8 @@ func open(root, name, partition, extra string) (env, error) {
 	if err != nil {
 		return env{}, err
 	}
+
+	col = col.With(g)
 
 	var letters [2]rune
 	for i, r := range []rune(extra) {
@@ -285,7 +296,9 @@ func cmdCompact(ctx context.Context, e env) error {
 		return err
 	}
 
-	if res.Seq == 0 && res.Ops == 0 {
+	// Any compaction rewrites p.log; seq 0 is also that of a collection never
+	// written to since Init.
+	if res.Bytes == 0 {
 		fmt.Println("nothing to compact")
 
 		return nil
@@ -335,8 +348,13 @@ func cmdLog(ctx context.Context, e env) error {
 			}
 		}
 
-		fmt.Printf("base: epoch %d, last seq %d (previous %d), %d docs, %d buckets rewritten by its compaction · %s · torn tail %v\n",
-			log.Base.Epoch, log.Base.LastSeq, log.Base.PrevSeq, log.Base.Docs, touched, kb(uint64(log.Size)), log.TornTail)
+		grouping := fmt.Sprintf("%d", log.Base.Grouping)
+		if g, err := layout.GroupingByID(log.Base.Grouping); err == nil {
+			grouping = g.String()
+		}
+
+		fmt.Printf("base: epoch %d, last seq %d (previous %d), %d docs, grouping %s, %d buckets rewritten by its compaction · %s · torn tail %v\n",
+			log.Base.Epoch, log.Base.LastSeq, log.Base.PrevSeq, log.Base.Docs, grouping, touched, kb(uint64(log.Size)), log.TornTail)
 	}
 
 	for _, op := range log.Ops {
@@ -379,8 +397,16 @@ func cmdInspect(ctx context.Context, e env, args []string) error {
 		return nil
 	}
 
+	// The index's grouping, whatever -grouping says.
+	g, err := layout.GroupingByID(log.Base.Grouping)
+	if err != nil {
+		return err
+	}
+
+	col := e.col.With(g)
+
 	if len(args) == 0 {
-		tdata, _, err := e.store.Get(ctx, e.col.Tokens())
+		tdata, _, err := e.store.Get(ctx, col.Tokens())
 		if err != nil {
 			return err
 		}
@@ -392,31 +418,31 @@ func cmdInspect(ctx context.Context, e env, args []string) error {
 
 		var idxBytes, dbBytes, dbs int
 
-		for slot := range tok.Buckets {
-			x, _, err := e.store.Get(ctx, e.col.Idx(slot))
+		for group := range tok.Buckets {
+			x, _, err := e.store.Get(ctx, col.Idx(group))
 			if err != nil {
 				return err
 			}
 
 			idxBytes += len(x)
 
-			if d, _, err := e.store.Get(ctx, e.col.DB(slot)); err == nil {
+			if d, _, err := e.store.Get(ctx, col.DB(group)); err == nil {
 				dbBytes += len(d)
 				dbs++
 			}
 		}
 
-		fmt.Printf("epoch %d · last seq %d · %d docs · %d buckets (.idx %s), %d with a .db (%s) · %d expanded words · tokens %s · NormID %08x\n",
-			log.Base.Epoch, log.Base.LastSeq, log.Base.Docs, len(tok.Buckets), kb(uint64(idxBytes)), dbs, kb(uint64(dbBytes)),
+		fmt.Printf("epoch %d · last seq %d · %d docs · grouping %s · %d buckets (.idx %s), %d with a .db (%s) · %d expanded words · tokens %s · NormID %08x\n",
+			log.Base.Epoch, log.Base.LastSeq, log.Base.Docs, g, len(tok.Buckets), kb(uint64(idxBytes)), dbs, kb(uint64(dbBytes)),
 			len(tok.Expanded), kb(uint64(len(tdata))), log.Base.NormID)
 
 		return nil
 	}
 
 	word := key5.FromToken(strings.Join(e.norm.Tokens(strings.Join(args, " ")), ""))
-	slot := word.Key.Slot()
+	group := g.Of(word.Key.Slot())
 
-	data, _, err = e.store.Get(ctx, e.col.Idx(slot))
+	data, _, err = e.store.Get(ctx, col.Idx(group))
 	if err != nil {
 		return err
 	}
@@ -427,7 +453,7 @@ func cmdInspect(ctx context.Context, e env, args []string) error {
 	}
 
 	fmt.Printf("%s.idx: %d keys, %s · epoch %d, seq %d · inline %s · .db %s, combinations from %d\n",
-		layout.BucketName(slot), len(x.Words), kb(uint64(len(data))), x.Epoch, x.Seq, kb(uint64(len(x.Inline))), kb(uint64(x.DBSize)), x.DBCombos)
+		g.Name(group), len(x.Words), kb(uint64(len(data))), x.Epoch, x.Seq, kb(uint64(len(x.Inline))), kb(uint64(x.DBSize)), x.DBCombos)
 
 	locs := []string{"field", "inline", ".db", "expanded"}
 
