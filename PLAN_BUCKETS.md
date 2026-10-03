@@ -2,7 +2,7 @@
 
 > Estado: **implementado** (2026-10-03) en `genix-s3`. Reemplaza las secciones 5 a 8 de `PLAN_5BIT.md` (formatos, ruta de consulta, escritura): el diccionario global `k.<gen>`, los postings `p.<gen>`, el snapshot, el manifest y las generaciones desaparecen. **Siguen vigentes** las secciones 2 a 4 de `PLAN_5BIT.md`: el alfabeto de 5 bits, la clave de 8 letras con su cola de 2 bits, los números `NUM_n`, el normalizador y `NormID`.
 > **Qué se optimiza**, en orden: los requests a S3 por consulta, después los bytes leídos por consulta. El tamaño de los archivos no es el objetivo. No se supone nada del corpus ni de los IDs (`uint32` arbitrarios).
-> Lo que la implementación decidió por su cuenta, y lo que quedó para después (cabezas de prefijo, combinaciones de 3 palabras), está en 12. Las mediciones están en 13. La agrupación opcional de buckets en menos objetos (flag `Grouping`, `es100`) está en 14.
+> Lo que la implementación decidió por su cuenta, y lo que quedó para después (cabezas de prefijo, combinaciones de 3 palabras), está en 12. Las mediciones están en 13. La agrupación de buckets en menos objetos (flag `Grouping`; `es100` por defecto) está en 14.
 
 ## 0. Resumen
 
@@ -35,7 +35,7 @@ Semántica de resultados: la de `PLAN_5BIT.md` 13.3, **O con niveles estrictos**
 
 - **Un solo `p.log` para todo el corpus de la partición**, compartido por todos los buckets: no hay log por bucket. `ca` tiene `ca.idx` y `ca.db`, y nada más. Un registro que se agrega antes de la compactación vive solo en `p.log`; los buckets de sus palabras no cambian hasta que se compacta, y toda consulta lee `p.log` en la ronda 1 y le aplica esas ops (6.1).
 - **Nombre del bucket:** las dos primeras unidades de la clave, cada una con un carácter de `0abcdefghijklmnopqrstuvwxyz12345` (unidad 0 = `0`, 1–26 = `a`–`z`, 27–31 = `1`–`5`). `camisa` → `ca`; la palabra de una letra `x` → `x0`; el número 50 (`NUM_2`, unidad alta 1) → `2a`.
-- **Con `Grouping: GroupingES100`** (14) los objetos son por grupo de buckets contiguos: `ca.idx` sigue siendo solo `ca`, y `vo-y0.idx` tiene de `vo` a `y0`. Hay 100 grupos, así que como mucho 200 objetos en vez de 2 048. Por defecto (`GroupingNone`) un objeto es un bucket, como en el resto de este documento.
+- **Por defecto (`GroupingES100`, 14)** los objetos son por grupo de buckets contiguos: `ca.idx` sigue siendo solo `ca`, y `vo-y0.idx` tiene de `vo` a `y0`. Hay 100 grupos, así que como mucho 200 objetos en vez de 2 048. Con `GroupingNone` un objeto es un bucket. El resto de este documento habla de buckets: con agrupación, léase "el objeto del grupo del bucket".
 - **`<xy>.db` solo existe si alguna lista del bucket no entra en el `.idx`.** Medido en `productos.csv` (10k), sobre 379 buckets: 3 con IDs densos y 42 con IDs aleatorios. A 100k: 126 y 172.
 - Una colección con menos de `MinIndexDocs` documentos (100) no tiene `.idx`, `.db` ni `tokens`: todo está en `p.log` (`PLAN_5BIT.md` 5.8, sin cambios).
 
@@ -522,13 +522,15 @@ Lo que más lo bajaría es que el `.db` sea append‑only, aprovechando el appen
 
 ## 14. Agrupación de buckets (flag `Grouping`)
 
-> Opcional, y apagada por defecto. Con `GroupingNone` un objeto es un bucket y todo lo anterior queda igual.
+> **Activada por defecto en genix-s3 desde el 2026-10-03** (el valor cero del flag es `GroupingES100`). Con `GroupingNone` un objeto es un bucket y todo lo anterior queda igual.
 
 **Qué cambia:** con `GroupingES100`, los 1 024 buckets se reparten en **100 grupos de buckets contiguos** (en el orden de las unidades de 5 bits), y cada grupo es un par `.idx` / `.db`. Así hay como mucho 200 objetos, en vez de 2 048. A 100k con IDs aleatorios son 185, en vez de 551.
 
 **Cómo se activa:**
-- `genix.Config.Grouping` y `genix.ClientOptions.Grouping` (`GroupingNone` o `GroupingES100`);
-- `gxs -grouping none|es100`.
+- `genix.Config.Grouping` y `genix.ClientOptions.Grouping`: `GroupingES100` (el valor cero, por defecto) o `GroupingNone`;
+- `gxs -grouping es100|none` (por defecto `es100`).
+
+Los tests internos y el eval (`GXS_EVAL_GROUPING`) siguen usando `none` salvo que se pida otra, para que las mediciones de 13 sigan siendo comparables.
 
 Solo lo usan los escritores. Un lector sigue al índice, sea cual sea su flag.
 

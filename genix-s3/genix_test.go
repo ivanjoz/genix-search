@@ -56,8 +56,8 @@ func TestPublicAPI(t *testing.T) {
 	}
 }
 
-// TestGroupingFlag: the writers group as their Config says; a searcher
-// configured otherwise follows the index.
+// TestGroupingFlag: the writers group as their Config says, es100 by
+// default; a searcher configured otherwise follows the index.
 func TestGroupingFlag(t *testing.T) {
 	ctx := context.Background()
 
@@ -66,9 +66,27 @@ func TestGroupingFlag(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cfg := Config{Collection: "productos", MinIndexDocs: 1, Grouping: GroupingES100}
+	exists := func(key string) bool {
+		_, _, err := store.Get(ctx, "genix/productos/default/"+key)
 
-	ix, err := NewIndexer(store, cfg)
+		return err == nil
+	}
+
+	search := func(g Grouping) {
+		t.Helper()
+
+		s, err := NewSearcher(store, Config{Collection: "productos", Grouping: g}, DefaultSearchOptions())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		resp, err := s.Search(ctx, Request{Query: "xilofono", Limit: 10})
+		if err != nil || len(resp.Hits) != 1 || resp.Hits[0].ID != 1 {
+			t.Fatalf("xilofono: %+v %v", resp, err)
+		}
+	}
+
+	ix, err := NewIndexer(store, Config{Collection: "productos", MinIndexDocs: 1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,25 +95,27 @@ func TestGroupingFlag(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for _, key := range []string{"vo-y0.idx", "ca.idx"} {
-		if _, _, err := store.Get(ctx, "genix/productos/default/"+key); err != nil {
-			t.Errorf("%s: %v", key, err)
-		}
+	if !exists("vo-y0.idx") || !exists("ca.idx") || exists("xi.idx") {
+		t.Error("the default config did not group as es100")
 	}
 
-	if _, _, err := store.Get(ctx, "genix/productos/default/xi.idx"); err == nil {
-		t.Error("xi.idx was written: the grouping was ignored")
-	}
+	search(GroupingNone)
 
-	s, err := NewSearcher(store, Config{Collection: "productos"}, DefaultSearchOptions())
+	// Opting out rewrites the index one bucket per slot.
+	plain, err := NewIndexer(store, Config{Collection: "productos", MinIndexDocs: 1, Grouping: GroupingNone})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	resp, err := s.Search(ctx, Request{Query: "xilofono", Limit: 10})
-	if err != nil || len(resp.Hits) != 1 || resp.Hits[0].ID != 1 {
-		t.Fatalf("xilofono: %+v %v", resp, err)
+	if res, err := plain.Compact(ctx); err != nil || !res.Full {
+		t.Fatalf("regroup to none: %+v %v", res, err)
 	}
+
+	if !exists("xi.idx") {
+		t.Error("GroupingNone did not write xi.idx")
+	}
+
+	search(GroupingES100)
 
 	if _, err := NewIndexer(store, Config{Collection: "x", Grouping: 7}); err == nil {
 		t.Error("an unknown grouping was accepted")

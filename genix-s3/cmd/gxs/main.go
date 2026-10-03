@@ -41,7 +41,7 @@ commands:
 common flags: -root DIR (default data/gxs) -collection NAME -partition NAME -extra CHARS
               -min-index-docs N (default 100): with fewer documents there is no
               index, only p.log; build, put, del and compact apply it
-              -grouping none|es100 (default none): how build and compact group
+              -grouping es100|none (default es100): how build and compact group
               the buckets into objects; another than the index's rewrites
               every bucket. query, log and inspect follow the index`
 
@@ -68,7 +68,7 @@ func main() {
 	limit := flags.Int("limit", 10, "results")
 	fuzzy := flags.Bool("fuzzy", false, "tolerate typos")
 	minIndex := flags.Int("min-index-docs", plog.DefaultMinIndexDocs, "documents below which there is no index, only p.log")
-	grouping := flags.String("grouping", "none", "how the writers group the buckets: none or es100")
+	grouping := flags.String("grouping", "es100", "how the writers group the buckets: es100 or none")
 
 	if err := flags.Parse(args); err != nil {
 		fail(err)

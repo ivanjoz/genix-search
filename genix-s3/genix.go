@@ -73,9 +73,10 @@ type Config struct {
 	// documents live in p.log and a search is one request. 0 means the
 	// default, 100; 1 always builds the index.
 	MinIndexDocs int
-	// Grouping is how the writers group the buckets into objects. Searchers
-	// follow the index, whatever theirs. Changing it for an existing
-	// collection rewrites every bucket at the next compaction.
+	// Grouping is how the writers group the buckets into objects; the zero
+	// value is GroupingES100. Searchers follow the index, whatever theirs.
+	// Changing it for an existing collection rewrites every bucket at the
+	// next compaction.
 	Grouping Grouping
 }
 
@@ -86,16 +87,26 @@ type Config struct {
 type Grouping uint8
 
 const (
-	// GroupingNone is one group per slot: up to 1024 buckets. The default.
-	GroupingNone Grouping = iota
 	// GroupingES100 is 100 groups of contiguous slots, cut from the
 	// frequency of Spanish words so that they weigh about the same: "ca"
 	// alone, "vo" to "y0" (w, x and the rest of v) together; 21 of them for
-	// numbers. Up to 200 objects.
-	GroupingES100
+	// numbers. Up to 200 objects. The default.
+	GroupingES100 Grouping = iota
+	// GroupingNone is one group per slot: up to 1024 buckets, the smallest
+	// .idx a cold search can read.
+	GroupingNone
 )
 
-func (g Grouping) layout() (*layout.Grouping, error) { return layout.GroupingByID(uint8(g)) }
+func (g Grouping) layout() (*layout.Grouping, error) {
+	switch g {
+	case GroupingES100:
+		return layout.GroupingES100, nil
+	case GroupingNone:
+		return layout.GroupingNone, nil
+	}
+
+	return nil, fmt.Errorf("genix: unknown grouping %d", g)
+}
 
 // collection returns the layout of a partition grouped as g.
 func (g Grouping) collection(root, name, partition string) (layout.Collection, error) {
