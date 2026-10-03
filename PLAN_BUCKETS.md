@@ -489,11 +489,11 @@ En los tests (`TestMatchesBruteForce`, 3 000 documentos con IDs aleatorios), el 
 | Build inicial | 61 ms · 427 PUT · 1,38 MB | 587 ms · 557 PUT · 17,0 MB |
 | `Put` de 1 documento | 1 GET (176 B) + 1 append (52 B) | 1 GET (176 B) + 1 append (65 B) |
 | `p.log` hasta el umbral de compactación | 71 appends de un documento | 72 appends |
-| Compactación | 71 ops · 37 ms · 4 lecturas (347 KB) · 28 escrituras (782 KB) | 72 ops · 402 ms · 4 lecturas (3,27 MB) · 128 escrituras (11,3 MB) |
+| Compactación | 71 ops · 37 ms · 14 buckets · 4 lecturas (347 KB) · 28 escrituras (782 KB) | 72 ops · 410 ms · 62 buckets · 4 lecturas (3,27 MB) · 128 escrituras (11,3 MB) |
 
 **Es más cara que antes**, y `PLAN_5BIT.md` pide que la escritura siga siendo eficiente: queda para decidir (12.3). La escritura de un documento no cambió (1 GET y 1 append); lo que cambió es la compactación. El diseño anterior compactaba 100k en 5 escrituras y 6,0 MB, porque reescribía `k`, `p` y el snapshot enteros. Ahora son 128 escrituras y 11,3 MB:
-- 72 productos al azar cambian unos 120 de los 379 buckets;
-- entre ellos están casi siempre los buckets grandes (`ca`, `co`, `po`…), y cada `.db` se reescribe entero (el más grande pesa 757 KB);
+- 72 productos al azar cambian 62 de los 379 buckets, casi todos con `.db`;
+- entre ellos están casi siempre los buckets grandes (`ca`, `co`, `po`…), y cada `.db` se reescribe entero (el más grande pesa 757 KB): se escriben unos 7,9 de los 9,9 MB de `.db`;
 - `tokens` (3,3 MB) se reescribe en cada compactación, como antes el snapshot.
 
 Lo que más lo bajaría es que el `.db` sea append‑only, aprovechando el append nativo de S3 Express: la compactación agrega al final solo las listas que cambiaron, y el `.idx` apunta a los offsets nuevos. Habría que validar los rangos por tamaño en vez de por ETag (un append cambia el ETag), y reescribir el `.db` cuando la basura pase de la mitad. No está implementado.
