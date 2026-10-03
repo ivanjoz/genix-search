@@ -1,6 +1,6 @@
 # Plan: índice de búsqueda con palabras de 5 bits, leído por rangos desde S3 Express
 
-> Estado: **implementado en `genix-s3/`** (2026-10-02), con el diseño A de D‑5B11 (postings por término). Los resultados medidos de la implementación están en la sección 13 y reemplazan a las estimaciones de Python donde difieren. Alternativa a [`plan.md`](plan.md) en las claves, el layout del índice y los formatos de archivo. Reusa su ruta de escritura, el overlay de `p.log` y la compactación.
+> Estado: **implementado en `genix-s3/`** (2026-10-02), con el diseño A de D‑5B11 (postings por término). Los resultados medidos de la implementación están en la sección 13 y reemplazan a las estimaciones de Python donde difieren. Reemplaza a los planes anteriores (`plan.md`, shards con colbin, y `PLAN_S3_EXPRESS.md`, sobre el servidor en Rust), que se borraron.
 > Objetivo: el backend recibe `polo spiderman rojo` y devuelve los IDs que más se acercan, **sin saber nada del corpus**: todo lo que necesita se calcula a partir de la consulta con tablas fijas, y el índice se lee por rangos de bytes.
 > **Qué se optimiza:** primero la **cantidad de requests a S3 por consulta**, después los **bytes leídos por consulta**. El tamaño de los archivos no es el objetivo: un índice 3× más grande vale la pena si baja las lecturas. **Pero la escritura tiene que seguir siendo eficiente**: se descartan diseños que multiplican los objetos o los PUT por escritura (por ejemplo, un objeto por palabra con append en cada cambio). El proyecto **solo devuelve IDs ranqueados**: se guardan IDs y claves de 5 bits (las primeras 8 letras de cada palabra), nunca texto. No se supone nada sobre el tamaño de la colección (`productos.csv` es solo un corpus de prueba) ni sobre los IDs del cliente (`uint32` arbitrarios).
 > **Formatos:** los archivos del índice (`k`, `p`), `p.log` y el snapshot son **solo bytes**, con layouts definidos acá. colbin se usa únicamente como formato de comunicación (request/response, en lugar de JSON) y para la metadata (manifest).
@@ -17,7 +17,7 @@
 - **Los números no ocupan letras.** Son `NUM_1`, `NUM_2` o `NUM_3` seguido de 1, 2 o 3 unidades con el valor en binario (`uint5`, `uint10`, `uint15`; más grande desborda). Quedan ordenados por valor y caben las 26 letras sin pérdida.
 - **Los postings son bits sin cabecera.** La cantidad, la codificación, el largo y el primer ID de cada lista están en el diccionario cacheado, así que una lista en `p` no lleva ningún byte de estructura. El primer ID va en el diccionario con **ancho fijo por slot**. Las diferencias entre IDs van con **un ancho fijo por lista o en varint de nibbles**, lo que ocupe menos en cada lista. Las listas de un slot van pegadas en bits. El 42 % de las palabras (las de un solo documento) se resuelve desde el diccionario, sin leer `p`.
 
-**Lecturas por consulta (implementación en Go, 13.2):** con el diccionario en caché, **1 ronda y 3,3–3,6 requests** contando `p.log`. Los bytes leídos dependen de cómo son los IDs del cliente: con IDs densos (autoincremento) son **1,0 KB** a 10k y **7,2 KB** a 100k; con IDs `uint32` aleatorios, 2,4 KB y 20,4 KB. En frío desde cero son 4 rondas. Bajar los requests es lo que queda por decidir (D‑5B10, D‑5B11).
+**Lecturas por consulta (implementación en Go, 13.2):** con el diccionario en caché, **1 ronda y 3,3–3,6 requests** contando `p.log`. Los bytes leídos dependen de cómo son los IDs del cliente: con IDs densos (autoincremento) son **1,0 KB** a 10k y **7,2 KB** a 100k; con IDs `uint32` aleatorios, 2,4 KB y 20,4 KB. En frío desde cero son 4 rondas. Bajar los requests es lo que queda por decidir (D‑5B10, D‑5B11). Una colección con menos de `MinIndexDocs` documentos (100 por defecto) no tiene índice y se busca con **1 request** (5.8).
 
 ---
 
@@ -57,7 +57,7 @@ Son 22 + 10 si los dígitos van dentro de las palabras. Pero conviene que no vay
 
 ### 2.2 Variante de 22 letras: plegado fonético solo para el slot
 
-Si se quieren 22 letras como tolerancia a errores (`vaca`/`baca`, `zapato`/`sapato`), **no hay que plegar la clave, solo el slot**: `slot = plegar(primeras 2 letras)`, con `v→b`, `z→s`, `w→u`, `k→c` (la regla D2 de `plan.md`). La clave conserva sus letras: `vaca` y `baca` siguen siendo distintas, pero caen en el mismo slot y el fuzzy las ve juntas. El slot sigue siendo una cuenta: `fold[u1]*32 + fold[u2]`.
+Si se quieren 22 letras como tolerancia a errores (`vaca`/`baca`, `zapato`/`sapato`), **no hay que plegar la clave, solo el slot**: `slot = plegar(primeras 2 letras)`, con `v→b`, `z→s`, `w→u`, `k→c`. No está implementado (D‑5B1). La clave conserva sus letras: `vaca` y `baca` siguen siendo distintas, pero caen en el mismo slot y el fuzzy las ve juntas. El slot sigue siendo una cuenta: `fold[u1]*32 + fold[u2]`.
 
 ### 2.3 Códigos 30 y 31: los fija el usuario de la librería
 
@@ -280,7 +280,7 @@ tail   Count × 2 bits            solo si Tail = 1
 - Una entrada por aparición, ordenadas por `(ID, pos)`: la misma palabra dos veces en un documento da `gap = 0`.
 - **El builder elige el `Codec` que ocupe menos en cada lista.** El ancho fijo gana cuando las diferencias son parecidas (IDs sin relación con el texto). Los nibbles ganan cuando hay muchas diferencias chicas y pocas grandes, porque una sola diferencia grande ya no obliga a ensanchar todas. Medido en 6.1.
 - **Rangos:** una palabra es `bytes(j)`; un prefijo es un solo rango, desde la primera hasta la última clave del tramo; un slot entero es `[POff[s], POff[s+1])`. El lector salta los `bitOff mod 8` bits del primer byte.
-- **Por qué pegadas y no alineadas a byte:** alinear cada lista desperdicia 1,76 KB a 10k (1,6 % de `p`, medido) y no da nada, porque los offsets se calculan igual y el lector de bits arranca en cualquier bit. Lo único que se pierde es leer `p` a ojo con un hexdump: lo cubre un `gxs dump` que decodifica slot por slot.
+- **Por qué pegadas y no alineadas a byte:** alinear cada lista desperdicia 1,76 KB a 10k (1,6 % de `p`, medido) y no da nada, porque los offsets se calculan igual y el lector de bits arranca en cualquier bit. Lo único que se pierde es leer `p` a ojo con un hexdump: lo cubre `gxs inspect PALABRA`, que decodifica el slot de la palabra.
 
 ### 5.3 Integridad de `p` por páginas
 
@@ -290,7 +290,7 @@ tail   Count × 2 bits            solo si Tail = 1
 
 ### 5.4 `p.log`
 
-Misma semántica que `plan.md` 4.6 (seq, borrados, marca de compactación), en bytes. **No guarda texto**: el writer normaliza al recibir y guarda solo las claves de 5 bits del documento.
+Es el log de cambios desde la última compactación, y toda consulta lo lee. Cada op tiene un número de secuencia (`seq`) y es un alta o edición (el ID con sus claves nuevas) o un borrado. La `Base` dice sobre qué generación y hasta qué `seq` está compactado el resto. **No guarda texto**: el writer normaliza al recibir y guarda solo las claves de 5 bits del documento.
 
 **Tokens de un documento** (formato común a `p.log` y al snapshot):
 
@@ -312,7 +312,7 @@ p.log := Base Frame*
 Base (36 B):
   0   magic "GXL1"       4
   4   Format             uint16
-  6   reservado          uint16 (0)
+  6   flags              uint16     bit 0 = LogOnly (5.8)
   8   NormID             uint32     normalizador + códigos 30/31 (2.3)
   12  ManifestGen        uint32
   16  LastSeq            uint64
@@ -324,7 +324,8 @@ Frame := tag uint8 | len uint32 | crc32c uint32 | body[len]
   tag 1 Batch    FirstSeq uint64 | n uint16 | n × Op
                  Op := ID uint32 | flags uint8 (bit 0 = borrado) | tokLen uint16 | tokens[tokLen]
                  seq del op i = FirstSeq + i; un borrado lleva tokLen = 0
-  tag 2 Compact  TargetSeq uint64 | UnixMs int64
+  tag 2 Compact  TargetSeq uint64 | UnixMs int64     pide compactar hasta TargetSeq
+  tag 3 Docs     solo sin índice (5.8)
 ```
 
 - El overlay de la consulta usa las claves tal como están: no normaliza nada al leer el log.
@@ -348,18 +349,18 @@ Chunks de ~1 000 documentos. Es el estado `ID → claves` vigente. La compactaci
 
 ### 5.6 Manifest (colbin)
 
-Es metadata y sigue en colbin, como en `plan.md` 4.5: generación, `LastSeq`, `NormalizerVersion`, la configuración de los códigos 30 y 31 con su `NormID` (2.3) y, para `k`, `p` y el snapshot, su generación y tamaño. El protocolo de consulta y escritura (`QueryRequest`, `QueryResponse`, `WriteRequest`) también es colbin.
+Es metadata y va en colbin: generación, `LastSeq`, `NormalizerVersion`, la configuración de los códigos 30 y 31 con su `NormID` (2.3), la cantidad de documentos y de claves, los tamaños de `k`, `p` y el snapshot, y `CreatedUnixMs` (el reclamo de la generación, 8). El protocolo de consulta (`QueryRequest`, `QueryResponse`, `Searcher.Serve`) también es colbin. El de escritura todavía no existe: se escribe con la API de Go.
 
 ### 5.7 Partición (a escala)
 
 Un `k`/`p` por generación hace que compactar reescriba todo. Con 10k es trivial (~170 KB). A 1M es del orden de decenas de MB por compactación. Opciones, en orden de complejidad:
 
-1. Partir `p` por primera letra (26 objetos + números), con el `SlotDir` global en `k` y un `POff` relativo a cada objeto. Una compactación reescribe solo las letras tocadas, aunque las palabras frecuentes cubren casi todas (`plan.md` 1.1).
-2. El delta por partición de `plan.md` 6.3, con el mismo layout.
+1. Partir `p` por primera letra (26 objetos + números), con el `SlotDir` global en `k` y un `POff` relativo a cada objeto. Una compactación reescribe solo las letras tocadas, aunque con ~7 palabras por documento un lote de cambios toca casi todas.
+2. Base + delta por partición: la base no se reescribe, y cada compactación reescribe un delta acumulativo con las listas de los IDs cambiados (y esos IDs, para anular sus postings en la base). Cuando el delta pasa una fracción de la base (~10 %), se mezclan. La consulta lee base y delta en la misma ronda. El snapshot, que pesa más que el índice, sigue la misma regla.
 
 ### 5.8 Colecciones chicas: sin índice, solo `p.log`
 
-`MinIndexDocs` (`GENIX_MIN_INDEX_DOCS`, **100 por defecto**, configurable en `genix.Config` y en `gxs -min-index-docs`): una colección con menos documentos **no tiene índice**: ni `k`, ni `p`, ni snapshot, ni manifest. Todo está en `p.log`:
+`MinIndexDocs` (**100 por defecto**, configurable en `genix.Config` y en `gxs -min-index-docs`): una colección con menos documentos **no tiene índice**: ni `k`, ni `p`, ni snapshot, ni manifest. Todo está en `p.log`:
 
 ```
 p.log := Base (flags bit 0 = LogOnly) | Docs | Frame*
@@ -459,7 +460,8 @@ Para palabras con millones de postings (`ml`, `pack`), una variante de ancho fij
 4. diccionario     → recorrer el SlotBlock de cada slot (en caché)
                      exacto; la última palabra también como prefijo; typos: 7.4
                      Count = 1 → el posting ya está en el diccionario
-5. rangos          → bitOff(j), bits(j) → rangos en p.<gen>, redondeados a páginas; se fusionan
+5. rangos          → bitOff(j), bits(j) → rangos en p.<gen>; se fusionan los cercanos
+                     (y se redondean a páginas solo con VerifyPages, 5.3)
 6. UNA ronda       → GET p.log + GET de los rangos de p.<gen>, en paralelo
 7. puntuar         → cobertura, adyacencia por posición, IDF por Count,
                      bonus si la cola coincide, overlay de p.log
@@ -481,7 +483,7 @@ En frío la generación sale de `p.log`, así que antes de leer `k` hay una rond
 
 La última palabra se busca también como prefijo. Con 2 letras, el prefijo es el slot entero (`ca`: 280 claves a 10k, ×10 a 100k), y con 1 letra son 27 slots seguidos, que también son un solo rango de `p`. Para que un prefijo corto no lea medio índice:
 
-- se ordenan las claves del tramo por `Count` y se toman las de más documentos hasta un presupuesto de bytes (`GENIX_PREFIX_BUDGET_KB`, 32 KB por defecto), con los largos calculados de 5.1. Las claves con `Count = 1` no cuestan nada (están en el diccionario) y entran siempre;
+- se ordenan las claves del tramo por `Count` y se toman las de más documentos hasta un presupuesto de bytes (`Options.PrefixBudget`, 32 KB por defecto), con los largos calculados de 5.1. Las claves con `Count = 1` no cuestan nada (están en el diccionario) y entran siempre;
 - **si el término no tiene clave exacta**, la mejor clave del tramo entra aunque pase el presupuesto: el término lee lo mismo que leería una palabra exacta. Sin esto, una palabra frecuente a medio escribir (`carre` a 100k) no encontraba nada;
 - con 1 letra (o 1 dígito), el prefijo no se expande: solo cuenta la palabra exacta (`x`, `l`);
 - la respuesta marca `Approx` cuando el presupuesto dejó claves afuera.
@@ -499,7 +501,33 @@ La última palabra se busca también como prefijo. Con 2 letras, el prefijo es e
 
 ## 8. Escritura
 
-Igual que `plan.md`, con los formatos de 5.4 y 5.5: append de un frame `Batch` a `p.log` y overlay en cada consulta (el overlay normaliza y genera claves y colas con las mismas funciones que el builder). La compactación genera nuevos `k`/`p`: ordenar claves, concatenar listas y escribir cada `SlotBlock`.
+Implementado en `internal/collection` y `internal/plog`.
+
+**Append** (`Put`, `Delete`):
+
+1. El writer normaliza el texto y genera las claves y colas con las mismas funciones que el builder. La consulta usa las claves del log tal como están.
+2. Lee `p.log` (un GET) y arma un frame `Batch` con `seq` = último + 1, …
+3. Lo agrega con el append nativo de S3 Express (`WriteOffsetBytes` = el tamaño leído). Un batch es un solo append, que es atómico.
+4. Si el offset no coincide (otro writer o una compactación tocaron el log), vuelve a leer y reintenta. Así varios writers quedan serializados sin locks.
+5. Si lo agregado desde la base pasa `CompactBytes`, o la colección llega a `MinIndexDocs` (5.8), el mismo append lleva un frame `Compact` y el resultado dice `CompactRequested`. Quien escribe llama a `Compact`: la librería no dispara nada sola.
+
+**Compactación** (`Compact`):
+
+1. Lee `p.log`: la base (generación M) y las ops pendientes hasta `TargetSeq`, el último `seq`. Un log con la cola corrupta no se compacta.
+2. Lee el snapshot de M (o el frame `Docs`, sin índice), le aplica las ops y construye `k`, `p` y el snapshot de G = M + 1.
+3. **Reclamo:** `PUT m/<G>.cbm` con `If-None-Match`. Va antes que los objetos, así que solo una compactación escribe objetos con G en la clave. Si G es un reclamo abandonado (sin publicar y más viejo que `ClaimTimeout`, 5 min), usa el siguiente número libre.
+4. Escribe `k`, `p` y el snapshot.
+5. **Commit:** reescribe `p.log` con `If-Match`: la base nueva (G, `TargetSeq`) más las ops y los pedidos de compactación posteriores a `TargetSeq`. Si recibe 412 (un writer agregó algo en el medio), vuelve a leer y reintenta. Si la base ya no es la que leyó en el paso 1, aborta con `ErrConflict` y borra su reclamo y sus objetos.
+6. **GC** sin `List`, best effort: borra la generación M − 1. La M sigue viva, porque una consulta que leyó `p.log` antes del commit puede estar leyéndola.
+
+**Por qué no se pierde nada:**
+
+- Los writers solo agregan, con un offset exacto, y la compactación solo reescribe el log con `If-Match`. Ninguno puede pisar al otro sin que el otro reciba un error.
+- Las ops que llegan durante la compactación tienen `seq > TargetSeq` y se conservan en el rebase.
+- Las consultas leen `p.log` entero, y S3 tiene consistencia fuerte: ven el log viejo con la base M o el nuevo con la base G, nunca una mezcla. Si la generación que la consulta tenía en caché ya no está, la descarta y reintenta.
+- Igual, el lector verifica `len` y `crc` de cada frame y descarta un frame final cortado.
+
+**Verificado en un directory bucket** (`s3blob`, 13.6): el append con `WriteOffsetBytes`, `If-None-Match` e `If-Match` se comportan como supone el diseño, también con escritores concurrentes. La cola SQS FIFO que se había previsto por si faltaba `If-Match` no hace falta.
 
 ---
 
@@ -543,14 +571,14 @@ El relleno es como mucho 7 bits por bloque alineado: a 10k, < 300 B en `k` y otr
 
 ## 12. Plan de trabajo
 
-Hecho los 6 puntos (13.1). Queda: la suite de relevancia de `plan.md` 9.2 (la comparación de ranking de 13.3 es contra referencias, no contra juicios humanos), el cliente de S3 real (hoy `blob.FS`), y D‑5B11.
+Hecho: el alfabeto y las claves, el normalizador v4, `k` y `p`, `p.log` y el snapshot, la consulta, la escritura con compactación, el modo sin índice y las mediciones (13). Queda:
 
-1. **`internal/key5`:** clave de 8 letras, slot, cola, clave numérica `NUM_n` (canónica, overflow a 15 bits), y codificación/decodificación del stream de un slot con la cabecera de 1 unidad. Tests: el orden de las claves es el orden de los strings cortados en 8; roundtrip de los 28 pares `(s, L)`; prefijos.
-2. **Normalizador v4:** corte entre letras y dígitos, ceros iniciales. Regenerar `normalize_golden.cb`.
-3. **`internal/kfile` y `internal/pfile`:** writer y reader de los layouts de 5.1–5.3, con tests de bytes dorados, `Count = 1` dentro del diccionario, elección de `Codec` por lista (verificar que siempre se elige el menor), largo calculado de las listas y verificación por páginas. Reader por rangos sobre la interfaz `Blob` que ya existe.
-4. **`p.log` y snapshot en bytes** (5.4, 5.5), con pruebas de append cortado.
-5. **Consulta:** exacto, prefijo (con presupuesto y prefijo numérico), cola, fuzzy con edit distance de prefijo para claves de 8 letras, y slots vecinos, contra la suite de relevancia de `plan.md` 9.2. Medir especialmente cuánto cambia el ranking por el corte en 8.
-6. **Medir requests y bytes leídos por consulta** (`reads.py` como referencia), en caliente y en frío, contra la implementación actual de `genix-s3`. El tamaño de los archivos se reporta, pero no decide.
+1. ~~**Cliente de S3 real.**~~ Hecho: `s3blob`, verificado contra un directory bucket (13.6). Falta medir la latencia por ronda desde la misma AZ.
+2. **D‑5B11**, el contrato del ranking, que decide D‑5B10 y si se puede bajar a 1 request de datos (6.3).
+3. **Suite de relevancia con juicios humanos.** La comparación de 13.3 es contra referencias que aplican las mismas reglas, no contra lo que un usuario espera. Casos: `spiderman polo` contra `polo spiderman rojo`, `pimienta moli`, `sunrise tequila`, tildes y `ñ`, `carrefour` ≡ `carefour`, `pollo` ≠ `polo`, `sin gluten`, typos (`spidreman`, `camizeta`), que un match con typo nunca supere al exacto, y cuánto cambia el ranking por el corte en 8.
+4. **Lambdas** de consulta y de escritura (protocolo de escritura en colbin) y el disparo asíncrono de la compactación.
+5. **Fuzzing** de los lectores de `k`, `p.log` y el snapshot.
+6. **Partición** (5.7) cuando la compactación pese.
 
 ---
 
@@ -558,22 +586,24 @@ Hecho los 6 puntos (13.1). Queda: la suite de relevancia de `plan.md` 9.2 (la co
 
 ### 13.1 Código (`genix-s3/`)
 
-El código anterior de `genix-s3` (shards con colbin) se borró. Hay copia en `../genix-s3-legacy-2026-10-02.tar.gz`, fuera del repo.
+El código anterior de `genix-s3` (shards con colbin) y sus planes se borraron. Hay copia en `../genix-s3-legacy-2026-10-02.tar.gz` y `../genix-plans-legacy-2026-10-02.tar.gz`, fuera del repo.
 
 | Paquete | Qué hace |
 |---|---|
-| `genix` (raíz) | API pública: `Config{Extra}`, `NewIndexer`, `NewSearcher`, `Serve` (request/response en colbin) |
+| `genix` (raíz) | API pública: `Config{Extra, MinIndexDocs}`, `NewIndexer`, `NewSearcher`, `Serve` (request/response en colbin) |
 | `internal/bits` | Lector y escritor de bits LSB‑first |
+| `internal/blob` | La interfaz del store, `blob.FS` (directorio local) y `blobtest`, el contrato que todo store cumple |
+| `s3blob` | El store en S3: append nativo en un directory bucket (`--x-s3`), emulado con GET + PUT `If-Match` en un bucket de propósito general |
 | `internal/normalize` | Normalizador v4 (letras/dígitos separados, letras extra 30/31, `NormID`) |
 | `internal/key5` | Claves de 5 bits, `NUM_n`, slot, cola, stream de un slot, stream de tokens, edit distance de prefijo |
 | `internal/index` | `k` y `p` (5.1–5.3): builder, reader por slot, decodificación de listas, páginas |
 | `internal/plog`, `internal/snapshot` | 5.4 y 5.5 en bytes |
 | `internal/manifest` | 5.6 en colbin |
-| `internal/collection` | Escritura: `Init`, `Put`, `Delete`, `Compact` (claim con If‑None‑Match, rebase de `p.log` con If‑Match, GC de la generación anterior) |
+| `internal/collection` | Escritura (8): `Init`, `Put`, `Delete`, `Compact` (claim con If‑None‑Match, rebase de `p.log` con If‑Match, GC de la generación anterior, cambio de modo de 5.8) |
 | `internal/query` | Consulta: plan (exacto, prefijo con presupuesto, typos), rondas, caché de slots, overlay, ranking |
 | `cmd/gxs` | CLI: `build`, `query`, `put`, `del`, `compact`, `log`, `inspect PALABRA` (el dump por slot de 5.2) |
 
-Tests (todos con `-race`): bytes dorados de `p` y de un `SlotBlock`, roundtrip y corrupción byte por byte de `k`, el `Codec` elegido siempre es el menor, `p.log` cortado en cada byte, appends concurrentes, compactación con generación cacheada, búsquedas concurrentes con escrituras y compactaciones, y **el motor contra una referencia que rankea todos los documentos con las mismas reglas**, con ops pendientes en `p.log`.
+Tests (todos con `-race`): bytes dorados de `p` y de un `SlotBlock`, roundtrip y corrupción byte por byte de `k`, el `Codec` elegido siempre es el menor, `p.log` cortado en cada byte, appends concurrentes, compactación con generación cacheada, búsquedas concurrentes con escrituras y compactaciones, **el motor contra una referencia que rankea todos los documentos con las mismas reglas**, con ops pendientes en `p.log`, y el ciclo de vida sin índice → con índice → sin índice (5.8), incluida la carrera entre dos compactaciones sin índice.
 
 ### 13.2 Lecturas por consulta
 
@@ -607,7 +637,7 @@ Qué dicen:
 - **Las estimaciones de `reads.py` (1 229 B con IDs aleatorios) eran optimistas.** La implementación lee 2,4 KB.
 - **Fusionar rangos** (`CoalesceGap` 4 KB): −0,15 requests y +260 B a 10k con IDs densos; a 100k casi no cambia nada, porque las listas de una consulta caen en slots lejanos.
 - **Verificar páginas** (5.3): de 1,0 a 10,9 KB a 10k, y de 7,2 a 18,0 KB a 100k. Queda desactivado.
-- **`p.log` se lee en cada consulta**: lleno (4,1 KB, 71 appends de un documento) suma ~4 KB por consulta. `GENIX_LOG_COMPACT_BYTES` es la perilla.
+- **`p.log` se lee en cada consulta**: lleno (4,1 KB, 71 appends de un documento) suma ~4 KB por consulta. `Options.CompactBytes` (4 KB por defecto) es la perilla.
 - **En frío** el piso son las 4 rondas (`p.log` → manifest y `SlotDir` → slots → listas). Leer `k` entero (`Preload`) ahorra una ronda a cambio de ~60–70 KB.
 
 ### 13.3 Ranking
@@ -642,3 +672,12 @@ La compactación reescribe `k`, `p` y el snapshot enteros: el costo crece con la
 - Build: 28 ms.
 
 El ranking elige el top `offset + limit` con un heap en vez de ordenar todos los candidatos, y los matches de cada documento van en slabs. Las dos cosas bajaron la búsqueda de 241 µs y 1 218 allocs a los valores de arriba.
+
+### 13.6 S3 Express real
+
+Directory bucket `genix-test--use1-az4--x-s3` (us-east-1). Los tests corren con `GENIX_S3_TEST_BUCKET=<bucket> go test ./s3blob`; sin la variable se saltan.
+
+- **Contrato** (`blobtest`, el mismo que cumple `blob.FS`): `If-None-Match` y `If-Match` devuelven 412, un `If-Match` sobre una clave inexistente cuenta como precondición fallida, el append con un offset viejo falla, y con 8 escritores a la vez sobre el mismo offset o la misma clave nueva gana exactamente uno. Un rango que empieza justo en el final devuelve vacío, como en el store local; S3 responde 416, y `s3blob` lo resuelve con un `HEAD`.
+- **Ciclo de vida con la API pública** (`TestLifecycle`): build de 300 documentos, 40 `Put` desde 4 escritores concurrentes, un `Delete`, compactación (gen 2, 41 ops, 4 lecturas, 5 escrituras, 19 KB) y búsquedas antes y después. En frío: 4 rondas y 5 requests. En caliente: 1 ronda y 2 requests.
+- **Latencia desde fuera de AWS** (WAN, no la AZ): ~100 ms por request en GET, rango, append y PUT. Casi todo es el viaje de ida y vuelta; falta medir desde una Lambda en `use1-az4`.
+- Un bucket de propósito general no tiene append. `s3blob` lo emula con GET + PUT `If-Match`, que reescribe el objeto entero (`p.log` pesa ≤ 4 KB). Ese camino todavía no se probó contra S3.
