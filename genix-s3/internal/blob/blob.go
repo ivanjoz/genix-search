@@ -1,9 +1,9 @@
 // Package blob is the object store under the engine: S3 Express One Zone in
 // production, a directory on disk for tests and the CLI.
 //
-// The interface is exactly the subset of S3 the design relies on (plan.md
-// §8.1): range reads, conditional puts, and the native append of directory
-// buckets, whose write offset is what serialises concurrent writers.
+// The interface is exactly the subset of S3 the design relies on
+// (PLAN_5BIT.md §8): range reads, conditional puts, and the native append of
+// directory buckets, whose write offset is what serialises concurrent writers.
 package blob
 
 import (

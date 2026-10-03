@@ -11,12 +11,12 @@ import (
 	"github.com/ivanjoz/genix-search/genix-s3/internal/blob"
 )
 
-// DefaultCompactBytes is GENIX_LOG_COMPACT_BYTES: once the appends since the
+// DefaultCompactBytes is the default CompactBytes: once the appends since the
 // last compaction pass it, an append asks for a compaction. Every query reads
 // the whole log, so it is kept small.
 const DefaultCompactBytes = 4096
 
-// DefaultMinIndexDocs is GENIX_MIN_INDEX_DOCS: a collection with fewer
+// DefaultMinIndexDocs is the default MinIndexDocs: a collection with fewer
 // documents has no index, only p.log.
 const DefaultMinIndexDocs = 100
 

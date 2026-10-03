@@ -63,17 +63,15 @@ Releases are built on a developer machine and uploaded to GitHub. Nothing is
 compiled in CI: RocksDB comes from source for all three targets, which is far
 too heavy for a hosted runner.
 
-1. Update [`CHANGELOG.md`](./CHANGELOG.md) under the active version with the
-   user-facing changes.
-2. Bump the version in `Cargo.toml` (`[package] version = ...`) following
+1. Bump the version in `Cargo.toml` (`[package] version = ...`) following
    [Semantic Versioning](https://semver.org/), and commit.
-3. Build all three targets — expect this to take a while:
+2. Build all three targets — expect this to take a while:
 
    ```sh
    scripts/release_binaries.sh          # or: task release
    ```
 
-4. Check what you are about to publish, then publish it:
+3. Check what you are about to publish, then publish it:
 
    ```sh
    scripts/publish_release.sh --dry-run

@@ -110,11 +110,31 @@ overridable env vars.
 * [`PROTOCOL.md`](PROTOCOL.md) — channel commands, syntax, response format.
 * [`CONFIGURATION.md`](CONFIGURATION.md) — every `genixsearch.cfg` knob.
 * [`INNER_WORKINGS.md`](INNER_WORKINGS.md) — index, ingest, query walkthrough.
-* [`docs/refactoring.md`](docs/refactoring.md) — design doc the rewrite
-  followed.
-* [`docs/bigrams.md`](docs/bigrams.md) — frequency-ordered Spanish bigram
-  groups that drive the letter-pair encoder.
-* [`CHANGELOG.md`](CHANGELOG.md) — release history.
+* [`PACKAGING.md`](PACKAGING.md) — release assets and how to cut a release.
+* [`CONTRIBUTING.md`](CONTRIBUTING.md) — local checks before a change.
+* [`PLAN_5BIT.md`](PLAN_5BIT.md) — design and measurements of `genix-s3` (in
+  Spanish).
+
+## genix-s3: the S3 Express One Zone index
+
+[`genix-s3/`](genix-s3) is a separate Go library, not a part of the server
+above. It keeps the index in an S3 Express One Zone directory bucket and is
+built to answer a query with as few requests and bytes read as possible. It
+returns ranked IDs and stores no text: each word is reduced to its first 8
+letters in 5-bit units, and numbers to their binary value. Collections under
+100 documents (`MinIndexDocs`) have no index at all and are searched with a
+single read.
+
+```sh
+cd genix-s3
+go test -race ./...
+go run ./cmd/gxs build -csv ../scripts/perf/data/productos.csv
+go run ./cmd/gxs query polo spiderman rojo
+```
+
+Only a local directory stands in for the bucket so far; the real S3 client is
+pending. Formats, query path, write path and measurements are in
+[`PLAN_5BIT.md`](PLAN_5BIT.md).
 
 ## License
 

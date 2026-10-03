@@ -21,8 +21,8 @@ import (
 
 // Options are the query tunables.
 type Options struct {
-	// PrefixBudget is GENIX_PREFIX_BUDGET_KB: the bytes of p a prefix (or a
-	// typo expansion) may read; the most frequent keys go first.
+	// PrefixBudget is the bytes of p a prefix (or a typo expansion) may read;
+	// the most frequent keys go first.
 	PrefixBudget int64
 	// CoalesceGap is the largest hole merged into one range read: S3 has no
 	// multi-range GET, so two lists close together cost one request.

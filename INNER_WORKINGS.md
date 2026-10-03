@@ -2,8 +2,7 @@
 
 This document walks through what happens inside GenixSearch when a client
 issues a command. It assumes you have read [`README.md`](README.md) for the
-big picture and [`docs/refactoring.md`](docs/refactoring.md) for the design
-the implementation follows.
+big picture.
 
 ## 1. The shape of the index
 
@@ -35,8 +34,7 @@ bits 2-0 : reserved
 
 Both Adjacent and Wrap postings for the same `(word1, word2)` pair live
 under a single RocksDB key; the kind bit distinguishes them at read
-time. The design rationale and full bit-layout reasoning is in
-[`docs/position-aware-postings.md`](docs/position-aware-postings.md).
+time.
 
 Indices `5` and `6` are reserved for optional exact-token / exact-pair
 verification hashes (not built in v1).
@@ -50,8 +48,8 @@ raw UTF-8 token:
    drop everything that is not `a-z` / `0-9` inside a token, collapse
    repeated consecutive letters (`aaa → a`).
 2. Split the normalised text into non-overlapping two-character pairs.
-3. Map each pair to a `u8` group code from
-   [`docs/bigrams.md`](docs/bigrams.md). Code `255` is reserved.
+3. Map each pair to a `u8` group code from the frequency-ordered table in
+   `src/pair/spanish_bigrams.rs`. Code `255` is reserved.
 4. Numeric runs consume two `u8` units: `[NUM_FLAG=255][bucket(value)]`.
    `bucket()` is a fixed quantiser with finer resolution for small numbers
    (steps of 1 up to 80, then 5, then 15, …, capped at code 254).
