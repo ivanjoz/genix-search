@@ -1,12 +1,12 @@
 package blob
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -39,37 +39,32 @@ func (s *FS) path(key string) (string, error) {
 	return filepath.Join(s.Root, filepath.FromSlash(key)), nil
 }
 
-func (s *FS) GetRange(_ context.Context, key string, off, n int64) ([]byte, error) {
+// GetRange reads the whole file, under the lock, so the range and the ETag
+// are of the same version.
+func (s *FS) GetRange(_ context.Context, key string, off, n int64) ([]byte, string, error) {
 	path, err := s.path(key)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
-	file, err := os.Open(path)
+	s.mu.Lock()
+	whole, err := os.ReadFile(path)
+	s.mu.Unlock()
+
 	if err != nil {
-		return nil, mapNotFound(err)
-	}
-	defer file.Close()
-
-	info, err := file.Stat()
-	if err != nil {
-		return nil, err
+		return nil, "", mapNotFound(err)
 	}
 
-	if off < 0 || off > info.Size() {
-		return nil, fmt.Errorf("blob: range %d out of %d bytes of %s", off, info.Size(), key)
+	size := int64(len(whole))
+	if off < 0 || off > size {
+		return nil, "", fmt.Errorf("blob: range %d out of %d bytes of %s", off, size, key)
 	}
 
-	if n < 0 || off+n > info.Size() {
-		n = info.Size() - off
+	if n < 0 || off+n > size {
+		n = size - off
 	}
 
-	data := make([]byte, n)
-	if _, err := file.ReadAt(data, off); err != nil && !errors.Is(err, io.EOF) {
-		return nil, err
-	}
-
-	return data, nil
+	return bytes.Clone(whole[off : off+n]), etag(whole), nil
 }
 
 func (s *FS) Get(_ context.Context, key string) ([]byte, string, error) {

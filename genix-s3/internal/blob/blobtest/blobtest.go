@@ -81,7 +81,8 @@ func Run(t *testing.T, store blob.Blob, prefix string) {
 	t.Run("Range", func(t *testing.T) {
 		k := key("range")
 
-		if _, err := store.Put(ctx, k, []byte("0123456789"), blob.PutCond{}); err != nil {
+		etag, err := store.Put(ctx, k, []byte("0123456789"), blob.PutCond{})
+		if err != nil {
 			t.Fatal(err)
 		}
 
@@ -94,17 +95,28 @@ func Run(t *testing.T, store blob.Blob, prefix string) {
 			{7, 10, "789"}, // past the end: clamped
 			{6, -1, "6789"},
 			{10, -1, ""}, // at the end: empty, not an error
+			{3, 0, ""},
 		}
 
 		for _, c := range cases {
-			got, err := store.GetRange(ctx, k, c.off, c.n)
-			if err != nil || string(got) != c.want {
-				t.Errorf("GetRange(%d, %d) = %q, %v; want %q", c.off, c.n, got, err, c.want)
+			got, tag, err := store.GetRange(ctx, k, c.off, c.n)
+			if err != nil || string(got) != c.want || tag != etag {
+				t.Errorf("GetRange(%d, %d) = %q, %q, %v; want %q, %q", c.off, c.n, got, tag, err, c.want, etag)
 			}
 		}
 
-		if _, err := store.GetRange(ctx, k, 11, -1); err == nil || errors.Is(err, blob.ErrNotFound) {
+		if _, _, err := store.GetRange(ctx, k, 11, -1); err == nil || errors.Is(err, blob.ErrNotFound) {
 			t.Errorf("range past the end: %v", err)
+		}
+
+		// After a rewrite, a range carries the new ETag.
+		etag2, err := store.Put(ctx, k, []byte("abcdefghij"), blob.PutCond{})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if got, tag, err := store.GetRange(ctx, k, 1, 2); err != nil || string(got) != "bc" || tag != etag2 || tag == etag {
+			t.Errorf("GetRange after a rewrite = %q, %q, %v; want \"bc\", %q", got, tag, err, etag2)
 		}
 	})
 
@@ -115,7 +127,7 @@ func Run(t *testing.T, store blob.Blob, prefix string) {
 			t.Errorf("Get: %v", err)
 		}
 
-		if _, err := store.GetRange(ctx, k, 0, 4); !errors.Is(err, blob.ErrNotFound) {
+		if _, _, err := store.GetRange(ctx, k, 0, 4); !errors.Is(err, blob.ErrNotFound) {
 			t.Errorf("GetRange: %v", err)
 		}
 

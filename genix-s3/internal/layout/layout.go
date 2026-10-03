@@ -1,5 +1,5 @@
 // Package layout names every object of a collection in the bucket
-// (PLAN_5BIT.md §5.0).
+// (PLAN_BUCKETS.md §1).
 package layout
 
 import (
@@ -24,15 +24,19 @@ func New(root, collection, partition string) (Collection, error) {
 	return Collection{prefix: root + collection + "/" + partition + "/"}, nil
 }
 
-func (c Collection) Log() string                { return c.prefix + "p.log" }
-func (c Collection) Manifest(gen uint32) string { return fmt.Sprintf("%sm/%08d.cbm", c.prefix, gen) }
-func (c Collection) Snapshot(gen uint32) string {
-	return fmt.Sprintf("%ssnap/%08d.snap", c.prefix, gen)
-}
-func (c Collection) K(gen uint32) string { return fmt.Sprintf("%sk.%08d", c.prefix, gen) }
-func (c Collection) P(gen uint32) string { return fmt.Sprintf("%sp.%08d", c.prefix, gen) }
+func (c Collection) Log() string    { return c.prefix + "p.log" }
+func (c Collection) Tokens() string { return c.prefix + "tokens" }
+func (c Collection) Lease() string  { return c.prefix + "compact.lease" }
 
-// Objects are the data objects of a generation, besides its manifest.
-func (c Collection) Objects(gen uint32) []string {
-	return []string{c.K(gen), c.P(gen), c.Snapshot(gen)}
+// Idx and DB are the objects of the bucket of a slot: "ca.idx", "ca.db".
+func (c Collection) Idx(slot uint16) string { return c.prefix + BucketName(slot) + ".idx" }
+func (c Collection) DB(slot uint16) string  { return c.prefix + BucketName(slot) + ".db" }
+
+// unitChars names the 32 units: 0 for End, the letters, then 1–5 for the
+// numbers and the extra letters.
+const unitChars = "0abcdefghijklmnopqrstuvwxyz12345"
+
+// BucketName is the two characters of a slot, its two leading units.
+func BucketName(slot uint16) string {
+	return string([]byte{unitChars[slot>>5&31], unitChars[slot&31]})
 }

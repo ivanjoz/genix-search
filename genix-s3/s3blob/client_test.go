@@ -30,7 +30,7 @@ func TestClient(t *testing.T) {
 			t.Fatalf("%s %q: %v", part, query, err)
 		}
 
-		t.Logf("%s %q: gen %d, %d hits, %d rounds, %d requests, %d B, log only %v", part, query, resp.Gen, len(resp.Hits), resp.Stats.Rounds, resp.Stats.Requests, resp.Stats.Bytes, resp.Stats.LogOnly)
+		t.Logf("%s %q: seq %d, %d hits, %d rounds, %d requests, %d B, log only %v", part, query, resp.Seq, len(resp.Hits), resp.Stats.Rounds, resp.Stats.Requests, resp.Stats.Bytes, resp.Stats.LogOnly)
 
 		return resp
 	}

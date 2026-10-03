@@ -79,6 +79,115 @@ func AppendSlot(w *bits.Writer, keys []Key) ([]uint32, error) {
 	return restarts, nil
 }
 
+// AppendBucket writes the keys of one slot as AppendSlot does, without
+// restarts: what a bucket's dictionary holds, which is always decoded whole
+// (PLAN_BUCKETS.md §2.2). ReadSlot reads it.
+func AppendBucket(w *bits.Writer, keys []Key) error {
+	var prev Key
+
+	for i, k := range keys {
+		if i > 0 && (k <= prev || k.Slot() != prev.Slot()) {
+			return fmt.Errorf("key5: slot keys out of order: %s after %s", k, prev)
+		}
+
+		l := k.rest()
+		s := 0
+
+		if i > 0 {
+			for s < l && s < prev.rest() && k.Unit(2+s) == prev.Unit(2+s) {
+				s++
+			}
+		}
+
+		w.Write(uint64(HeaderCode(s, l)), 5)
+
+		for j := s; j < l; j++ {
+			w.Write(uint64(k.Unit(2+j)), 5)
+		}
+
+		prev = k
+	}
+
+	return nil
+}
+
+// AppendKeys writes keys of any slot, sorted and distinct, front-coded: per
+// key the units it shares with the previous one (3 bits), its units − 1 (3
+// bits), and its other units (PLAN_BUCKETS.md §2.2).
+func AppendKeys(w *bits.Writer, keys []Key) error {
+	var prev Key
+	prevLen := 0
+
+	for i, k := range keys {
+		if i > 0 && k <= prev {
+			return fmt.Errorf("key5: keys out of order: %s after %s", k, prev)
+		}
+
+		l := k.Len()
+		if l == 0 {
+			return errors.New("key5: empty key")
+		}
+
+		s := 0
+		for s < l && s < prevLen && s < MaxUnits-1 && k.Unit(s) == prev.Unit(s) {
+			s++
+		}
+
+		w.Write(uint64(s), 3)
+		w.Write(uint64(l-1), 3)
+
+		for j := s; j < l; j++ {
+			w.Write(uint64(k.Unit(j)), 5)
+		}
+
+		prev, prevLen = k, l
+	}
+
+	return nil
+}
+
+// ReadKeys decodes n keys written by AppendKeys.
+func ReadKeys(r *bits.Reader, n int) ([]Key, error) {
+	keys := make([]Key, n)
+
+	var prev Key
+	prevLen := 0
+
+	for i := range keys {
+		s, l := int(r.Read(3)), int(r.Read(3))+1
+		if s > prevLen || s > l {
+			return nil, ErrCorrupt
+		}
+
+		k := prev.prefix(s)
+		for j := s; j < l; j++ {
+			k |= Key(r.Read(5)) << (35 - 5*j)
+		}
+
+		if r.Err() != nil || (i > 0 && k <= prev) {
+			return nil, ErrCorrupt
+		}
+
+		keys[i] = k
+		prev, prevLen = k, l
+	}
+
+	return keys, nil
+}
+
+// prefix keeps the first n units.
+func (k Key) prefix(n int) Key {
+	if n >= MaxUnits {
+		return k
+	}
+
+	return k &^ (Key(1)<<(40-5*n) - 1)
+}
+
+// Prefix keeps the first n units of the key and zeroes the rest: the key of
+// the group of keys sharing those units.
+func (k Key) Prefix(n int) Key { return k.prefix(n) }
+
 // ErrCorrupt is a slot stream that does not decode.
 var ErrCorrupt = errors.New("key5: corrupt slot stream")
 

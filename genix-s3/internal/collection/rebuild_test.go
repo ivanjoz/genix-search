@@ -10,15 +10,16 @@ import (
 	"time"
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/blob"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/layout"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/normalize"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/plog"
-	"github.com/ivanjoz/genix-search/genix-s3/internal/snapshot"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/tokens"
 )
 
-// state is the live ID → tokens of a collection: its base (snapshot or Docs
+// liveState is the live ID → tokens of a collection: its base (tokens or Docs
 // frame) with the pending ops of p.log applied.
-func state(t *testing.T, store blob.Blob, col layout.Collection, norm *normalize.Normalizer) (map[uint32][]byte, plog.Base) {
+func liveState(t *testing.T, store blob.Blob, col layout.Collection, norm *normalize.Normalizer) (map[uint32][]byte, plog.Base) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -40,17 +41,21 @@ func state(t *testing.T, store blob.Blob, col layout.Collection, norm *normalize
 			byID[d.ID] = d.Tokens
 		}
 	} else {
-		snap, _, err := store.Get(ctx, col.Snapshot(log.Base.ManifestGen))
+		data, _, err := store.Get(ctx, col.Tokens())
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		_, docs, err := snapshot.Decode(snap, norm.ID())
+		tok, err := tokens.Decode(data, norm.ID())
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		for _, d := range docs {
+		if tok.Epoch != log.Base.Epoch || tok.Seq != log.Base.LastSeq || len(tok.Docs) != int(log.Base.Docs) {
+			t.Fatalf("tokens at epoch %d seq %d with %d docs, the base is %+v", tok.Epoch, tok.Seq, len(tok.Docs), log.Base)
+		}
+
+		for _, d := range tok.Docs {
 			byID[d.ID] = d.Tokens
 		}
 	}
@@ -91,19 +96,6 @@ func numbered(from, to int) []Doc {
 	return docs
 }
 
-func newTestCollection(t *testing.T, minIndex int) (*blob.FS, layout.Collection, *Collection) {
-	fs, err := blob.NewFS(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	col, _ := layout.New("genix/", "c", "p1")
-	opts := DefaultOptions()
-	opts.MinIndexDocs = minIndex
-
-	return fs, col, New(fs, col, normalize.Default, opts)
-}
-
 // TestRebuildNew: a rebuild creates a missing collection, with or without
 // index.
 func TestRebuildNew(t *testing.T) {
@@ -117,13 +109,9 @@ func TestRebuildNew(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		byID, base := state(t, fs, col, normalize.Default)
-		if len(byID) != n || base.LogOnly != (n < 5) || res.Docs != n {
+		byID, base := liveState(t, fs, col, normalize.Default)
+		if len(byID) != n || base.LogOnly != (n < 5) || res.Docs != n || res.Indexed != (n >= 5) {
 			t.Errorf("%d docs: %d live, base %+v, result %+v", n, len(byID), base, res)
-		}
-
-		if n >= 5 && (res.Gen != 1 || base.ManifestGen != 1) {
-			t.Errorf("%d docs: generation %d, base %+v", n, res.Gen, base)
 		}
 	}
 }
@@ -172,7 +160,7 @@ func TestRebuildReplaces(t *testing.T) {
 			}
 		}), func(id uint32) bool { return id == 12 }), 500)
 
-		byID, base := state(t, fs, col, normalize.Default)
+		byID, base := liveState(t, fs, col, normalize.Default)
 		if got := ids(byID); !slices.Equal(got, want) {
 			t.Errorf("min %d: live %v\nwant %v", minIndex, got, want)
 		}
@@ -190,87 +178,54 @@ func TestRebuildReplaces(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if after, _ := state(t, fs, col, normalize.Default); !slices.Equal(ids(after), want) {
+		if after, _ := liveState(t, fs, col, normalize.Default); !slices.Equal(ids(after), want) {
 			t.Errorf("min %d: after compaction %v", minIndex, ids(after))
 		}
 	}
 }
 
-// TestRebuildBlocksCompaction: the claim taken before the source is read
-// keeps an indexed compaction from committing meanwhile.
+// TestRebuildBlocksCompaction: the lease taken before the source is read
+// keeps any compaction, with or without index, from committing meanwhile.
 func TestRebuildBlocksCompaction(t *testing.T) {
 	ctx := context.Background()
 
-	_, _, c := newTestCollection(t, 1)
+	for _, minIndex := range []int{1, 1000} {
+		fs, col, c := newTestCollection(t, minIndex)
 
-	if _, err := c.Init(ctx, numbered(0, 10)); err != nil {
-		t.Fatal(err)
-	}
-
-	var compactErr error
-
-	source := func(ctx context.Context, yield func(Doc) error) error {
-		if _, err := c.Put(ctx, []Doc{{ID: 99, Text: "x"}}); err != nil {
-			return err
+		if _, err := c.Init(ctx, numbered(0, 10)); err != nil {
+			t.Fatal(err)
 		}
 
-		_, compactErr = c.Compact(ctx)
+		var compactErr error
 
-		return sliceSource(numbered(0, 10))(ctx, yield)
-	}
-
-	if _, err := c.Rebuild(ctx, source); err != nil {
-		t.Fatal(err)
-	}
-
-	if !errors.Is(compactErr, ErrConflict) {
-		t.Errorf("a compaction during the rebuild: %v, want ErrConflict", compactErr)
-	}
-}
-
-// TestRebuildRestarts: a LogOnly compaction claims nothing, so it can commit
-// during a rebuild; the rebuild then reads the source again.
-func TestRebuildRestarts(t *testing.T) {
-	ctx := context.Background()
-
-	fs, col, c := newTestCollection(t, 1000)
-
-	if _, err := c.Init(ctx, numbered(0, 10)); err != nil {
-		t.Fatal(err)
-	}
-
-	calls := 0
-	source := func(ctx context.Context, yield func(Doc) error) error {
-		calls++
-		if calls == 1 {
+		source := func(ctx context.Context, yield func(Doc) error) error {
 			if _, err := c.Put(ctx, []Doc{{ID: 99, Text: "x"}}); err != nil {
 				return err
 			}
 
-			if _, err := c.Compact(ctx); err != nil {
-				return err
-			}
+			_, compactErr = c.Compact(ctx)
+
+			return sliceSource(numbered(0, 10))(ctx, yield)
 		}
 
-		return sliceSource(append(numbered(0, 10), Doc{ID: 99, Text: "x"}))(ctx, yield)
-	}
+		if _, err := c.Rebuild(ctx, source); err != nil {
+			t.Fatal(err)
+		}
 
-	if _, err := c.Rebuild(ctx, source); err != nil {
-		t.Fatal(err)
-	}
+		if !errors.Is(compactErr, ErrConflict) {
+			t.Errorf("min %d: a compaction during the rebuild: %v, want ErrConflict", minIndex, compactErr)
+		}
 
-	if calls != 2 {
-		t.Errorf("source read %d times; want 2", calls)
-	}
-
-	if byID, _ := state(t, fs, col, normalize.Default); len(byID) != 11 {
-		t.Errorf("%d live documents; want 11", len(byID))
+		// The write landed during the rebuild stays pending.
+		if byID, _ := liveState(t, fs, col, normalize.Default); len(byID) != 11 {
+			t.Errorf("min %d: %d live documents; want 11", minIndex, len(byID))
+		}
 	}
 }
 
-// TestRebuildWaitsForClaim: a fresh claim of another compaction makes the
+// TestRebuildWaitsForLease: a fresh lease of another compaction makes the
 // rebuild wait and retry, not fail at once.
-func TestRebuildWaitsForClaim(t *testing.T) {
+func TestRebuildWaitsForLease(t *testing.T) {
 	ctx := context.Background()
 
 	fs, col, c := newTestCollection(t, 1)
@@ -279,20 +234,16 @@ func TestRebuildWaitsForClaim(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	g, err := c.encode(2, 0, map[uint32][]byte{})
-	if err != nil {
+	held := &lease{owner: 1, expiry: time.Now().Add(time.Minute).UnixMilli()}
+	if _, err := fs.Put(ctx, col.Lease(), held.encode(), blob.PutCond{IfNoneMatch: true}); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := fs.Put(ctx, col.Manifest(2), g.manifestBytes, blob.PutCond{IfNoneMatch: true}); err != nil {
-		t.Fatal(err)
-	}
-
-	time.AfterFunc(100*time.Millisecond, func() { fs.Delete(context.Background(), col.Manifest(2)) })
+	time.AfterFunc(100*time.Millisecond, func() { fs.Delete(context.Background(), col.Lease()) })
 
 	res, err := c.Rebuild(ctx, sliceSource(numbered(0, 5)))
-	if err != nil || res.Gen != 2 {
-		t.Fatalf("rebuild after the claim was released: %+v %v", res, err)
+	if err != nil || res.Docs != 5 || !res.Full {
+		t.Fatalf("rebuild after the lease was released: %+v %v", res, err)
 	}
 }
 
@@ -317,9 +268,7 @@ func TestRebuildNewNormalizer(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		opts := DefaultOptions()
-		opts.MinIndexDocs = minIndex
-		c := New(fs, col, norm, opts)
+		c := New(fs, col, norm, testOptions(minIndex))
 
 		if _, err := c.Put(ctx, []Doc{{ID: 4, Text: "x"}}); !errors.Is(err, plog.ErrNormID) {
 			t.Fatalf("append with the new normalizer before the rebuild: %v", err)
@@ -329,7 +278,7 @@ func TestRebuildNewNormalizer(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		byID, _ := state(t, fs, col, norm)
+		byID, _ := liveState(t, fs, col, norm)
 		if len(byID) != 3 || slices.Equal(byID[1], byID[2]) {
 			t.Errorf("min %d: %d docs; piña and pina must differ with ñ as a letter", minIndex, len(byID))
 		}
@@ -341,7 +290,7 @@ func TestRebuildNewNormalizer(t *testing.T) {
 }
 
 // TestDrop: the index goes away, p.log stays empty and LogOnly, and the
-// generation numbers go on.
+// index comes back in a new epoch.
 func TestDrop(t *testing.T) {
 	ctx := context.Background()
 
@@ -355,24 +304,23 @@ func TestDrop(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if res, err := c.Compact(ctx); err != nil || res.Gen != 2 {
-		t.Fatalf("compact: %+v %v", res, err)
+	first, err := c.Compact(ctx)
+	if err != nil || first.Seq != 2 {
+		t.Fatalf("compact: %+v %v", first, err)
 	}
 
 	if _, err := c.Drop(ctx); err != nil {
 		t.Fatal(err)
 	}
 
-	byID, base := state(t, fs, col, normalize.Default)
-	if len(byID) != 0 || !base.LogOnly || base.ManifestGen != 2 {
+	byID, base := liveState(t, fs, col, normalize.Default)
+	if len(byID) != 0 || !base.LogOnly || base.Epoch <= first.Epoch {
 		t.Errorf("after drop: %d docs, base %+v", len(byID), base)
 	}
 
-	for gen := uint32(1); gen <= 3; gen++ {
-		for _, key := range append(col.Objects(gen), col.Manifest(gen)) {
-			if _, _, err := fs.Get(ctx, key); !errors.Is(err, blob.ErrNotFound) {
-				t.Errorf("%s survived the drop: %v", key, err)
-			}
+	for _, key := range []string{col.Tokens(), col.Idx(key5.FromToken("producto").Key.Slot()), col.DB(key5.FromToken("producto").Key.Slot())} {
+		if _, _, err := fs.Get(ctx, key); !errors.Is(err, blob.ErrNotFound) {
+			t.Errorf("%s survived the drop: %v", key, err)
 		}
 	}
 
@@ -380,7 +328,7 @@ func TestDrop(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if res, err := c.Compact(ctx); err != nil || res.Gen != 3 {
-		t.Errorf("first compaction after the drop: %+v %v; want generation 3", res, err)
+	if res, err := c.Compact(ctx); err != nil || !res.Indexed || res.Epoch <= base.Epoch {
+		t.Errorf("first compaction after the drop: %+v %v; want a new epoch", res, err)
 	}
 }

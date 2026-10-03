@@ -107,11 +107,11 @@ func TestClientCompactModes(t *testing.T) {
 		c, _ := newTestClient(t, ClientOptions{MinIndexDocs: 5, Compact: CompactSync})
 
 		res, err := c.Apply(ctx, "c", "p", docs(0, 5), nil)
-		if err != nil || res.Compacted == nil || res.CompactErr != nil || res.Compacted.Gen != 1 {
+		if err != nil || res.Compacted == nil || res.CompactErr != nil || !res.Compacted.Indexed || res.Compacted.Seq != 5 {
 			t.Fatalf("the write that reaches MinIndexDocs: %+v %v", res, err)
 		}
 
-		if resp, _ := c.Search(ctx, "c", "p", Request{Query: "producto 3"}); resp.Gen != 1 || len(resp.Hits) == 0 {
+		if resp, _ := c.Search(ctx, "c", "p", Request{Query: "producto 3"}); resp.Seq != 5 || resp.Stats.LogOnly || len(resp.Hits) == 0 {
 			t.Errorf("search after the sync compaction: %+v", resp)
 		}
 	})
@@ -146,8 +146,8 @@ func TestClientCompactModes(t *testing.T) {
 		}
 
 		resp, err := c.Search(ctx, "c", "p", Request{Query: "producto", Limit: 200})
-		if err != nil || resp.Gen == 0 || len(resp.Hits) != 120 {
-			t.Errorf("after async compactions: gen %d, %d hits, %v", resp.Gen, len(resp.Hits), err)
+		if err != nil || resp.Seq == 0 || resp.Stats.LogOnly || len(resp.Hits) != 120 {
+			t.Errorf("after async compactions: seq %d, %d hits, %v", resp.Seq, len(resp.Hits), err)
 		}
 	})
 
@@ -166,7 +166,7 @@ func TestClientCompactModes(t *testing.T) {
 			t.Errorf("OnCompact calls: %v", asked)
 		}
 
-		if res, err := c.Compact(ctx, "c", "p"); err != nil || res.Gen != 1 {
+		if res, err := c.Compact(ctx, "c", "p"); err != nil || !res.Indexed {
 			t.Errorf("compaction run by the caller: %+v %v", res, err)
 		}
 	})

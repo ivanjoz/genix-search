@@ -58,13 +58,13 @@ func IsDirectoryBucket(bucket string) bool {
 // to a read and a conditional rewrite.
 func (s *Store) NativeAppend() bool { return s.express }
 
-func (s *Store) GetRange(ctx context.Context, key string, off, n int64) ([]byte, error) {
+func (s *Store) GetRange(ctx context.Context, key string, off, n int64) ([]byte, string, error) {
 	if off < 0 {
-		return nil, fmt.Errorf("s3blob: negative offset %d of %s", off, key)
+		return nil, "", fmt.Errorf("s3blob: negative offset %d of %s", off, key)
 	}
 
 	if n == 0 {
-		return []byte{}, nil
+		return s.rangeAtEnd(ctx, key, -1)
 	}
 
 	rng := fmt.Sprintf("bytes=%d-", off)
@@ -78,30 +78,33 @@ func (s *Store) GetRange(ctx context.Context, key string, off, n int64) ([]byte,
 			return s.rangeAtEnd(ctx, key, off)
 		}
 
-		return nil, fail("get", key, err)
+		return nil, "", fail("get", key, err)
 	}
 
-	return readBody(out.Body, out.ContentLength)
+	data, err := readBody(out.Body, out.ContentLength)
+
+	return data, aws.ToString(out.ETag), err
 }
 
 // quietRange drops the log line the SDK writes for every ranged GET: S3 has
 // no checksum of a part of an object, so there is nothing to validate.
 func quietRange(o *s3.Options) { o.DisableLogOutputChecksumValidationSkipped = true }
 
-// rangeAtEnd answers a range S3 refused with 416: it starts at or past the
-// end. At the end it is empty, as it is for the local store; past it, an
+// rangeAtEnd answers an empty range: one S3 refused with 416 because it
+// starts at or past the end, or one of 0 bytes (off < 0), which is never
+// sent. At the end it is empty, as it is for the local store; past it, an
 // error.
-func (s *Store) rangeAtEnd(ctx context.Context, key string, off int64) ([]byte, error) {
+func (s *Store) rangeAtEnd(ctx context.Context, key string, off int64) ([]byte, string, error) {
 	head, err := s.client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &s.bucket, Key: &key})
 	if err != nil {
-		return nil, fail("head", key, err)
+		return nil, "", fail("head", key, err)
 	}
 
-	if size := aws.ToInt64(head.ContentLength); off != size {
-		return nil, fmt.Errorf("s3blob: range %d out of %d bytes of %s", off, size, key)
+	if size := aws.ToInt64(head.ContentLength); off >= 0 && off != size {
+		return nil, "", fmt.Errorf("s3blob: range %d out of %d bytes of %s", off, size, key)
 	}
 
-	return []byte{}, nil
+	return []byte{}, aws.ToString(head.ETag), nil
 }
 
 func (s *Store) Get(ctx context.Context, key string) ([]byte, string, error) {

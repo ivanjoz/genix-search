@@ -1,7 +1,9 @@
 // Package genix is a search index on S3 Express One Zone that returns ranked
-// IDs (PLAN_5BIT.md). Words are their first 8 letters in 5-bit units and
-// numbers are their binary value; the index stores IDs and those keys, never
-// text.
+// IDs (PLAN_5BIT.md for the keys, PLAN_BUCKETS.md for the index). Words are
+// their first 8 letters in 5-bit units and numbers are their binary value;
+// the index stores IDs and those keys, never text. A query reads p.log and
+// the index of the buckets of its words, <xy>.idx, in one round, and the
+// ranges of <xy>.db they point to in a second.
 //
 //	store, _ := genix.NewFSStore("/tmp/genix")
 //	cfg := genix.Config{Collection: "productos", Extra: [2]rune{'ñ', 0}}
@@ -59,7 +61,7 @@ type Config struct {
 	Root       string // key prefix in the bucket; default "genix/"
 	Collection string
 	// Partition is an independent index of the collection (one per company,
-	// in a multi-tenant system): its own p.log and generations. Default
+	// in a multi-tenant system): its own p.log and buckets. Default
 	// "default".
 	Partition string
 	// Extra are the letters of codes 30 and 31 of the 5-bit table: characters
@@ -117,8 +119,8 @@ func (c Config) collectionOptions() collection.Options {
 	return opts
 }
 
-// Init creates a collection: its first generation, or only p.log when it has
-// fewer than MinIndexDocs documents.
+// Init creates a collection: p.log with its documents, and the index from
+// MinIndexDocs documents on.
 func (ix *Indexer) Init(ctx context.Context, docs []Doc) error {
 	_, err := ix.c.Init(ctx, docs)
 
@@ -154,15 +156,16 @@ func (ix *Indexer) Drop(ctx context.Context) (CompactResult, error) {
 	return ix.c.Drop(ctx)
 }
 
-// Compact folds the pending writes into a new generation (or into p.log,
-// under MinIndexDocs). Call it when a write reports CompactRequested: that
-// includes reaching MinIndexDocs, so the index gets built.
+// Compact folds the pending writes into the index, rewriting the buckets they
+// change (or into p.log, under MinIndexDocs). Call it when a write reports
+// CompactRequested: that includes reaching MinIndexDocs, so the index gets
+// built.
 func (ix *Indexer) Compact(ctx context.Context) (CompactResult, error) {
 	return ix.c.Compact(ctx)
 }
 
-// Searcher answers queries on a collection. It caches the dictionary of the
-// current generation; keep one per collection for the life of the process.
+// Searcher answers queries on a collection. It caches the .idx it reads;
+// keep one per collection for the life of the process.
 type Searcher struct {
 	e *query.Engine
 }
@@ -200,7 +203,7 @@ type QueryHit struct {
 
 // QueryResponse is the answer on the wire.
 type QueryResponse struct {
-	Gen    uint32     `cb:"1"`
+	Seq    uint64     `cb:"1"` // the LastSeq of the index the answer comes from
 	Hits   []QueryHit `cb:"2"`
 	Approx bool       `cb:"3"`
 }
@@ -217,7 +220,7 @@ func (s *Searcher) Serve(ctx context.Context, body []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	out := QueryResponse{Gen: resp.Gen, Approx: resp.Stats.Approx, Hits: make([]QueryHit, len(resp.Hits))}
+	out := QueryResponse{Seq: resp.Seq, Approx: resp.Stats.Approx, Hits: make([]QueryHit, len(resp.Hits))}
 	for i, h := range resp.Hits {
 		out.Hits[i] = QueryHit(h)
 	}

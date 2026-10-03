@@ -68,7 +68,7 @@ func TestLatency(t *testing.T) {
 		run  func() error
 	}{
 		{"get 4 KB", func() error { _, _, err := store.Get(ctx, key); return err }},
-		{"range 1 KB", func() error { _, err := store.GetRange(ctx, key, 1024, 1024); return err }},
+		{"range 1 KB", func() error { _, _, err := store.GetRange(ctx, key, 1024, 1024); return err }},
 		{"append 64 B", func() error {
 			n, err := store.Append(ctx, key, data[:64], size)
 			size = n

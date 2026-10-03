@@ -5,93 +5,64 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"sync/atomic"
 	"time"
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/blob"
-	"github.com/ivanjoz/genix-search/genix-s3/internal/manifest"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/bucket"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/parallel"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/plog"
-	"github.com/ivanjoz/genix-search/genix-s3/internal/snapshot"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/tokens"
 )
 
-// ErrConflict is another compaction that owns the next generation.
-var ErrConflict = errors.New("collection: another compaction is in progress")
-
-// CompactResult says what a compaction did.
+// CompactResult says what a compaction, a rebuild or a drop did.
 type CompactResult struct {
-	Gen      uint32 // the new generation; 0 if there was nothing to fold
-	Ops      int    // p.log ops folded in
-	Docs     int
-	Requests int64 // reads
-	Writes   int64 // puts and deletes
-	Bytes    int64 // written
+	Seq     uint64 // the LastSeq of the base it wrote; 0 if it did nothing
+	Epoch   uint32
+	Ops     int // p.log ops folded in
+	Docs    int
+	Buckets int  // buckets written, tombstones included
+	Full    bool // a new epoch: every bucket was written
+	Indexed bool // the collection has an index after it
+	// Requests are the reads, Writes the puts and deletes, Bytes the bytes
+	// written.
+	Requests, Writes, Bytes int64
 }
 
-// Compact folds the pending ops of p.log into a new generation:
+// Compact folds the pending ops of p.log into the index (PLAN_BUCKETS.md §8):
 //
-//  1. Read p.log, the base manifest and its snapshot.
-//  2. Apply the ops to the snapshot's ID → tokens state, build k, p and the
-//     snapshot of the next generation.
-//  3. Claim the generation: put its manifest with If-None-Match, so only one
-//     compaction writes objects with that number.
-//  4. Write k, p and the snapshot.
-//  5. Rebase p.log on the new generation with If-Match: the commit. Ops
-//     appended meanwhile are carried over.
-//  6. Delete the generations no query can be reading anymore.
+//  1. Take the lease.
+//  2. Read p.log and tokens; apply the ops to the ID → tokens state.
+//  3. Wait until CompactSpacing has passed since the last compaction.
+//  4. Build the whole index in memory and write the buckets whose content
+//     changed: <xy>.db first, then <xy>.idx with its ETag.
+//  5. Write tokens, then rebase p.log with If-Match: the commit. Its base
+//     says which buckets this compaction rewrote.
 //
 // Under MinIndexDocs there is no index: the state lives in the Docs frame of
-// p.log, and the compaction only rebases p.log with the new state (steps 1, 2
-// and 5). Crossing the threshold either way switches the mode.
-func (c *Collection) Compact(ctx context.Context) (CompactResult, error) {
-	var res CompactResult
-
-	normID := c.norm.ID()
-
-	data, _, err := c.store.Get(ctx, c.col.Log())
-	res.Requests++
-
-	// A collection never written, or dropped, has nothing to fold.
-	if errors.Is(err, blob.ErrNotFound) {
-		return res, nil
-	}
-
-	if err != nil {
-		return res, fmt.Errorf("collection: p.log: %w", err)
-	}
-
-	log, err := plog.Parse(data, normID)
+// p.log, and the compaction only rebases p.log. Crossing the threshold either
+// way, or taking over the lease of a compaction that did not finish, writes
+// every bucket in a new epoch.
+func (c *Collection) Compact(ctx context.Context) (res CompactResult, err error) {
+	l, err := c.acquire(ctx, &res)
 	if err != nil {
 		return res, err
 	}
 
-	pending := log.Pending()
-	if len(pending) == 0 {
-		return res, nil
+	defer func() { c.release(ctx, l, err != nil, &res) }()
+
+	st, err := c.readState(ctx, &res)
+	if err != nil || st.log == nil {
+		return res, err
 	}
 
-	base, target := log.Base, log.LastSeq()
-	byID := make(map[uint32][]byte)
-
-	if base.LogOnly {
-		for _, doc := range log.Docs {
-			byID[doc.ID] = doc.Tokens
-		}
-	} else {
-		snapData, _, err := c.store.Get(ctx, c.col.Snapshot(base.ManifestGen))
-		res.Requests++
-
-		if err != nil {
-			return res, fmt.Errorf("collection: snapshot %d: %w", base.ManifestGen, err)
-		}
-
-		_, docs, err := snapshot.Decode(snapData, normID)
-		if err != nil {
-			return res, err
-		}
-
-		for _, doc := range docs {
-			byID[doc.ID] = doc.Tokens
-		}
+	byID, err := st.current()
+	if err != nil {
+		return res, err
 	}
+
+	pending := st.log.Pending()
 
 	for id, op := range pending {
 		if op.Del {
@@ -101,123 +72,382 @@ func (c *Collection) Compact(ctx context.Context) (CompactResult, error) {
 		}
 	}
 
-	res.Ops, res.Docs = len(pending), len(byID)
+	base := st.log.Base
+	indexed := c.indexed(len(byID))
+	leftover := base.LogOnly && st.tok != nil
 
-	if !c.indexed(len(byID)) {
-		start, err := c.logOnlyBase(base.ManifestGen, target, byID)
-		if err != nil {
-			return res, err
-		}
-
-		if err := c.rebase(ctx, base, start, target, &res); err != nil {
-			return res, err
-		}
-
-		c.collect(ctx, base, &res)
-
+	if len(pending) == 0 && !l.recover && indexed == !base.LogOnly && !leftover && (st.tok == nil || len(st.tok.Garbage) == 0) {
 		return res, nil
 	}
 
-	gen, err := c.freeGeneration(ctx, base.ManifestGen, &res)
-	if err != nil {
-		return res, err
-	}
+	res.Ops = len(pending)
+	full := l.recover || base.LogOnly || st.tok == nil || st.tok.Epoch != base.Epoch
 
-	g, err := c.encode(gen, target, byID)
-	if err != nil {
-		return res, err
-	}
+	return res, c.publish(ctx, l, st, byID, st.log.LastSeq(), full, &res)
+}
 
-	if _, err := c.store.Put(ctx, c.col.Manifest(gen), g.manifestBytes, blob.PutCond{IfNoneMatch: true}); err != nil {
-		if errors.Is(err, blob.ErrPrecondition) {
-			return res, ErrConflict
+// state is what a compaction starts from.
+type state struct {
+	log *plog.Log
+	tok *tokens.State // nil when missing or unreadable
+}
+
+// current is the ID → tokens state the base of the log stands for: the Docs
+// frame of a LogOnly log, or tokens. A tokens object ahead of the log (a
+// compaction that died after writing it) is as good: the ops are idempotent.
+func (s *state) current() (map[uint32][]byte, error) {
+	base := s.log.Base
+	byID := map[uint32][]byte{}
+
+	if s.tok != nil && s.tok.Epoch >= base.Epoch && s.tok.Seq >= base.LastSeq {
+		for _, doc := range s.tok.Docs {
+			byID[doc.ID] = doc.Tokens
 		}
 
-		return res, fmt.Errorf("collection: claim %d: %w", gen, err)
+		return byID, nil
+	}
+
+	if !base.LogOnly {
+		return nil, errors.New("collection: tokens is missing or behind p.log: rebuild the collection from its source")
+	}
+
+	for _, doc := range s.log.Docs {
+		byID[doc.ID] = doc.Tokens
+	}
+
+	return byID, nil
+}
+
+// readState reads p.log and tokens in one round. A missing p.log leaves log
+// nil.
+func (c *Collection) readState(ctx context.Context, res *CompactResult) (*state, error) {
+	var logData, tokData []byte
+	var logErr, tokErr error
+
+	_ = parallel.Run(ctx, 2, 2, func(ctx context.Context, i int) error {
+		if i == 0 {
+			logData, _, logErr = c.store.Get(ctx, c.col.Log())
+		} else {
+			tokData, _, tokErr = c.store.Get(ctx, c.col.Tokens())
+		}
+
+		return nil
+	})
+
+	res.Requests += 2
+
+	if errors.Is(logErr, blob.ErrNotFound) {
+		return &state{}, nil
+	}
+
+	if logErr != nil {
+		return nil, fmt.Errorf("collection: p.log: %w", logErr)
+	}
+
+	if tokErr != nil && !errors.Is(tokErr, blob.ErrNotFound) {
+		return nil, fmt.Errorf("collection: tokens: %w", tokErr)
+	}
+
+	log, err := plog.Parse(logData, c.norm.ID())
+	if err != nil {
+		return nil, err
+	}
+
+	st := &state{log: log}
+
+	if tokErr == nil {
+		// One of another normalizer, or corrupt, is no help: a full rewrite
+		// does without it, and an incremental compaction refuses to start.
+		st.tok, _ = tokens.Decode(tokData, c.norm.ID())
+	}
+
+	return st, nil
+}
+
+// publish writes the state byID as of target on top of the log of st, and
+// commits it by rebasing p.log. full writes every bucket in a new epoch.
+func (c *Collection) publish(ctx context.Context, l *lease, st *state, byID map[uint32][]byte, target uint64, full bool, res *CompactResult) error {
+	base, tok := st.log.Base, st.tok
+
+	res.Docs = len(byID)
+
+	// The spacing keeps a query from pairing the base this writes with
+	// buckets two compactions old. A LogOnly base with no tokens never had
+	// buckets: its queries read p.log alone.
+	if !base.LogOnly || tok != nil {
+		if err := c.waitSpacing(ctx, base.UnixMs); err != nil {
+			return err
+		}
+	}
+
+	// An epoch no bucket was ever written in: above the base's, the tokens'
+	// and any a holder of the lease that did not finish may have used.
+	newEpoch := max(base.Epoch, l.epoch)
+	if tok != nil {
+		newEpoch = max(newEpoch, tok.Epoch)
+	}
+
+	newEpoch++
+
+	next := plog.Base{NormID: c.norm.ID(), Epoch: base.Epoch, LastSeq: target, PrevSeq: base.LastSeq, Docs: uint32(len(byID))}
+
+	if !c.indexed(len(byID)) {
+		if !base.LogOnly {
+			next.Epoch = newEpoch // the index goes: no query mixes it with this log
+		}
+
+		next.UnixMs = c.opts.Now().UnixMilli()
+
+		start, err := c.logOnlyLog(next, byID)
+		if err != nil {
+			return err
+		}
+
+		if err := c.rebase(ctx, base, start, target, res); err != nil {
+			return err
+		}
+
+		res.Seq, res.Epoch = target, next.Epoch
+
+		// The buckets of an index dropped by an earlier compaction: no query
+		// has read them for at least CompactSpacing.
+		if base.LogOnly && tok != nil {
+			c.dropIndex(ctx, tok, res)
+		}
+
+		return nil
+	}
+
+	var prev map[uint16]tokens.Bucket
+	var prevExpanded map[key5.Key]bool
+
+	if tok != nil && tok.Epoch >= base.Epoch {
+		prevExpanded = map[key5.Key]bool{}
+		for _, k := range tok.Expanded {
+			prevExpanded[k] = true
+		}
+	}
+
+	if full || tok == nil {
+		full = true
+		next.Epoch = newEpoch
+
+		if err := c.claimEpoch(ctx, l, newEpoch, res); err != nil {
+			return err
+		}
+	} else {
+		prev = tok.Buckets
+	}
+
+	docs := make([]bucket.Doc, 0, len(byID))
+	for _, d := range sortedDocs(byID) {
+		toks, err := key5.ReadTokens(d.Tokens)
+		if err != nil {
+			return fmt.Errorf("collection: document %d: %w", d.ID, err)
+		}
+
+		docs = append(docs, bucket.Doc{ID: d.ID, Tokens: toks})
+	}
+
+	built, err := bucket.Build(docs, prevExpanded, c.opts.Params)
+	if err != nil {
+		return err
+	}
+
+	// What the previous index had, to delete what this one does not.
+	var known map[uint16]tokens.Bucket
+	if tok != nil {
+		known = tok.Buckets
+	}
+
+	now := map[uint16]tokens.Bucket{}
+	var write []*bucket.Built
+
+	for _, b := range built.Buckets {
+		now[b.Slot] = tokens.Bucket{Hash: b.Hash, HasDB: b.HasDB()}
+
+		if old, ok := prev[b.Slot]; full || !ok || old.Hash != b.Hash {
+			write = append(write, b)
+		}
+	}
+
+	var tombs []uint16
+	var garbage []uint16
+
+	for slot := range prev {
+		if _, ok := now[slot]; !ok {
+			tombs = append(tombs, slot)
+		}
+	}
+
+	slices.Sort(tombs)
+
+	if full {
+		// Buckets of the index this one replaces, in an older epoch: queries
+		// on the new base take them for empty; the next compaction deletes
+		// them, once no query reads them.
+		for slot := range known {
+			if _, ok := now[slot]; !ok {
+				garbage = append(garbage, slot)
+			}
+		}
+	}
+
+	// Tombstones go next time too: a query that read the base that made them
+	// is done by then.
+	garbage = append(garbage, tombs...)
+
+	var touched plog.Touched
+	meta := bucket.Meta{NormID: c.norm.ID(), Epoch: next.Epoch, Seq: target}
+
+	l.wrote = true
+
+	var writes, bytes atomic.Int64
+
+	err = parallel.Run(ctx, len(write)+len(tombs), c.opts.Concurrency, func(ctx context.Context, i int) error {
+		m := meta
+
+		if i >= len(write) {
+			slot := tombs[i-len(write)]
+			m.Slot = slot
+			data := bucket.Tombstone(m)
+
+			if _, err := c.store.Put(ctx, c.col.Idx(slot), data, blob.PutCond{}); err != nil {
+				return fmt.Errorf("collection: put %s: %w", c.col.Idx(slot), err)
+			}
+
+			writes.Add(1)
+			bytes.Add(int64(len(data)))
+
+			return c.deleteDB(ctx, slot, known, &writes)
+		}
+
+		b := write[i]
+		m.Slot = b.Slot
+
+		var etag string
+
+		if b.HasDB() {
+			data := b.EncodeDB(m)
+
+			var err error
+			if etag, err = c.store.Put(ctx, c.col.DB(b.Slot), data, blob.PutCond{}); err != nil {
+				return fmt.Errorf("collection: put %s: %w", c.col.DB(b.Slot), err)
+			}
+
+			writes.Add(1)
+			bytes.Add(int64(len(data)))
+		}
+
+		data := b.EncodeIdx(m, etag)
+		if _, err := c.store.Put(ctx, c.col.Idx(b.Slot), data, blob.PutCond{}); err != nil {
+			return fmt.Errorf("collection: put %s: %w", c.col.Idx(b.Slot), err)
+		}
+
+		writes.Add(1)
+		bytes.Add(int64(len(data)))
+
+		if !b.HasDB() {
+			return c.deleteDB(ctx, b.Slot, known, &writes)
+		}
+
+		return nil
+	})
+
+	res.Writes += writes.Load()
+	res.Bytes += bytes.Load()
+
+	if err != nil {
+		return err
+	}
+
+	for _, b := range write {
+		touched.Set(int(b.Slot))
+	}
+
+	for _, slot := range tombs {
+		touched.Set(int(slot))
+	}
+
+	res.Buckets = len(write) + len(tombs)
+
+	// The garbage of the last compaction: no query reads it anymore.
+	if tok != nil && len(tok.Garbage) > 0 {
+		var keys []string
+
+		for _, slot := range tok.Garbage {
+			if _, ok := now[slot]; !ok {
+				keys = append(keys, c.col.Idx(slot), c.col.DB(slot))
+			}
+		}
+
+		if err := c.store.Delete(ctx, keys...); err != nil {
+			garbage = append(garbage, tok.Garbage...)
+		}
+
+		res.Writes++
+	}
+
+	var tokDocs []tokens.Doc
+	for _, d := range sortedDocs(byID) {
+		tokDocs = append(tokDocs, tokens.Doc{ID: d.ID, Tokens: d.Tokens})
+	}
+
+	tokData, err := tokens.Encode(&tokens.State{
+		NormID: c.norm.ID(), Epoch: next.Epoch, Seq: target, Docs: tokDocs,
+		Expanded: built.Expanded, Buckets: now, Garbage: garbage,
+	})
+	if err != nil {
+		return err
+	}
+
+	if _, err := c.store.Put(ctx, c.col.Tokens(), tokData, blob.PutCond{}); err != nil {
+		return fmt.Errorf("collection: put tokens: %w", err)
 	}
 
 	res.Writes++
-	res.Bytes += int64(len(g.manifestBytes))
+	res.Bytes += int64(len(tokData))
 
-	release := func(cause error) error {
-		keys := append(c.col.Objects(gen), c.col.Manifest(gen))
+	next.Touched = touched
+	next.UnixMs = c.opts.Now().UnixMilli()
 
-		return errors.Join(cause, c.store.Delete(context.WithoutCancel(ctx), keys...))
+	if err := c.rebase(ctx, base, plog.EncodeBase(next), target, res); err != nil {
+		return err
 	}
 
-	if err := c.putObjects(ctx, g); err != nil {
-		return res, release(err)
-	}
+	res.Seq, res.Epoch, res.Full, res.Indexed = target, next.Epoch, full, true
 
-	res.Writes += 3
-	res.Bytes += int64(len(g.k) + len(g.p) + len(g.snap))
-
-	start := plog.EncodeBase(plog.Base{NormID: normID, ManifestGen: gen, LastSeq: target, UnixMs: c.opts.Now().UnixMilli()})
-
-	if err := c.rebase(ctx, base, start, target, &res); err != nil {
-		if errors.Is(err, ErrConflict) || errors.Is(err, errContention) {
-			return res, release(err)
-		}
-
-		return res, err
-	}
-
-	c.collect(ctx, base, &res)
-	res.Gen = gen
-
-	return res, nil
+	return nil
 }
 
-// collect deletes, best effort, the generations no query reads once p.log
-// left base: the one before an indexed base (queries in flight may still
-// read the base itself), or the last one of a LogOnly base, which nothing
-// has read since the compaction that dropped the index.
-func (c *Collection) collect(ctx context.Context, base plog.Base, res *CompactResult) {
-	var gens []uint32
-
-	if base.LogOnly {
-		gens = append(gens, base.ManifestGen)
+// deleteDB deletes the .db of a bucket that had one and has none now.
+func (c *Collection) deleteDB(ctx context.Context, slot uint16, known map[uint16]tokens.Bucket, writes *atomic.Int64) error {
+	if old, ok := known[slot]; !ok || !old.HasDB {
+		return nil
 	}
 
-	if base.ManifestGen > 1 {
-		gens = append(gens, base.ManifestGen-1)
-	}
+	writes.Add(1)
 
-	for _, gen := range gens {
-		if gen == 0 {
-			continue
-		}
-
-		if err := c.store.Delete(ctx, append(c.col.Objects(gen), c.col.Manifest(gen))...); err == nil {
-			res.Writes++
-		}
-	}
+	return c.store.Delete(ctx, c.col.DB(slot))
 }
 
-// freeGeneration finds the number to claim: the one after the base, or past
-// a claim on it that was abandoned.
-func (c *Collection) freeGeneration(ctx context.Context, baseGen uint32, res *CompactResult) (uint32, error) {
-	for gen := baseGen + 1; ; gen++ {
-		data, _, err := c.store.Get(ctx, c.col.Manifest(gen))
-		res.Requests++
+// dropIndex deletes every bucket of tok and tok itself, best effort.
+func (c *Collection) dropIndex(ctx context.Context, tok *tokens.State, res *CompactResult) {
+	keys := []string{}
 
-		if errors.Is(err, blob.ErrNotFound) {
-			return gen, nil
-		}
-
-		if err != nil {
-			return 0, fmt.Errorf("collection: manifest %d: %w", gen, err)
-		}
-
-		claim, err := manifest.Decode(data)
-		if err != nil {
-			return 0, err
-		}
-
-		if c.opts.Now().Sub(time.UnixMilli(claim.CreatedUnixMs)) < c.opts.ClaimTimeout {
-			return 0, ErrConflict
-		}
+	for slot := range tok.Buckets {
+		keys = append(keys, c.col.Idx(slot), c.col.DB(slot))
 	}
+
+	for _, slot := range tok.Garbage {
+		keys = append(keys, c.col.Idx(slot), c.col.DB(slot))
+	}
+
+	if err := c.store.Delete(ctx, keys...); err == nil {
+		_ = c.store.Delete(ctx, c.col.Tokens())
+	}
+
+	res.Writes += 2
 }
 
 var errContention = errors.New("collection: too much contention rebasing p.log")
@@ -250,10 +480,9 @@ func (c *Collection) rebase(ctx context.Context, base plog.Base, start []byte, t
 			return err
 		}
 
-		// Another compaction committed first (our claim timed out, or two
-		// compactions of a LogOnly log, which claim nothing): the state we
-		// built may miss what it folded.
-		if b := log.Base; b.ManifestGen != base.ManifestGen || b.LastSeq != base.LastSeq || b.LogOnly != base.LogOnly || b.NormID != base.NormID {
+		// Somebody else committed first: impossible while we hold the lease,
+		// unless it expired under us.
+		if b := log.Base; b.Epoch != base.Epoch || b.LastSeq != base.LastSeq || b.LogOnly != base.LogOnly || b.NormID != base.NormID {
 			return ErrConflict
 		}
 

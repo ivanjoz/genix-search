@@ -66,10 +66,10 @@ func TestLifecycle(t *testing.T) {
 		}
 
 		if !slices.ContainsFunc(resp.Hits, func(h genix.Hit) bool { return h.ID == id }) {
-			t.Errorf("%q (gen %d): %d not in %+v", query, resp.Gen, id, resp.Hits)
+			t.Errorf("%q (seq %d): %d not in %+v", query, resp.Seq, id, resp.Hits)
 		}
 
-		t.Logf("%q: gen %d, %d rounds, %d requests, %d B, %v", query, resp.Gen, resp.Stats.Rounds, resp.Stats.Requests, resp.Stats.Bytes, resp.Stats.Elapsed)
+		t.Logf("%q: seq %d, %d rounds, %d requests, %d B, %v", query, resp.Seq, resp.Stats.Rounds, resp.Stats.Requests, resp.Stats.Bytes, resp.Stats.Elapsed)
 	}
 
 	expectTop("gorra adidas", 11)
@@ -126,7 +126,7 @@ func TestLifecycle(t *testing.T) {
 
 	t.Logf("compact: %+v", res)
 
-	expectTop("piña colada 10203", 10_203) // from the new generation
+	expectTop("piña colada 10203", 10_203) // from the rewritten buckets
 	expectTop("mochila nike negro", 27)
 
 	resp, err := s.Search(ctx, genix.Request{Query: "gorra adidas amarillo talla 41", Limit: 50})

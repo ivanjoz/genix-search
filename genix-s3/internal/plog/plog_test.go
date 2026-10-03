@@ -18,7 +18,11 @@ func tokens(words ...string) []byte {
 }
 
 func TestRoundTrip(t *testing.T) {
-	data := EncodeBase(Base{NormID: normID, ManifestGen: 3, LastSeq: 10, UnixMs: 99})
+	b := Base{NormID: normID, Epoch: 3, LastSeq: 10, PrevSeq: 4, UnixMs: 99, Docs: 1234}
+	b.Touched.Set(0)
+	b.Touched.Set(97)
+	b.Touched.Set(Slots - 1)
+	data := EncodeBase(b)
 
 	ops := []Op{
 		{Seq: 11, ID: 7, Tokens: tokens("polo", "rojo")},
@@ -38,8 +42,12 @@ func TestRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if log.Base.ManifestGen != 3 || log.Base.LastSeq != 10 || log.LastSeq() != 13 || log.Size != int64(len(data)) || log.TornTail {
+	if log.Base != b || log.LastSeq() != 13 || log.Size != int64(len(data)) || log.TornTail {
 		t.Fatalf("log %+v", log)
+	}
+
+	if !log.Base.Touched.Has(97) || log.Base.Touched.Has(96) {
+		t.Error("Touched bits")
 	}
 
 	for i := range ops {
@@ -83,7 +91,7 @@ func TestTornTail(t *testing.T) {
 func TestLogOnly(t *testing.T) {
 	docs := []Doc{{ID: 3, Tokens: tokens("polo", "rojo")}, {ID: 9, Tokens: tokens("pollo")}}
 
-	data, err := AppendDocs(EncodeBase(Base{NormID: normID, ManifestGen: 2, LastSeq: 5, LogOnly: true}), docs)
+	data, err := AppendDocs(EncodeBase(Base{NormID: normID, Epoch: 2, LastSeq: 5, LogOnly: true}), docs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +105,7 @@ func TestLogOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !log.Base.LogOnly || log.Base.ManifestGen != 2 || len(log.Docs) != 2 || log.Docs[1].ID != 9 || log.BaseEnd != int64(baseEnd) || len(log.Ops) != 2 {
+	if !log.Base.LogOnly || log.Base.Epoch != 2 || len(log.Docs) != 2 || log.Docs[1].ID != 9 || log.BaseEnd != int64(baseEnd) || len(log.Ops) != 2 {
 		t.Fatalf("log %+v", log)
 	}
 

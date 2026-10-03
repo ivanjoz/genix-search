@@ -1,6 +1,7 @@
-// Package plog is p.log, the change log every query reads (PLAN_5BIT.md §5.4).
-// It is plain bytes: a fixed Base, then one frame per append. It holds no
-// text: each op carries the document's ID and its 5-bit tokens.
+// Package plog is p.log, the change log every query reads (PLAN_5BIT.md §5.4,
+// PLAN_BUCKETS.md §7). It is plain bytes: a fixed Base, then one frame per
+// append. It holds no text: each op carries the document's ID and its 5-bit
+// tokens.
 //
 // A collection under the index threshold (PLAN_5BIT.md §5.8) has no index:
 // its Base is flagged LogOnly and is followed by one Docs frame with every
@@ -17,11 +18,15 @@ import (
 )
 
 // Format is the layout version of p.log.
-const Format uint16 = 1
+const Format uint16 = 2
+
+// Slots is the number of buckets, one per pair of leading 5-bit units.
+const Slots = 1024
 
 const (
 	magic      = "GXL1"
-	BaseSize   = 36
+	BaseSize   = 176
+	baseCRC    = BaseSize - 4
 	frameHead  = 9 // tag u8 | len u32 | crc32c u32
 	opHead     = 7 // ID u32 | flags u8 | tokLen u16
 	flagDel    = 1
@@ -38,18 +43,39 @@ const (
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
-// Base opens the log: the manifest it applies on top of, and the last seq
-// that manifest already includes.
+// Base opens the log: the index it applies on top of, as of LastSeq.
 type Base struct {
 	NormID uint32
-	// ManifestGen is the generation of the index. With LogOnly it is the last
-	// generation the collection had (0 if never indexed), which no query reads.
-	ManifestGen uint32
-	LastSeq     uint64
-	UnixMs      int64
+	// Epoch is the epoch of the index: a full rebuild raises it, and a query
+	// never mixes a bucket of another epoch with this log.
+	Epoch uint32
+	// LastSeq: the ops up to it are in the index (or in the Docs frame).
+	LastSeq uint64
+	// PrevSeq is the LastSeq of the base this one replaced: a warm query that
+	// validated a bucket at PrevSeq keeps it unless Touched has it.
+	PrevSeq uint64
+	UnixMs  int64
+	// Docs is the number of documents as of LastSeq.
+	Docs uint32
+	// Touched has bit s set for every bucket the compaction that wrote this
+	// base rewrote.
+	Touched Touched
 	// LogOnly: the collection has no index; the Docs frame after the Base
 	// holds every document as of LastSeq.
 	LogOnly bool
+}
+
+// Touched is a set of buckets.
+type Touched [Slots / 8]byte
+
+func (t *Touched) Set(slot int)      { t[slot>>3] |= 1 << (slot & 7) }
+func (t *Touched) Has(slot int) bool { return t[slot>>3]&(1<<(slot&7)) != 0 }
+
+// All is every bucket: what a base after a full rebuild carries.
+func (t *Touched) All() {
+	for i := range t {
+		t[i] = 0xff
+	}
 }
 
 // Doc is a document of the Docs frame: its ID and its key5 token stream.
@@ -99,10 +125,13 @@ func EncodeBase(b Base) []byte {
 	}
 
 	binary.LittleEndian.PutUint32(out[8:], b.NormID)
-	binary.LittleEndian.PutUint32(out[12:], b.ManifestGen)
+	binary.LittleEndian.PutUint32(out[12:], b.Epoch)
 	binary.LittleEndian.PutUint64(out[16:], b.LastSeq)
-	binary.LittleEndian.PutUint64(out[24:], uint64(b.UnixMs))
-	binary.LittleEndian.PutUint32(out[32:], crc32.Checksum(out[:32], castagnoli))
+	binary.LittleEndian.PutUint64(out[24:], b.PrevSeq)
+	binary.LittleEndian.PutUint64(out[32:], uint64(b.UnixMs))
+	binary.LittleEndian.PutUint32(out[40:], b.Docs)
+	copy(out[44:], b.Touched[:])
+	binary.LittleEndian.PutUint32(out[baseCRC:], crc32.Checksum(out[:baseCRC], castagnoli))
 
 	return out
 }
@@ -231,17 +260,22 @@ func ParseBase(data []byte) (Base, error) {
 		return Base{}, fmt.Errorf("plog: format %d, this build reads %d", f, Format)
 	}
 
-	if crc32.Checksum(data[:32], castagnoli) != binary.LittleEndian.Uint32(data[32:]) {
+	if crc32.Checksum(data[:baseCRC], castagnoli) != binary.LittleEndian.Uint32(data[baseCRC:]) {
 		return Base{}, errors.New("plog: base CRC")
 	}
 
-	return Base{
-		NormID:      binary.LittleEndian.Uint32(data[8:]),
-		ManifestGen: binary.LittleEndian.Uint32(data[12:]),
-		LastSeq:     binary.LittleEndian.Uint64(data[16:]),
-		UnixMs:      int64(binary.LittleEndian.Uint64(data[24:])),
-		LogOnly:     binary.LittleEndian.Uint16(data[6:])&baseLogOnly != 0,
-	}, nil
+	b := Base{
+		NormID:  binary.LittleEndian.Uint32(data[8:]),
+		Epoch:   binary.LittleEndian.Uint32(data[12:]),
+		LastSeq: binary.LittleEndian.Uint64(data[16:]),
+		PrevSeq: binary.LittleEndian.Uint64(data[24:]),
+		UnixMs:  int64(binary.LittleEndian.Uint64(data[32:])),
+		Docs:    binary.LittleEndian.Uint32(data[40:]),
+		LogOnly: binary.LittleEndian.Uint16(data[6:])&baseLogOnly != 0,
+	}
+	copy(b.Touched[:], data[44:])
+
+	return b, nil
 }
 
 // Parse reads a whole log. normID is the reader's normalizer.

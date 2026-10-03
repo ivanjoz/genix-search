@@ -29,8 +29,10 @@ type PutCond struct {
 
 // Blob is an object store.
 type Blob interface {
-	// GetRange reads n bytes at off; n < 0 reads to the end.
-	GetRange(ctx context.Context, key string, off, n int64) ([]byte, error)
+	// GetRange reads n bytes at off; n < 0 reads to the end. The ETag is the
+	// whole object's, so a reader can tell the range came from the version it
+	// expected (PLAN_BUCKETS.md §7).
+	GetRange(ctx context.Context, key string, off, n int64) (data []byte, etag string, err error)
 	Get(ctx context.Context, key string) (data []byte, etag string, err error)
 	Put(ctx context.Context, key string, data []byte, cond PutCond) (etag string, err error)
 	// Append writes data at offset, which must equal the object's size.

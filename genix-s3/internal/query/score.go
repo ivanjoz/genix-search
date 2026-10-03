@@ -77,7 +77,8 @@ const (
 
 // classifyKey says how a dictionary key matches term t. fuzzy enables the
 // typo match for this term (the engine enables it only for terms the
-// dictionary does not have).
+// dictionary does not have). A typo is never in the first two letters: the
+// key must be in the term's bucket (PLAN_BUCKETS.md §6.1).
 func (t *Term) classifyKey(k key5.Key, fuzzy bool, scratch []uint8) (keyKind, uint8) {
 	if !t.Explicit && k == t.Token.Key {
 		return exactKey, 0
@@ -95,7 +96,7 @@ func (t *Term) classifyKey(k key5.Key, fuzzy bool, scratch []uint8) (keyKind, ui
 		}
 	}
 
-	if fuzzy && !t.Explicit && !t.Number && !k.IsNumber() {
+	if fuzzy && !t.Explicit && !t.Number && !k.IsNumber() && k.Slot() == t.Token.Key.Slot() {
 		budget := fuzzyBudget(len(t.Text))
 		if budget == 0 {
 			return noKey, 0
@@ -360,12 +361,25 @@ type ranked struct {
 	score docScore
 }
 
+// idfs is the rarity bonus of every term. df of a term is the sum, over the
+// keys of the dictionary that match it, of the documents with the key: known
+// from the dictionary alone, without reading a list (PLAN_BUCKETS.md §6.2).
+// docs is the documents the dictionary describes.
+func idfs(df []int, docs int) []uint32 {
+	idf := make([]uint32, len(df))
+	for i := range idf {
+		idf[i] = idfBonus(df[i], docs)
+	}
+
+	return idf
+}
+
+func orderRanked(a, b ranked) int { return compareScores(a.score, b.score, a.id, b.id) }
+
 // rankAll scores every candidate, adds the rarity bonus and returns the
-// first top in order. df of a term is the number of candidates that matched
-// it, unless dfFloor says the read was cut and the dictionary knows more.
-func rankAll(terms []Term, cands *candidates, docs int, dfFloor []int, top int) []ranked {
+// first top in order.
+func rankAll(terms []Term, cands *candidates, idf []uint32, top int) []ranked {
 	results := make([]ranked, 0, cands.len())
-	df := make([]int, len(terms))
 
 	cands.each(func(id uint32, matches []termMatch) {
 		s, ok := scoreDoc(terms, matches)
@@ -373,35 +387,14 @@ func rankAll(terms []Term, cands *candidates, docs int, dfFloor []int, top int) 
 			return
 		}
 
-		results = append(results, ranked{id, s})
-
-		for i := range df {
-			if s.matched&(1<<i) != 0 {
-				df[i]++
-			}
-		}
+		results = append(results, ranked{id, s.withIDF(idf)})
 	})
 
-	idf := make([]uint32, len(terms))
-	for i := range idf {
-		if dfFloor != nil {
-			df[i] = max(df[i], dfFloor[i])
-		}
-
-		idf[i] = idfBonus(df[i], docs)
-	}
-
-	for i := range results {
-		results[i].score = results[i].score.withIDF(idf)
-	}
-
-	order := func(a, b ranked) int { return compareScores(a.score, b.score, a.id, b.id) }
-
 	if top < len(results) {
-		results = selectTop(results, top, order)
+		results = selectTop(results, top, orderRanked)
 	}
 
-	slices.SortFunc(results, order)
+	slices.SortFunc(results, orderRanked)
 
 	return results
 }

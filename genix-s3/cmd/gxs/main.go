@@ -14,14 +14,14 @@ import (
 	"time"
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/blob"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/bucket"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/collection"
-	"github.com/ivanjoz/genix-search/genix-s3/internal/index"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/layout"
-	"github.com/ivanjoz/genix-search/genix-s3/internal/manifest"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/normalize"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/plog"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/query"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/tokens"
 )
 
 const usage = `usage: gxs <command> [flags] [args]
@@ -34,9 +34,9 @@ commands:
                                   FILE, the way the application uses its database
   put     ID TEXT...              write one document through p.log
   del     ID                      delete one document through p.log
-  compact                         fold p.log into a new generation
+  compact                         fold p.log into the buckets of the index
   log                             print p.log
-  inspect [WORD]                  print the manifest, or the slot of WORD
+  inspect [WORD]                  print the buckets, or the bucket of WORD
 
 common flags: -root DIR (default data/gxs) -collection NAME -partition NAME -extra CHARS
               -min-index-docs N (default 100): with fewer documents there is no
@@ -184,19 +184,19 @@ func cmdBuild(ctx context.Context, e env, path string) error {
 
 	start := time.Now()
 
-	m, err := e.writer().Init(ctx, docs)
+	res, err := e.writer().Init(ctx, docs)
 	if err != nil {
 		return err
 	}
 
-	if m == nil {
+	if !res.Indexed {
 		fmt.Printf("%d docs, under -min-index-docs %d: no index, only p.log · %v\n", len(docs), e.minIndex, time.Since(start).Round(time.Millisecond))
 
 		return nil
 	}
 
-	fmt.Printf("generation %d: %d docs, %d keys · k %s · p %s · snapshot %s · %v\n",
-		m.Gen, m.Docs, m.Keys, kb(m.KSize), kb(m.PSize), kb(m.SnapSize), time.Since(start).Round(time.Millisecond))
+	fmt.Printf("epoch %d: %d docs in %d buckets · %d writes, %s written · %v\n",
+		res.Epoch, res.Docs, res.Buckets, res.Writes, kb(uint64(res.Bytes)), time.Since(start).Round(time.Millisecond))
 
 	return nil
 }
@@ -231,8 +231,8 @@ func cmdQuery(ctx context.Context, e env, csv string, limit int, fuzzy bool, ter
 		fmt.Print("no index, p.log only · ")
 	}
 
-	fmt.Printf("generation %d · %d rounds · %d requests · %s read (p.log %s) · %d candidates · %d pending · approx %v · %v\n",
-		resp.Gen, s.Rounds, s.Requests, kb(uint64(s.Bytes)), kb(uint64(s.LogBytes)), s.Candidates, s.LogEntries, s.Approx, s.Elapsed.Round(time.Microsecond))
+	fmt.Printf("seq %d · %d rounds · %d requests · %s read (p.log %s, .idx %s) · %d candidates · %d pending · approx %v · %v\n",
+		resp.Seq, s.Rounds, s.Requests, kb(uint64(s.Bytes)), kb(uint64(s.LogBytes)), kb(uint64(s.IdxBytes)), s.Candidates, s.LogEntries, s.Approx, s.Elapsed.Round(time.Microsecond))
 
 	return nil
 }
@@ -285,21 +285,21 @@ func cmdCompact(ctx context.Context, e env) error {
 		return err
 	}
 
-	if res.Ops == 0 {
+	if res.Seq == 0 && res.Ops == 0 {
 		fmt.Println("nothing to compact")
 
 		return nil
 	}
 
-	if res.Gen == 0 {
+	if !res.Indexed {
 		fmt.Printf("no index (%d docs, under -min-index-docs %d): %d ops folded into p.log · %d reads, %d writes, %s written · %v\n",
 			res.Docs, e.minIndex, res.Ops, res.Requests, res.Writes, kb(uint64(res.Bytes)), time.Since(start).Round(time.Millisecond))
 
 		return nil
 	}
 
-	fmt.Printf("generation %d: %d ops folded, %d docs · %d reads, %d writes, %s written · %v\n",
-		res.Gen, res.Ops, res.Docs, res.Requests, res.Writes, kb(uint64(res.Bytes)), time.Since(start).Round(time.Millisecond))
+	fmt.Printf("seq %d, epoch %d (full %v): %d ops folded, %d docs · %d buckets rewritten · %d reads, %d writes, %s written · %v\n",
+		res.Seq, res.Epoch, res.Full, res.Ops, res.Docs, res.Buckets, res.Requests, res.Writes, kb(uint64(res.Bytes)), time.Since(start).Round(time.Millisecond))
 
 	return nil
 }
@@ -316,8 +316,8 @@ func cmdLog(ctx context.Context, e env) error {
 	}
 
 	if log.Base.LogOnly {
-		fmt.Printf("base: no index, %d docs (last generation %d), last seq %d · %s (%s since the base) · torn tail %v\n",
-			len(log.Docs), log.Base.ManifestGen, log.Base.LastSeq, kb(uint64(log.Size)), kb(uint64(log.Size-log.BaseEnd)), log.TornTail)
+		fmt.Printf("base: no index, %d docs (epoch %d), last seq %d · %s (%s since the base) · torn tail %v\n",
+			len(log.Docs), log.Base.Epoch, log.Base.LastSeq, kb(uint64(log.Size)), kb(uint64(log.Size-log.BaseEnd)), log.TornTail)
 
 		for _, doc := range log.Docs {
 			words, err := keys(doc.Tokens)
@@ -328,7 +328,15 @@ func cmdLog(ctx context.Context, e env) error {
 			fmt.Printf("  doc %d  %s\n", doc.ID, words)
 		}
 	} else {
-		fmt.Printf("base: generation %d, last seq %d · %s · torn tail %v\n", log.Base.ManifestGen, log.Base.LastSeq, kb(uint64(log.Size)), log.TornTail)
+		touched := 0
+		for s := range plog.Slots {
+			if log.Base.Touched.Has(s) {
+				touched++
+			}
+		}
+
+		fmt.Printf("base: epoch %d, last seq %d (previous %d), %d docs, %d buckets rewritten by its compaction · %s · torn tail %v\n",
+			log.Base.Epoch, log.Base.LastSeq, log.Base.PrevSeq, log.Base.Docs, touched, kb(uint64(log.Size)), log.TornTail)
 	}
 
 	for _, op := range log.Ops {
@@ -371,62 +379,77 @@ func cmdInspect(ctx context.Context, e env, args []string) error {
 		return nil
 	}
 
-	gen := log.Base.ManifestGen
-
-	mdata, _, err := e.store.Get(ctx, e.col.Manifest(gen))
-	if err != nil {
-		return err
-	}
-
-	m, err := manifest.Decode(mdata)
-	if err != nil {
-		return err
-	}
-
-	k, _, err := e.store.Get(ctx, e.col.K(gen))
-	if err != nil {
-		return err
-	}
-
-	h, err := index.ParseHead(k, e.norm.ID())
-	if err != nil {
-		return err
-	}
-
 	if len(args) == 0 {
-		used := 0
-		for s := range uint16(key5.Slots) {
-			if off, end := h.Block(s); end > off {
-				used++
+		tdata, _, err := e.store.Get(ctx, e.col.Tokens())
+		if err != nil {
+			return err
+		}
+
+		tok, err := tokens.Decode(tdata, e.norm.ID())
+		if err != nil {
+			return err
+		}
+
+		var idxBytes, dbBytes, dbs int
+
+		for slot := range tok.Buckets {
+			x, _, err := e.store.Get(ctx, e.col.Idx(slot))
+			if err != nil {
+				return err
+			}
+
+			idxBytes += len(x)
+
+			if d, _, err := e.store.Get(ctx, e.col.DB(slot)); err == nil {
+				dbBytes += len(d)
+				dbs++
 			}
 		}
 
-		fmt.Printf("generation %d · last seq %d · %d docs · %d keys in %d slots · k %s · p %s · snapshot %s · NormID %08x (normalizer %d, extra %q %q)\n",
-			m.Gen, m.LastSeq, m.Docs, m.Keys, used, kb(m.KSize), kb(m.PSize), kb(m.SnapSize), m.NormID, m.NormalizerVersion, rune(m.Extra1), rune(m.Extra2))
+		fmt.Printf("epoch %d · last seq %d · %d docs · %d buckets (.idx %s), %d with a .db (%s) · %d expanded words · tokens %s · NormID %08x\n",
+			log.Base.Epoch, log.Base.LastSeq, log.Base.Docs, len(tok.Buckets), kb(uint64(idxBytes)), dbs, kb(uint64(dbBytes)),
+			len(tok.Expanded), kb(uint64(len(tdata))), log.Base.NormID)
 
 		return nil
 	}
 
 	word := key5.FromToken(strings.Join(e.norm.Tokens(strings.Join(args, " ")), ""))
-	s := word.Key.Slot()
-	off, end := h.Block(s)
+	slot := word.Key.Slot()
 
-	slot, err := index.ParseSlot(h, s, k[off:end])
+	data, _, err = e.store.Get(ctx, e.col.Idx(slot))
 	if err != nil {
 		return err
 	}
 
-	fmt.Printf("slot %d (%s): %d keys, block %d B, lists [%d, %d) of p\n", s, word.Key.String()[:min(2, len(word.Key.String()))], len(slot.Entries), end-off, h.POff[s], h.POff[s+1])
+	x, err := bucket.Decode(data, e.norm.ID())
+	if err != nil {
+		return err
+	}
 
-	for _, entry := range slot.Entries {
+	fmt.Printf("%s.idx: %d keys, %s · epoch %d, seq %d · inline %s · .db %s, combinations from %d\n",
+		layout.BucketName(slot), len(x.Words), kb(uint64(len(data))), x.Epoch, x.Seq, kb(uint64(len(x.Inline))), kb(uint64(x.DBSize)), x.DBCombos)
+
+	locs := []string{"field", "inline", ".db", "expanded"}
+
+	for _, w := range x.Words {
 		mark := " "
-		if entry.Key == word.Key {
+		if w.Key == word.Key {
 			mark = "*"
 		}
 
-		from, to := entry.Bytes()
-		fmt.Printf("%s %-10s count %5d  codec %d  x %2d  tail %-5v  first %10d  p [%d, %d)\n",
-			mark, entry.Key, entry.Count, entry.Codec, entry.X, entry.HasTail, entry.First, from, to)
+		fmt.Printf("%s %-10s count %5d  df %5d  %-8s %6d B", mark, w.Key, w.Shape.Count, w.DF, locs[w.Loc], (w.Shape.Bits()+7)/8)
+
+		if w.Exp != nil {
+			var blocks uint32
+			for _, c := range w.Exp.Combos {
+				blocks += c.Len
+			}
+
+			fmt.Printf("  · %d heads (%d entries of %d docs) · %d combination blocks by %d letters, %s",
+				len(w.Exp.Groups), len(w.Exp.Groups[0].Entries), w.Exp.Groups[0].Total, len(w.Exp.Combos), w.Exp.P, kb(uint64(blocks)))
+		}
+
+		fmt.Println()
 	}
 
 	return nil

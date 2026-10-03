@@ -12,7 +12,9 @@ import (
 	"time"
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/collection"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/layout"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/normalize"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/tokens"
 )
 
 // TestEval measures the design on a real catalogue: storage, what a query
@@ -101,15 +103,10 @@ func evalScale(t *testing.T, docs []collection.Doc, queries []string, r *rand.Ra
 	f := newFixture(t, normalize.Default, docs)
 	buildTime := time.Since(start)
 
-	e0 := f.engine(DefaultOptions())
-	if _, err := e0.Search(ctx, Request{Query: "polo"}); err != nil {
-		t.Fatal(err)
-	}
-
-	m := e0.state().manifest
-	t.Logf("%d docs · %d keys · k %s · p %s · snapshot %s · build %v · %d PUTs %s written",
-		len(docs), m.Keys, kib(int(m.KSize)), kib(int(m.PSize)), kib(int(m.SnapSize)), buildTime.Round(time.Millisecond),
+	t.Logf("%d docs · build %v · %d PUTs %s written", len(docs), buildTime.Round(time.Millisecond),
 		f.store.Writes.Load(), kib(int(f.store.BytesWritten.Load())))
+
+	logIndex(t, f)
 
 	type variant struct {
 		name string
@@ -118,51 +115,77 @@ func evalScale(t *testing.T, docs []collection.Doc, queries []string, r *rand.Ra
 	}
 
 	base := DefaultOptions()
-	pages := base
-	pages.VerifyPages = true
-	preload := base
-	preload.Preload = true
 	noCoalesce := base
 	noCoalesce.CoalesceGap = 0
 
 	variants := []variant{
 		{"warm", base, false},
 		{"warm, no coalescing", noCoalesce, false},
-		{"warm, page CRCs", pages, false},
-		{"cold, head + slots", base, true},
-		{"cold, whole k", preload, true},
+		{"cold", base, true},
 	}
 
 	for _, v := range variants {
 		warm := f.engine(v.opts)
 
-		var rounds, requests, bytes []int
-		var approx int
+		for _, words := range []int{1, 2, 3} {
+			var rounds, requests, bytes, idxBytes, dbBytes []int
+			var approx, n, headed, deep, pairs int
 
-		for _, q := range queries {
-			e := warm
-			if v.cold {
-				e = f.engine(v.opts)
-			} else if _, err := e.Search(ctx, Request{Query: q, Limit: 10}); err != nil { // load its slots
-				t.Fatal(err)
+			for i, q := range queries {
+				// 1 word: the first word of every other query, also as a
+				// prefix like any last word.
+				if words == 1 {
+					if i%2 != 0 {
+						continue
+					}
+
+					q = strings.Fields(q)[0]
+				} else if len(strings.Fields(q)) != words {
+					continue
+				}
+
+				e := warm
+				if v.cold {
+					e = f.engine(v.opts)
+				} else if _, err := e.Search(ctx, Request{Query: q, Limit: 10}); err != nil { // load its .idx
+					t.Fatal(err)
+				}
+
+				resp, err := e.Search(ctx, Request{Query: q, Limit: 10})
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				s := resp.Stats
+				n++
+				rounds = append(rounds, s.Rounds)
+				requests = append(requests, s.Requests)
+				bytes = append(bytes, int(s.Bytes))
+				idxBytes = append(idxBytes, int(s.IdxBytes))
+				dbBytes = append(dbBytes, int(s.Bytes-s.LogBytes-s.IdxBytes))
+
+				if s.Approx {
+					approx++
+				}
+
+				if s.Heads > 0 {
+					headed++
+				}
+
+				if s.Deep > 0 {
+					deep++
+				}
+
+				pairs += s.Pairs
 			}
 
-			resp, err := e.Search(ctx, Request{Query: q, Limit: 10})
-			if err != nil {
-				t.Fatal(err)
+			if n == 0 {
+				continue
 			}
 
-			rounds = append(rounds, resp.Stats.Rounds)
-			requests = append(requests, resp.Stats.Requests)
-			bytes = append(bytes, int(resp.Stats.Bytes))
-
-			if resp.Stats.Approx {
-				approx++
-			}
+			t.Logf("%-20s %d words (%4d queries): rounds %.2f (max %d) · requests %.2f (max %d) · bytes %s · .idx %s · .db %s · approx %d · heads %d · deep %d · pairs %d",
+				v.name, words, n, avgOf(rounds), slices.Max(rounds), avgOf(requests), slices.Max(requests), dist(bytes), dist(idxBytes), dist(dbBytes), approx, headed, deep, pairs)
 		}
-
-		t.Logf("%-20s rounds %.2f · requests %.2f (max %d) · bytes %s · approx %d",
-			v.name, avgOf(rounds), avgOf(requests), slices.Max(requests), dist(bytes), approx)
 	}
 
 	if !all {
@@ -174,7 +197,7 @@ func evalScale(t *testing.T, docs []collection.Doc, queries []string, r *rand.Ra
 		state[d.ID] = d.Text
 	}
 
-	ref := newReference(normalize.Default, state)
+	ref := newReference(normalize.Default, state, state)
 	full := newFullText(normalize.Default, state)
 
 	// Ranking: against the same rules over every document, and against the
@@ -192,7 +215,7 @@ func evalScale(t *testing.T, docs []collection.Doc, queries []string, r *rand.Ra
 
 		parsed := Parse(normalize.Default, q)
 
-		if slices.Equal(resp.Hits, ref.top(parsed, 10, len(docs))) {
+		if slices.Equal(resp.Hits, ref.top(parsed, 0, 10, false)) {
 			same++
 		}
 
@@ -233,8 +256,13 @@ func evalFuzzy(t *testing.T, f *fixture, docs []collection.Doc, textOf map[uint3
 	ctx := context.Background()
 	warm := f.engine(DefaultOptions())
 
+	// The same queries with no budget: what the budget costs.
+	unlimited := DefaultOptions()
+	unlimited.PrefixBudget = 1 << 40
+	all := f.engine(unlimited)
+
 	var requests, bytes, coldRequests, coldRounds []int
-	found, covered, total := 0, 0, 0
+	found, covered, total, foundAll, approx, early := 0, 0, 0, 0, 0, 0
 
 	for total < 500 {
 		doc := docs[r.IntN(len(docs))]
@@ -262,6 +290,10 @@ func evalFuzzy(t *testing.T, f *fixture, docs []collection.Doc, textOf map[uint3
 		q := typo + " " + other
 		total++
 
+		if len(typo) < 2 || typo[:2] != tokens[i][:2] {
+			early++ // a typo in the first two letters: not searched, by design
+		}
+
 		cold, err := f.engine(DefaultOptions()).Search(ctx, Request{Query: q, Limit: 10, Fuzzy: true})
 		if err != nil {
 			t.Fatal(err)
@@ -284,14 +316,27 @@ func evalFuzzy(t *testing.T, f *fixture, docs []collection.Doc, textOf map[uint3
 			covered++
 		}
 
+		if resp.Stats.Approx {
+			approx++
+		}
+
+		whole, err := all.Search(ctx, Request{Query: q, Limit: 10, Fuzzy: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if slices.ContainsFunc(whole.Hits, func(h Hit) bool { return textOf[h.ID] == doc.Text }) {
+			foundAll++
+		}
+
 		requests = append(requests, resp.Stats.Requests)
 		bytes = append(bytes, int(resp.Stats.Bytes))
 		coldRequests = append(coldRequests, cold.Stats.Requests)
 		coldRounds = append(coldRounds, cold.Stats.Rounds)
 	}
 
-	t.Logf("typos (%d queries of 2 words, one with a typo): the document in the top 10 %d/%d · top hit covers both words %d/%d · warm requests %.2f · bytes %s · cold rounds %.2f requests %.2f",
-		total, found, total, covered, total, avgOf(requests), dist(bytes), avgOf(coldRounds), avgOf(coldRequests))
+	t.Logf("typos (%d queries of 2 words, one with a typo, %d of them in the first two letters): the document in the top 10 %d/%d (%d/%d with no budget, %d cut by it) · top hit covers both words %d/%d · warm requests %.2f · bytes %s · cold rounds %.2f requests %.2f",
+		total, early, found, total, foundAll, total, approx, covered, total, avgOf(requests), dist(bytes), avgOf(coldRounds), avgOf(coldRequests))
 }
 
 // mutate makes one typo: a swap, a deletion, an insertion or a substitution.
@@ -367,8 +412,8 @@ func evalWrites(t *testing.T, f *fixture, docs []collection.Doc, r *rand.Rand, q
 		t.Fatal(err)
 	}
 
-	t.Logf("compaction of %d ops: %v · %d reads %s · %d writes %s",
-		cres.Ops, time.Since(start).Round(time.Millisecond), f.store.Requests.Load(), kib(int(f.store.BytesRead.Load())),
+	t.Logf("compaction of %d ops: %v · %d buckets rewritten · %d reads %s · %d writes %s",
+		cres.Ops, time.Since(start).Round(time.Millisecond), cres.Buckets, f.store.Requests.Load(), kib(int(f.store.BytesRead.Load())),
 		f.store.Writes.Load(), kib(int(f.store.BytesWritten.Load())))
 }
 
@@ -426,6 +471,7 @@ func (f *fullText) top(q Parsed, limit, docs int) []uint32 {
 	}
 
 	cands := newCandidates(len(q.Terms), len(cand))
+	df := make([]int, len(q.Terms))
 
 	for d := range cand {
 		matches := cands.get(f.ids[d])
@@ -435,9 +481,15 @@ func (f *fullText) top(q Parsed, limit, docs int) []uint32 {
 				matches[i].add(f.matches(&q.Terms[i], tok), 0, uint8(min(pos, 255)))
 			}
 		}
+
+		for i := range matches {
+			if matches[i].kind != noMatch {
+				df[i]++
+			}
+		}
 	}
 
-	results := rankAll(q.Terms, cands, docs, nil, 1<<30)
+	results := rankAll(q.Terms, cands, idfs(df, docs), 1<<30)
 	out := make([]uint32, 0, limit)
 
 	for _, r := range results[:min(limit, len(results))] {
@@ -488,6 +540,54 @@ func readLines(t *testing.T, path string) []string {
 	}
 
 	return lines
+}
+
+// logIndex prints what the index takes: the buckets, their .idx and .db.
+func logIndex(t *testing.T, f *fixture) {
+	ctx := context.Background()
+
+	data, _, err := f.store.Get(ctx, f.col.Tokens())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tok, err := tokens.Decode(data, f.norm.ID())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var idx, db []int
+	var biggest string
+	var biggestIdx int
+
+	for slot := range tok.Buckets {
+		x, _, err := f.store.Get(ctx, f.col.Idx(slot))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		idx = append(idx, len(x))
+
+		if len(x) > biggestIdx {
+			biggest, biggestIdx = layout.BucketName(slot), len(x)
+		}
+
+		if d, _, err := f.store.Get(ctx, f.col.DB(slot)); err == nil {
+			db = append(db, len(d))
+		}
+	}
+
+	t.Logf("%d buckets: .idx %s, total %s · %d .db: %s, total %s · %d expanded words · tokens %s · biggest .idx %s (%s)",
+		len(idx), dist(idx), kib(sum(idx)), len(db), dist(db), kib(sum(db)), len(tok.Expanded), kib(len(data)), biggest, kib(biggestIdx))
+}
+
+func sum(values []int) int {
+	total := 0
+	for _, v := range values {
+		total += v
+	}
+
+	return total
 }
 
 func kib(n int) string {

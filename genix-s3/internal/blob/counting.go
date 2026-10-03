@@ -15,12 +15,12 @@ type Counting struct {
 	BytesWritten atomic.Int64
 }
 
-func (c *Counting) GetRange(ctx context.Context, key string, off, n int64) ([]byte, error) {
-	data, err := c.Blob.GetRange(ctx, key, off, n)
+func (c *Counting) GetRange(ctx context.Context, key string, off, n int64) ([]byte, string, error) {
+	data, etag, err := c.Blob.GetRange(ctx, key, off, n)
 	c.Requests.Add(1)
 	c.BytesRead.Add(int64(len(data)))
 
-	return data, err
+	return data, etag, err
 }
 
 func (c *Counting) Get(ctx context.Context, key string) ([]byte, string, error) {

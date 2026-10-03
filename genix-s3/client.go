@@ -37,7 +37,7 @@ type ClientOptions struct {
 	MinIndexDocs int     // see Config.MinIndexDocs
 	Search       SearchOptions
 	// MaxSearchers bounds the searchers kept, one per partition searched,
-	// each with the cached dictionary of its generation. Default 256.
+	// each with the .idx it cached. Default 256.
 	MaxSearchers int
 	Compact      CompactMode
 	// OnCompact receives the compaction requests in CompactCallback mode.
@@ -92,7 +92,7 @@ func NewClient(store Blob, opts ClientOptions) (*Client, error) {
 	}
 
 	if opts.Search == (SearchOptions{}) {
-		// A process holds up to MaxSearchers of them: a smaller slot cache
+		// A process holds up to MaxSearchers of them: a smaller .idx cache
 		// each than a single collection's default.
 		opts.Search = DefaultSearchOptions()
 		opts.Search.CacheBytes = 8 << 20
@@ -213,7 +213,7 @@ func (c *Client) compactAsync(k partKey) {
 // Wait blocks until the async compactions running now end.
 func (c *Client) Wait() { c.running.Wait() }
 
-// Compact folds the pending writes of a partition into a new generation.
+// Compact folds the pending writes of a partition into its index.
 func (c *Client) Compact(ctx context.Context, collection, partition string) (CompactResult, error) {
 	col, err := c.collection(partKey{collection, partition})
 	if err != nil {

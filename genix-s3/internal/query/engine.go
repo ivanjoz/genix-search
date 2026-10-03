@@ -1,28 +1,31 @@
+// Package query answers a search from p.log and the buckets of the index
+// (PLAN_BUCKETS.md §6–7, §10).
 package query
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/blob"
-	"github.com/ivanjoz/genix-search/genix-s3/internal/index"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/bucket"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/layout"
-	"github.com/ivanjoz/genix-search/genix-s3/internal/manifest"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/normalize"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/parallel"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/plog"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/postings"
 )
 
 // Options are the query tunables.
 type Options struct {
-	// PrefixBudget is the bytes of p a prefix (or a typo expansion) may read;
-	// the most frequent keys go first.
+	// PrefixBudget is the bytes of .db a prefix (or a typo expansion) may
+	// read; the most frequent words go first.
 	PrefixBudget int64
 	// CoalesceGap is the largest hole merged into one range read: S3 has no
 	// multi-range GET, so two lists close together cost one request.
@@ -31,14 +34,12 @@ type Options struct {
 	MaxRequest int64
 	// Concurrency is the simultaneous requests of one round.
 	Concurrency int
-	// VerifyPages checks every read of p against the page CRCs of k, which
-	// rounds every read to 4 KB pages.
-	VerifyPages bool
-	// Preload reads the whole k the first time a generation is used, instead
-	// of the head and then the slots each query needs.
-	Preload bool
-	// CacheBytes bounds the decoded slots kept per generation.
+	// CacheBytes bounds the decoded .idx kept between searches.
 	CacheBytes int64
+	// RoundLimit: a cold first round, p.log and the .idx read together, that
+	// takes longer is repeated. It must stay below the writers'
+	// CompactSpacing (PLAN_BUCKETS.md §7).
+	RoundLimit time.Duration
 }
 
 // DefaultOptions are the defaults.
@@ -48,9 +49,8 @@ func DefaultOptions() Options {
 		CoalesceGap:  4 << 10,
 		MaxRequest:   1 << 20,
 		Concurrency:  16,
-		VerifyPages:  false,
-		Preload:      false,
 		CacheBytes:   64 << 20,
+		RoundLimit:   500 * time.Millisecond,
 	}
 }
 
@@ -72,10 +72,12 @@ type Hit struct {
 
 // Stats says what a search cost.
 type Stats struct {
-	Rounds     int
-	Requests   int
-	Bytes      int64 // every byte read, p.log included
-	LogBytes   int64 // of which p.log
+	Rounds   int
+	Requests int
+	Bytes    int64 // every byte read, p.log included
+	LogBytes int64 // of which p.log
+	IdxBytes int64 // of which .idx
+	// Candidates is the documents scored; LogEntries the pending ops of p.log.
 	Candidates int
 	LogEntries int
 	// Approx is set when a prefix or typo expansion was cut by the budget.
@@ -83,57 +85,23 @@ type Stats struct {
 	// LogOnly is set when the collection has no index (under MinIndexDocs)
 	// and the answer came from p.log alone.
 	LogOnly bool
+	// Warm is set when the .idx it needed were cached.
+	Warm bool
+	// Heads is the expanded words read through their head; Pairs the
+	// combinations read; Deep the whole lists read after the heads fell
+	// short.
+	Heads, Pairs, Deep int
+	// Retries counts the attempts started over: a compaction or a rebuild
+	// between the reads.
+	Retries int
 	Elapsed time.Duration
 }
 
 // Response is the answer to a Request.
 type Response struct {
-	Gen   uint32
+	Seq   uint64 // the LastSeq of the index the answer comes from
 	Hits  []Hit
 	Stats Stats
-}
-
-// genState is what the engine holds of one generation.
-type genState struct {
-	gen      uint32
-	manifest *manifest.Manifest
-	head     *index.Head
-	pageCRCs []uint32 // nil until loaded
-
-	mu    sync.Mutex
-	slots map[uint16]*index.Slot
-	bytes int64
-}
-
-func (g *genState) crcs() []uint32 {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	return g.pageCRCs
-}
-
-func (g *genState) slot(s uint16) *index.Slot {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	return g.slots[s]
-}
-
-func (g *genState) putSlots(slots []*index.Slot, limit int64) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-
-	for _, s := range slots {
-		if g.bytes > limit {
-			// A simple bound: start over rather than track recency.
-			g.slots, g.bytes = map[uint16]*index.Slot{}, 0
-		}
-
-		if _, ok := g.slots[s.ID]; !ok {
-			g.slots[s.ID] = s
-			g.bytes += int64(s.Size) + int64(len(s.Entries))*48
-		}
-	}
 }
 
 // Engine serves the searches of one collection. It is safe for concurrent
@@ -144,28 +112,58 @@ type Engine struct {
 	norm  *normalize.Normalizer
 	opts  Options
 
-	mu      sync.Mutex
-	current *genState
+	// The cache: decoded buckets, valid as of (epoch, seq). A nil Index is a
+	// bucket known to be empty.
+	mu         sync.Mutex
+	epoch      uint32
+	seq        uint64
+	cache      map[uint16]*bucket.Index
+	cacheBytes int64
 }
 
-// New returns an engine with empty caches. norm must be the normalizer the
+// New returns an engine with an empty cache. norm must be the normalizer the
 // collection was indexed with: every file's NormID is checked against it.
 func New(store blob.Blob, col layout.Collection, norm *normalize.Normalizer, opts Options) *Engine {
-	return &Engine{store: store, col: col, norm: norm, opts: opts}
+	def := DefaultOptions()
+
+	if opts.RoundLimit <= 0 {
+		opts.RoundLimit = def.RoundLimit
+	}
+
+	if opts.Concurrency <= 0 {
+		opts.Concurrency = def.Concurrency
+	}
+
+	if opts.MaxRequest <= 0 {
+		opts.MaxRequest = def.MaxRequest
+	}
+
+	return &Engine{store: store, col: col, norm: norm, opts: opts, cache: map[uint16]*bucket.Index{}}
 }
 
 // ErrNoCollection is returned for a collection without p.log.
 var ErrNoCollection = errors.New("query: the collection does not exist")
 
+// errStale is a bucket of another version than the p.log read with it: a
+// compaction or a rebuild ran in between. The search starts over.
+var errStale = errors.New("query: the index changed during the search")
+
 // counters are shared by the requests of one search.
 type counters struct {
-	requests, bytes, logBytes atomic.Int64
+	requests, bytes, logBytes, idxBytes atomic.Int64
 }
 
-const maxAttempts = 4
+// A search started over waits a random time under staleBackoff << attempt
+// (capped at attempt 5): about 3 s over maxAttempts at most, enough for a
+// rebuild, whose new-epoch buckets are stale until it rebases p.log, to
+// finish writing them.
+const (
+	maxAttempts  = 8
+	staleBackoff = 25 * time.Millisecond
+)
 
-// Search runs one query. With the generation's slots cached it is one round:
-// p.log and the lists of p, in parallel.
+// Search runs one query: p.log and the .idx of its buckets in one round, the
+// ranges of .db it needs in a second. With the .idx cached, one round.
 func (e *Engine) Search(ctx context.Context, req Request) (Response, error) {
 	start := time.Now()
 	q := Parse(e.norm, req.Query)
@@ -177,183 +175,242 @@ func (e *Engine) Search(ctx context.Context, req Request) (Response, error) {
 		return resp, nil
 	}
 
-	var log *plog.Log
+	for attempt := range maxAttempts {
+		if attempt > 0 {
+			resp.Stats.Retries++
 
-	for range maxAttempts {
-		g := e.state()
-
-		if g == nil {
-			if log == nil {
-				var err error
-				if log, err = e.fetchLog(ctx, &c); err != nil {
-					return resp, err
-				}
-
-				resp.Stats.Rounds++
-			}
-
-			if log.Base.LogOnly {
-				return e.searchLog(q, req, log, resp, &c, start)
-			}
-
-			var err error
-			if g, err = e.loadGen(ctx, log.Base.ManifestGen, &c); err != nil {
-				if stale(err) {
-					log = nil
-
-					continue
-				}
-
+			if err := plog.Backoff(ctx, attempt, staleBackoff); err != nil {
 				return resp, err
 			}
-
-			resp.Stats.Rounds++
 		}
 
-		hits, err := e.run(ctx, g, q, req, &log, &c, &resp.Stats)
-		if err != nil {
-			if stale(err) {
-				e.drop(g)
-				log = nil
+		resp.Stats.Rounds = 0
 
-				continue
-			}
-
-			return resp, err
-		}
-
-		if log.Base.ManifestGen != g.gen || log.Base.LogOnly {
-			// p.log moved to another generation (or dropped the index) while
-			// this one was read: the lists belong to the old one. Read again
-			// from what p.log says now.
-			e.drop(g)
-
+		err := e.attempt(ctx, q, req, &resp, &c)
+		if errors.Is(err, errStale) {
 			continue
 		}
 
-		resp.Gen = g.gen
-		resp.Hits = hits
 		resp.Stats.Requests = int(c.requests.Load())
 		resp.Stats.Bytes = c.bytes.Load()
 		resp.Stats.LogBytes = c.logBytes.Load()
+		resp.Stats.IdxBytes = c.idxBytes.Load()
 		resp.Stats.Elapsed = time.Since(start)
 
-		return resp, nil
+		return resp, err
 	}
 
-	return resp, errors.New("query: the collection kept changing generation during the search")
+	return resp, errors.New("query: the index kept changing during the search")
 }
 
-// searchLog answers from p.log alone, for a collection without index (under
-// MinIndexDocs): every document of the Docs frame and the pending ops is
-// matched by the same rules the index path uses.
-func (e *Engine) searchLog(q Parsed, req Request, log *plog.Log, resp Response, c *counters, start time.Time) (Response, error) {
-	pending := log.Pending()
+// fetched is an .idx read in this search.
+type fetched struct {
+	slot  uint16
+	data  []byte
+	found bool
+}
 
-	docs := make([][]key5.Token, 0, len(log.Docs))
-	ids := make([]uint32, 0, len(log.Docs))
+// attempt runs the search once.
+func (e *Engine) attempt(ctx context.Context, q Parsed, req Request, resp *Response, c *counters) error {
+	slots := querySlots(q.Terms)
 
-	for _, doc := range log.Docs {
-		if _, changed := pending[doc.ID]; changed {
+	// Round 1: p.log, the .idx not cached, and — when every .idx is cached —
+	// the .db ranges they say, speculatively.
+	pinned, missing := e.lookup(slots)
+
+	var spec *readPlan
+	var specData *dbData
+
+	if len(missing) == 0 {
+		spec = planQuery(q.Terms, func(s uint16) *bucket.Index { return pinned[s] }, e.opts.PrefixBudget, req.Fuzzy)
+		specData = &dbData{}
+	}
+
+	var log *plog.Log
+	got := make([]fetched, len(missing))
+	started := time.Now()
+
+	var specJobs []dbRange
+	if spec != nil {
+		specJobs = e.ranges(spec.picks, spec.pairs)
+	}
+
+	err := parallel.Run(ctx, 1+len(missing)+len(specJobs), e.opts.Concurrency, func(ctx context.Context, i int) error {
+		switch {
+		case i == 0:
+			var err error
+			log, err = e.fetchLog(ctx, c)
+
+			return err
+		case i <= len(missing):
+			got[i-1].slot = missing[i-1]
+			got[i-1].data, got[i-1].found, _ = e.fetchIdx(ctx, missing[i-1], c)
+
+			return nil
+		}
+
+		return e.fetchRange(ctx, specJobs[i-1-len(missing)], specData, c)
+	})
+
+	resp.Stats.Rounds++
+
+	if err != nil {
+		return err
+	}
+
+	if len(missing) > 0 && time.Since(started) > e.opts.RoundLimit {
+		return errStale // too slow to tell an old bucket from a current one
+	}
+
+	base := log.Base
+	resp.Seq = base.LastSeq
+	resp.Stats.LogEntries = len(log.Pending())
+
+	if base.LogOnly {
+		return e.searchLog(q, req, log, resp)
+	}
+
+	// Validate what was cached against this base, and what was read.
+	usable := e.sync(base)
+
+	var refetch []uint16
+
+	for _, s := range slots {
+		if _, read := pinned[s]; !read {
 			continue
 		}
 
-		tokens, err := key5.ReadTokens(doc.Tokens)
-		if err != nil {
-			return resp, fmt.Errorf("query: p.log document %d: %w", doc.ID, err)
+		if !usable || !e.still(s, pinned[s]) {
+			delete(pinned, s)
+			refetch = append(refetch, s)
 		}
-
-		docs = append(docs, tokens)
-		ids = append(ids, doc.ID)
 	}
 
-	for id, op := range pending {
-		if op.Del {
-			continue
-		}
-
-		tokens, err := key5.ReadTokens(op.Tokens)
+	for _, f := range got {
+		x, err := e.validate(f, base)
 		if err != nil {
-			return resp, fmt.Errorf("query: p.log op %d: %w", op.Seq, err)
+			return err
 		}
 
-		docs = append(docs, tokens)
-		ids = append(ids, id)
+		pinned[f.slot] = x
 	}
 
-	// Typos only for the terms no document has, exactly or as a prefix: the
-	// same rule as the index, whose dictionary is every key of the collection.
-	fuzzy := make([]bool, len(q.Terms))
-	var scratch [key5.MaxUnits]uint8
+	if len(refetch) > 0 {
+		// Read after p.log: never older than the base it says.
+		again := make([]fetched, len(refetch))
 
-	if req.Fuzzy {
-		for i := range q.Terms {
-			t := &q.Terms[i]
-			if t.Explicit || t.Number || fuzzyBudget(len(t.Text)) == 0 {
-				continue
+		err := parallel.Run(ctx, len(refetch), e.opts.Concurrency, func(ctx context.Context, i int) error {
+			again[i].slot = refetch[i]
+			again[i].data, again[i].found, _ = e.fetchIdx(ctx, refetch[i], c)
+
+			return nil
+		})
+
+		resp.Stats.Rounds++
+
+		if err != nil {
+			return err
+		}
+
+		for _, f := range again {
+			x, err := e.validate(f, base)
+			if err != nil {
+				return err
 			}
 
-			fuzzy[i] = !slices.ContainsFunc(docs, func(tokens []key5.Token) bool {
-				return slices.ContainsFunc(tokens, func(tok key5.Token) bool {
-					kind, _ := t.classifyKey(tok.Key, false, scratch[:])
+			pinned[f.slot] = x
+		}
 
-					return kind != noKey
-				})
-			})
+		got = append(got, again...)
+		spec = nil
+	}
+
+	if usable {
+		e.remember(got, pinned)
+	}
+
+	resp.Stats.Warm = len(missing) == 0 && spec != nil
+
+	p := spec
+	data := specData
+
+	if p == nil {
+		p = planQuery(q.Terms, func(s uint16) *bucket.Index { return pinned[s] }, e.opts.PrefixBudget, req.Fuzzy)
+		data = &dbData{}
+
+		if n, err := e.read(ctx, p.picks, p.pairs, data, c); err != nil {
+			return err
+		} else if n > 0 {
+			resp.Stats.Rounds++
 		}
 	}
 
-	cands := newCandidates(len(q.Terms), len(docs))
-
-	for i, tokens := range docs {
-		if matches, any := matchTokens(q.Terms, fuzzy, tokens, scratch[:]); any {
-			cands.put(ids[i], matches)
-		}
+	if err := data.check(p); err != nil {
+		return err
 	}
 
+	resp.Stats.Approx = p.approx
+
+	return e.answer(ctx, q, req, p, data, log, int(base.Docs), resp, c)
+}
+
+// answer assembles the candidates, ranks them and checks the ranking is
+// exact; when a head left room for a document it did not show, it reads the
+// whole list of that word and ranks again (PLAN_BUCKETS.md §6.1, step 6).
+func (e *Engine) answer(ctx context.Context, q Parsed, req Request, p *readPlan, data *dbData, log *plog.Log, docs int, resp *Response, c *counters) error {
 	limit := req.Limit
 	if limit <= 0 {
 		limit = 10
 	}
 
-	results := rankAll(q.Terms, cands, len(docs), nil, max(req.Offset, 0)+limit)
-	from := min(max(req.Offset, 0), len(results))
-	to := min(from+limit, len(results))
+	offset := max(req.Offset, 0)
+	need := offset + limit
+	idf := idfs(p.df, docs)
+	pending := log.Pending()
 
-	resp.Gen = 0
-	resp.Hits = make([]Hit, 0, to-from)
-
-	for _, r := range results[from:to] {
-		resp.Hits = append(resp.Hits, Hit{ID: r.id, Coverage: r.score.coverage, Score: r.score.score})
+	resp.Stats.Pairs = len(p.pairs)
+	for _, pk := range p.picks {
+		if pk.headed() {
+			resp.Stats.Heads++
+		}
 	}
 
-	resp.Stats.LogOnly = true
-	resp.Stats.Candidates = cands.len()
-	resp.Stats.LogEntries = len(pending)
-	resp.Stats.Requests = int(c.requests.Load())
-	resp.Stats.Bytes = c.bytes.Load()
-	resp.Stats.LogBytes = c.logBytes.Load()
-	resp.Stats.Elapsed = time.Since(start)
+	for {
+		cands, err := assemble(q.Terms, p, data, pending)
+		if err != nil {
+			return err
+		}
 
-	return resp, nil
-}
+		results := rankAll(q.Terms, cands, idf, need)
+		short := shortHeads(q.Terms, p, idf, results, need)
 
-// stale is an object that is gone: the generation was collected.
-func stale(err error) bool { return errors.Is(err, blob.ErrNotFound) }
+		if len(short) == 0 {
+			resp.Stats.Candidates = cands.len()
+			from, to := min(offset, len(results)), min(offset+limit, len(results))
+			resp.Hits = make([]Hit, 0, to-from)
 
-func (e *Engine) state() *genState {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+			for _, r := range results[from:to] {
+				resp.Hits = append(resp.Hits, Hit{ID: r.id, Coverage: r.score.coverage, Score: r.score.score})
+			}
 
-	return e.current
-}
+			return nil
+		}
 
-func (e *Engine) drop(g *genState) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+		for _, pk := range short {
+			pk.full = true
+		}
 
-	if e.current == g {
-		e.current = nil
+		resp.Stats.Deep += len(short)
+
+		if _, err := e.read(ctx, short, nil, data, c); err != nil {
+			return err
+		}
+
+		resp.Stats.Rounds++
+
+		if err := data.check(p); err != nil {
+			return err
+		}
 	}
 }
 
@@ -374,438 +431,323 @@ func (e *Engine) fetchLog(ctx context.Context, c *counters) (*plog.Log, error) {
 	return plog.Parse(data, e.norm.ID())
 }
 
-func (e *Engine) get(ctx context.Context, key string, off, n int64, c *counters) ([]byte, error) {
-	data, err := e.store.GetRange(ctx, key, off, n)
+// fetchIdx reads the .idx of a slot. Errors other than a missing object come
+// back as found with no data, which validate reports.
+func (e *Engine) fetchIdx(ctx context.Context, slot uint16, c *counters) ([]byte, bool, error) {
+	data, _, err := e.store.Get(ctx, e.col.Idx(slot))
 	c.requests.Add(1)
 	c.bytes.Add(int64(len(data)))
+	c.idxBytes.Add(int64(len(data)))
+
+	if errors.Is(err, blob.ErrNotFound) {
+		return nil, false, nil
+	}
 
 	if err != nil {
-		return nil, fmt.Errorf("query: %s: %w", key, err)
+		return nil, true, err
 	}
 
-	if n >= 0 && int64(len(data)) != n {
-		return nil, fmt.Errorf("query: %s: short read at %d", key, off)
-	}
-
-	return data, nil
+	return data, true, nil
 }
 
-// loadGen reads the manifest and the head of k (or all of k with Preload),
-// in one round.
-func (e *Engine) loadGen(ctx context.Context, gen uint32, c *counters) (*genState, error) {
-	g := &genState{gen: gen, slots: map[uint16]*index.Slot{}}
+// validate decides whether an .idx read belongs to the p.log base read with
+// it (PLAN_BUCKETS.md §7). It returns the decoded index, nil for an empty
+// bucket, or errStale.
+func (e *Engine) validate(f fetched, base plog.Base) (*bucket.Index, error) {
+	touched := base.Touched.Has(int(f.slot))
 
-	var kData []byte
-
-	err := parallel.Run(ctx, 2, 2, func(ctx context.Context, i int) error {
-		if i == 0 {
-			data, _, err := e.store.Get(ctx, e.col.Manifest(gen))
-			c.requests.Add(1)
-			c.bytes.Add(int64(len(data)))
-
-			if err != nil {
-				return fmt.Errorf("query: manifest %d: %w", gen, err)
-			}
-
-			g.manifest, err = manifest.Decode(data)
-
-			return err
+	if !f.found {
+		// Missing: never written, or written by the last compaction after
+		// this read.
+		if touched {
+			return nil, errStale
 		}
 
-		n := int64(index.HeadSize)
-		if e.opts.Preload {
-			n = -1
-		}
+		return nil, nil
+	}
 
-		var err error
-		kData, err = e.get(ctx, e.col.K(gen), 0, n, c)
+	if f.data == nil {
+		return nil, fmt.Errorf("query: %s: read failed", e.col.Idx(f.slot))
+	}
 
-		return err
-	})
+	m, err := bucket.ReadMeta(f.data)
 	if err != nil {
 		return nil, err
 	}
 
-	if g.manifest.NormID != e.norm.ID() {
-		return nil, fmt.Errorf("query: the collection uses normalizer %08x (extra letters %q %q), this engine %08x",
-			g.manifest.NormID, rune(g.manifest.Extra1), rune(g.manifest.Extra2), e.norm.ID())
+	switch {
+	case m.Epoch > base.Epoch:
+		return nil, errStale // a rebuild in progress
+	case m.Epoch < base.Epoch:
+		if touched {
+			return nil, errStale
+		}
+
+		return nil, nil // a bucket of a replaced index, garbage
+	case m.Seq < base.LastSeq && touched:
+		return nil, errStale
 	}
 
-	if g.head, err = index.ParseHead(kData, e.norm.ID()); err != nil {
+	x, err := bucket.Decode(f.data, e.norm.ID())
+	if err != nil {
 		return nil, err
 	}
 
-	if g.head.Gen != gen {
-		return nil, fmt.Errorf("query: k.%d says generation %d", gen, g.head.Gen)
+	if x.Slot != f.slot {
+		return nil, fmt.Errorf("query: %s holds slot %d", e.col.Idx(f.slot), x.Slot)
 	}
 
-	if e.opts.Preload {
-		if int64(len(kData)) != int64(g.head.KSize()) {
-			return nil, fmt.Errorf("query: k.%d has %d bytes, the header says %d", gen, len(kData), g.head.KSize())
-		}
-
-		slots := make([]*index.Slot, 0, key5.Slots)
-
-		for s := range uint16(key5.Slots) {
-			off, end := g.head.Block(s)
-
-			slot, err := index.ParseSlot(g.head, s, kData[off:end])
-			if err != nil {
-				return nil, err
-			}
-
-			slots = append(slots, slot)
-		}
-
-		g.putSlots(slots, 1<<62)
-		g.pageCRCs = index.PageCRCs(kData[g.head.PageCRCOff:])
+	if len(x.Words) == 0 {
+		return nil, nil // a tombstone
 	}
 
+	return x, nil
+}
+
+// lookup returns the cached buckets of slots and the slots not cached.
+func (e *Engine) lookup(slots []uint16) (map[uint16]*bucket.Index, []uint16) {
 	e.mu.Lock()
-	e.current = g
-	e.mu.Unlock()
+	defer e.mu.Unlock()
 
-	return g, nil
-}
-
-// loadSlots pins the slots of want for this search: from the cache, or read
-// in one round with the page CRCs if needed and p.log if it was not read yet.
-// Pinned slots stay put even if another search resets the cache meanwhile.
-func (e *Engine) loadSlots(ctx context.Context, g *genState, want []uint16, pinned map[uint16]*index.Slot, log **plog.Log, c *counters) error {
+	pinned := make(map[uint16]*bucket.Index, len(slots))
 	var missing []uint16
 
-	for _, s := range want {
-		if pinned[s] != nil {
-			continue
-		}
-
-		if slot := g.slot(s); slot != nil {
-			pinned[s] = slot
-		} else if !slices.Contains(missing, s) {
+	for _, s := range slots {
+		if x, ok := e.cache[s]; ok {
+			pinned[s] = x
+		} else {
 			missing = append(missing, s)
 		}
 	}
 
-	slices.Sort(missing)
+	return pinned, missing
+}
 
-	needCRCs := e.opts.VerifyPages && g.crcs() == nil
+// sync moves the cache to base: the buckets the compaction that wrote base
+// rewrote are dropped, everything if more than one compaction ran. It
+// reports false for a base older than the cache, which is then neither used
+// nor filled.
+func (e *Engine) sync(base plog.Base) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
-	if len(missing) == 0 && !needCRCs {
-		return nil
+	switch {
+	case e.epoch == base.Epoch && e.seq == base.LastSeq:
+	case e.epoch == base.Epoch && e.seq == base.PrevSeq:
+		for s := range e.cache {
+			if base.Touched.Has(int(s)) {
+				e.forget(s)
+			}
+		}
+
+		e.seq = base.LastSeq
+	case e.epoch == base.Epoch && base.LastSeq < e.seq:
+		return false
+	default:
+		e.cache, e.cacheBytes = map[uint16]*bucket.Index{}, 0
+		e.epoch, e.seq = base.Epoch, base.LastSeq
 	}
 
-	// Coalesce the blocks into range reads.
-	type span struct {
-		off, end uint32
-		slots    []uint16
+	return true
+}
+
+func (e *Engine) forget(s uint16) {
+	if x := e.cache[s]; x != nil {
+		e.cacheBytes -= int64(x.Size)
 	}
 
-	var spans []span
+	delete(e.cache, s)
+}
 
-	for _, s := range missing {
-		off, end := g.head.Block(s)
-		if n := len(spans); n > 0 && int64(off)-int64(spans[n-1].end) <= e.opts.CoalesceGap && int64(end-spans[n-1].off) <= e.opts.MaxRequest {
-			spans[n-1].end = max(spans[n-1].end, end)
-			spans[n-1].slots = append(spans[n-1].slots, s)
+// still reports whether the cache still holds x for slot s.
+func (e *Engine) still(s uint16, x *bucket.Index) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
+	have, ok := e.cache[s]
+
+	return ok && have == x
+}
+
+// remember caches the buckets read.
+func (e *Engine) remember(got []fetched, pinned map[uint16]*bucket.Index) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	for _, f := range got {
+		x := pinned[f.slot]
+		if _, ok := e.cache[f.slot]; ok {
 			continue
 		}
 
-		spans = append(spans, span{off: off, end: end, slots: []uint16{s}})
-	}
-
-	// Empty slots need no read.
-	spans = slices.DeleteFunc(spans, func(sp span) bool { return sp.end == sp.off })
-
-	data := make([][]byte, len(spans))
-	jobs := len(spans)
-	logJob, crcJob := -1, -1
-
-	if *log == nil {
-		logJob = jobs
-		jobs++
-	}
-
-	if needCRCs {
-		crcJob = jobs
-		jobs++
-	}
-
-	var crcData []byte
-
-	err := parallel.Run(ctx, jobs, e.opts.Concurrency, func(ctx context.Context, i int) error {
-		var err error
-
-		switch i {
-		case logJob:
-			*log, err = e.fetchLog(ctx, c)
-		case crcJob:
-			off := int64(g.head.PageCRCOff)
-			crcData, err = e.get(ctx, e.col.K(g.gen), off, int64(g.head.KSize())-off, c)
-		default:
-			data[i], err = e.get(ctx, e.col.K(g.gen), int64(spans[i].off), int64(spans[i].end-spans[i].off), c)
+		size := int64(64)
+		if x != nil {
+			size += int64(x.Size) + int64(len(x.Words))*64
 		}
 
-		return err
-	})
-	if err != nil {
-		return err
-	}
-
-	slots := make([]*index.Slot, 0, len(missing))
-
-	for _, s := range missing {
-		off, end := g.head.Block(s)
-		if off == end {
-			slots = append(slots, &index.Slot{ID: s})
-
-			continue
+		if e.cacheBytes+size > e.opts.CacheBytes {
+			// A simple bound: drop a random half rather than track recency.
+			for s := range e.cache {
+				if rand.IntN(2) == 0 {
+					e.forget(s)
+				}
+			}
 		}
 
-		i := slices.IndexFunc(spans, func(sp span) bool { return off >= sp.off && end <= sp.end })
+		e.cache[f.slot] = x
+		e.cacheBytes += size
+	}
+}
 
-		slot, err := index.ParseSlot(g.head, s, data[i][off-spans[i].off:end-spans[i].off])
-		if err != nil {
-			return err
+// dbRange is a byte range of the .db of a slot.
+type dbRange struct {
+	slot     uint16
+	off, end uint64
+	etag     string // the .idx's DBETag: what the read must come back with
+}
+
+// dbData holds the ranges read, per slot.
+type dbData struct {
+	mu     sync.Mutex
+	chunks map[uint16][]chunk
+	bad    bool // a range came back from another version of its .db
+}
+
+type chunk struct {
+	off  uint64
+	data []byte
+}
+
+// get returns the data covering [off, end) of slot and the offset it starts at.
+func (d *dbData) get(slot uint16, off, end uint64) ([]byte, uint64, bool) {
+	for _, ch := range d.chunks[slot] {
+		if off >= ch.off && end <= ch.off+uint64(len(ch.data)) {
+			return ch.data, ch.off, true
 		}
-
-		slots = append(slots, slot)
 	}
 
-	for _, slot := range slots {
-		pinned[slot.ID] = slot
-	}
+	return nil, 0, false
+}
 
-	g.putSlots(slots, e.opts.CacheBytes)
-
-	if needCRCs {
-		g.mu.Lock()
-		g.pageCRCs = index.PageCRCs(crcData)
-		g.mu.Unlock()
+// check fails with errStale when a range was of another .db than its .idx says.
+func (d *dbData) check(p *readPlan) error {
+	if d.bad {
+		return errStale
 	}
 
 	return nil
 }
 
-// run plans and reads one query on generation g.
-func (e *Engine) run(ctx context.Context, g *genState, q Parsed, req Request, log **plog.Log, c *counters, stats *Stats) ([]Hit, error) {
-	var want []uint16
-	for i := range q.Terms {
-		want = append(want, termSlots(&q.Terms[i])...)
-	}
+// ranges are the reads of the .db that the whole lists of picks and the
+// combinations of pairs need, merged when close.
+func (e *Engine) ranges(picks []*pick, pairs []pairRead) []dbRange {
+	var want []dbRange
 
-	// round counts a round when the loads since the last one made requests.
-	before := c.requests.Load()
-	round := func() {
-		if now := c.requests.Load(); now > before {
-			stats.Rounds++
-			before = now
+	for _, pk := range picks {
+		if pk.full && (pk.w.Loc == bucket.LocDB || pk.w.Loc == bucket.LocExpanded) {
+			off, end := pk.w.Bytes()
+			want = append(want, dbRange{slot: pk.slot, off: off, end: end, etag: pk.x.DBETag})
 		}
 	}
 
-	pinned := map[uint16]*index.Slot{}
-
-	if err := e.loadSlots(ctx, g, want, pinned, log, c); err != nil {
-		return nil, err
+	for _, pr := range pairs {
+		off := uint64(pr.combo.Off)
+		want = append(want, dbRange{slot: pr.anchor.slot, off: off, end: off + uint64(pr.combo.Len), etag: pr.anchor.x.DBETag})
 	}
 
-	round()
-
-	// The slots of typo candidates are pinned from the cache when there;
-	// planTerms lists the others.
-	source := func(s uint16) *index.Slot {
-		if slot, ok := pinned[s]; ok {
-			return slot
+	slices.SortFunc(want, func(a, b dbRange) int {
+		if a.slot != b.slot {
+			return int(a.slot) - int(b.slot)
 		}
 
-		slot := g.slot(s)
-		if slot != nil {
-			pinned[s] = slot
-		}
+		if a.off != b.off {
+			if a.off < b.off {
+				return -1
+			}
 
-		return slot
-	}
-
-	p, need := planTerms(q.Terms, source, e.opts.PrefixBudget, req.Fuzzy)
-
-	if len(need) > 0 {
-		if err := e.loadSlots(ctx, g, need, pinned, log, c); err != nil {
-			return nil, err
-		}
-
-		round()
-
-		p, _ = planTerms(q.Terms, source, e.opts.PrefixBudget, req.Fuzzy)
-	}
-
-	postings, err := e.readLists(ctx, g, p, log, c)
-	if err != nil {
-		return nil, err
-	}
-
-	round()
-	stats.Approx = p.approx
-
-	candidates := gather(q.Terms, p, postings)
-
-	pending := (*log).Pending()
-	stats.LogEntries = len(pending)
-
-	if err := overlay(q.Terms, p.fuzzy, candidates, pending); err != nil {
-		return nil, err
-	}
-
-	stats.Candidates = candidates.len()
-
-	var dfFloor []int
-	if p.approx {
-		dfFloor = p.dfFloor
-	}
-
-	limit := req.Limit
-	if limit <= 0 {
-		limit = 10
-	}
-
-	results := rankAll(q.Terms, candidates, int(g.head.Docs), dfFloor, max(req.Offset, 0)+limit)
-
-	from := min(max(req.Offset, 0), len(results))
-	to := min(from+limit, len(results))
-	hits := make([]Hit, 0, to-from)
-
-	for _, r := range results[from:to] {
-		hits = append(hits, Hit{ID: r.id, Coverage: r.score.coverage, Score: r.score.score})
-	}
-
-	return hits, nil
-}
-
-// readLists reads the lists of the plan from p (and p.log if not read yet)
-// in one round, and decodes them.
-func (e *Engine) readLists(ctx context.Context, g *genState, p *readPlan, log **plog.Log, c *counters) ([][]index.Posting, error) {
-	type span struct{ off, end uint64 }
-
-	var spans []span
-	var ranges []span
-
-	for _, s := range p.entries {
-		if s.entry.Bits == 0 {
-			continue
-		}
-
-		off, end := s.entry.Bytes()
-		if e.opts.VerifyPages {
-			off = off / index.PageSize * index.PageSize
-			end = min((end+index.PageSize-1)/index.PageSize*index.PageSize, g.head.PSize)
-		}
-
-		ranges = append(ranges, span{off, end})
-	}
-
-	slices.SortFunc(ranges, func(a, b span) int {
-		switch {
-		case a.off < b.off:
-			return -1
-		case a.off > b.off:
 			return 1
 		}
 
 		return 0
 	})
 
-	for _, r := range ranges {
-		if n := len(spans); n > 0 && int64(r.off)-int64(spans[n-1].end) <= e.opts.CoalesceGap && int64(max(r.end, spans[n-1].end)-spans[n-1].off) <= e.opts.MaxRequest {
-			spans[n-1].end = max(spans[n-1].end, r.end)
+	var out []dbRange
+
+	for _, r := range want {
+		if n := len(out); n > 0 && out[n-1].slot == r.slot && int64(r.off)-int64(out[n-1].end) <= e.opts.CoalesceGap &&
+			int64(max(r.end, out[n-1].end)-out[n-1].off) <= e.opts.MaxRequest {
+			out[n-1].end = max(out[n-1].end, r.end)
 
 			continue
 		}
 
-		spans = append(spans, r)
+		out = append(out, r)
 	}
 
-	data := make([][]byte, len(spans))
-	jobs := len(spans)
+	return out
+}
 
-	if *log == nil {
-		jobs++
-	}
+// read reads, in one round, the .db ranges of picks and pairs. It returns
+// the requests made.
+func (e *Engine) read(ctx context.Context, picks []*pick, pairs []pairRead, data *dbData, c *counters) (int, error) {
+	jobs := e.ranges(picks, pairs)
 
-	err := parallel.Run(ctx, jobs, e.opts.Concurrency, func(ctx context.Context, i int) error {
-		if i == len(spans) {
-			var err error
-			*log, err = e.fetchLog(ctx, c)
-
-			return err
-		}
-
-		var err error
-		data[i], err = e.get(ctx, e.col.P(g.gen), int64(spans[i].off), int64(spans[i].end-spans[i].off), c)
-
-		return err
+	return len(jobs), parallel.Run(ctx, len(jobs), e.opts.Concurrency, func(ctx context.Context, i int) error {
+		return e.fetchRange(ctx, jobs[i], data, c)
 	})
-	if err != nil {
-		return nil, err
+}
+
+func (e *Engine) fetchRange(ctx context.Context, r dbRange, data *dbData, c *counters) error {
+	b, etag, err := e.store.GetRange(ctx, e.col.DB(r.slot), int64(r.off), int64(r.end-r.off))
+	c.requests.Add(1)
+	c.bytes.Add(int64(len(b)))
+
+	data.mu.Lock()
+	defer data.mu.Unlock()
+
+	if data.chunks == nil {
+		data.chunks = map[uint16][]chunk{}
 	}
 
-	if e.opts.VerifyPages {
-		for i, sp := range spans {
-			if err := index.CheckPages(data[i], sp.off, g.head.PSize, g.crcs(), 0); err != nil {
-				return nil, err
-			}
-		}
+	switch {
+	case errors.Is(err, blob.ErrNotFound):
+		data.bad = true // rewritten without a .db, or dropped
+	case err != nil:
+		return fmt.Errorf("query: %s: %w", e.col.DB(r.slot), err)
+	case etag != r.etag || uint64(len(b)) != r.end-r.off:
+		data.bad = true
+	default:
+		data.chunks[r.slot] = append(data.chunks[r.slot], chunk{off: r.off, data: b})
 	}
 
-	out := make([][]index.Posting, len(p.entries))
+	return nil
+}
 
-	for j, s := range p.entries {
-		var err error
+// searchLog answers from p.log alone, for a collection without index (under
+// MinIndexDocs): every document of the Docs frame and the pending ops is
+// matched by the same rules the index path uses, the live documents being
+// the dictionary.
+func (e *Engine) searchLog(q Parsed, req Request, log *plog.Log, resp *Response) error {
+	pending := log.Pending()
 
-		if s.entry.Bits == 0 {
-			out[j], err = index.Decode(s.entry, nil, 0, nil)
-		} else {
-			off, end := s.entry.Bytes()
-			i := slices.IndexFunc(spans, func(sp span) bool { return off >= sp.off && end <= sp.end })
-			out[j], err = index.Decode(s.entry, data[i], spans[i].off, make([]index.Posting, 0, s.entry.Count))
+	docs := make([][]key5.Token, 0, len(log.Docs))
+	ids := make([]uint32, 0, len(log.Docs))
+
+	for _, doc := range log.Docs {
+		if _, changed := pending[doc.ID]; changed {
+			continue
 		}
 
+		tokens, err := key5.ReadTokens(doc.Tokens)
 		if err != nil {
-			return nil, err
+			return fmt.Errorf("query: p.log document %d: %w", doc.ID, err)
 		}
+
+		docs = append(docs, tokens)
+		ids = append(ids, doc.ID)
 	}
-
-	return out, nil
-}
-
-// gather turns the postings read into per-document matches.
-func gather(terms []Term, p *readPlan, postings [][]index.Posting) *candidates {
-	n := 0
-	for _, list := range postings {
-		n += len(list)
-	}
-
-	cands := newCandidates(len(terms), n)
-
-	for j, s := range p.entries {
-		for _, posting := range postings[j] {
-			matches := cands.get(posting.ID)
-
-			for _, u := range s.uses {
-				matches[u.term].add(terms[u.term].resolve(u.kind, posting.Tail), u.dist, posting.Pos)
-			}
-		}
-	}
-
-	return cands
-}
-
-// overlay applies p.log: a document with a pending op is replaced by its new
-// version, matched against the terms by the same rules, or removed.
-func overlay(terms []Term, fuzzy []bool, cands *candidates, pending map[uint32]plog.Op) error {
-	var scratch [key5.MaxUnits]uint8
 
 	for id, op := range pending {
-		cands.remove(id)
-
 		if op.Del {
 			continue
 		}
@@ -815,13 +757,85 @@ func overlay(terms []Term, fuzzy []bool, cands *candidates, pending map[uint32]p
 			return fmt.Errorf("query: p.log op %d: %w", op.Seq, err)
 		}
 
-		matches, any := matchTokens(terms, fuzzy, tokens, scratch[:])
-		if any {
-			cands.put(id, matches)
+		docs = append(docs, tokens)
+		ids = append(ids, id)
+	}
+
+	fuzzy, df := dictMatch(q.Terms, docs, req.Fuzzy)
+	cands := newCandidates(len(q.Terms), len(docs))
+	var scratch [key5.MaxUnits]uint8
+
+	for i, tokens := range docs {
+		if matches, any := matchTokens(q.Terms, fuzzy, tokens, scratch[:]); any {
+			cands.put(ids[i], matches)
 		}
 	}
 
+	limit := req.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+
+	results := rankAll(q.Terms, cands, idfs(df, len(docs)), max(req.Offset, 0)+limit)
+	from := min(max(req.Offset, 0), len(results))
+	to := min(from+limit, len(results))
+
+	resp.Hits = make([]Hit, 0, to-from)
+
+	for _, r := range results[from:to] {
+		resp.Hits = append(resp.Hits, Hit{ID: r.id, Coverage: r.score.coverage, Score: r.score.score})
+	}
+
+	resp.Stats.LogOnly = true
+	resp.Stats.Candidates = cands.len()
+
 	return nil
+}
+
+// dictMatch is what the dictionary of docs says of every term: whether typos
+// are enabled for it (it has no exact or prefix key), and its df, the sum of
+// the documents of every key that matches it.
+func dictMatch(terms []Term, docs [][]key5.Token, fuzzy bool) ([]bool, []int) {
+	dfByKey := map[key5.Key]int{}
+
+	for _, tokens := range docs {
+		seen := map[key5.Key]bool{}
+
+		for _, tok := range tokens {
+			if !seen[tok.Key] {
+				seen[tok.Key] = true
+				dfByKey[tok.Key]++
+			}
+		}
+	}
+
+	enabled := make([]bool, len(terms))
+	df := make([]int, len(terms))
+	var scratch [key5.MaxUnits]uint8
+
+	for i := range terms {
+		t := &terms[i]
+
+		for k, n := range dfByKey {
+			if kind, _ := t.classifyKey(k, false, scratch[:]); kind != noKey {
+				df[i] += n
+			}
+		}
+
+		if df[i] > 0 || !fuzzy || t.Explicit || t.Number || fuzzyBudget(len(t.Text)) == 0 {
+			continue
+		}
+
+		enabled[i] = true
+
+		for k, n := range dfByKey {
+			if kind, _ := t.classifyKey(k, true, scratch[:]); kind != noKey {
+				df[i] += n
+			}
+		}
+	}
+
+	return enabled, df
 }
 
 // matchTokens matches a whole document against the terms.
@@ -830,7 +844,7 @@ func matchTokens(terms []Term, fuzzy []bool, tokens []key5.Token, scratch []uint
 	any := false
 
 	for pos, tok := range tokens {
-		p := uint8(min(pos, index.MaxPos))
+		p := uint8(min(pos, postings.MaxPos))
 
 		for i := range terms {
 			kind, d := terms[i].classifyKey(tok.Key, fuzzy[i], scratch)
