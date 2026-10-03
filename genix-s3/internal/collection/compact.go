@@ -225,6 +225,7 @@ func (c *Collection) rebase(ctx context.Context, base plog.Base, start []byte, t
 	normID := c.norm.ID()
 
 	for attempt := range 16 {
+		started := time.Now()
 		data, etag, err := c.store.Get(ctx, c.col.Log())
 		res.Requests++
 
@@ -233,6 +234,13 @@ func (c *Collection) rebase(ctx context.Context, base plog.Base, start []byte, t
 		}
 
 		log, err := plog.Parse(data, normID)
+		if errors.Is(err, plog.ErrNormID) && base.NormID != normID {
+			// A rebuild replacing a log of another normalizer: its ops are in
+			// keys this one does not read, and the source has their effect.
+			b, berr := plog.ParseBase(data)
+			log, err = &plog.Log{Base: b}, berr
+		}
+
 		if err != nil {
 			return err
 		}
@@ -240,7 +248,7 @@ func (c *Collection) rebase(ctx context.Context, base plog.Base, start []byte, t
 		// Another compaction committed first (our claim timed out, or two
 		// compactions of a LogOnly log, which claim nothing): the state we
 		// built may miss what it folded.
-		if b := log.Base; b.ManifestGen != base.ManifestGen || b.LastSeq != base.LastSeq || b.LogOnly != base.LogOnly {
+		if b := log.Base; b.ManifestGen != base.ManifestGen || b.LastSeq != base.LastSeq || b.LogOnly != base.LogOnly || b.NormID != base.NormID {
 			return ErrConflict
 		}
 
@@ -272,7 +280,7 @@ func (c *Collection) rebase(ctx context.Context, base plog.Base, start []byte, t
 		res.Writes++
 
 		if errors.Is(err, blob.ErrPrecondition) {
-			if err := plog.Backoff(ctx, attempt); err != nil {
+			if err := plog.Backoff(ctx, attempt, time.Since(started)); err != nil {
 				return err
 			}
 

@@ -20,12 +20,39 @@ const DefaultCompactBytes = 4096
 // documents has no index, only p.log.
 const DefaultMinIndexDocs = 100
 
+// DefaultStaleCompact is the default StaleCompact.
+const DefaultStaleCompact = time.Minute
+
 // AppendOptions are the writer's thresholds.
 type AppendOptions struct {
 	CompactBytes int64
 	// MinIndexDocs: a LogOnly collection asks for a compaction (which builds
 	// the index) as soon as it reaches this many documents.
 	MinIndexDocs int
+	// Create makes an append to a missing log create it, LogOnly and empty,
+	// with the changes in it. A missing log that only gets deletes is left
+	// missing: there is nothing to delete.
+	Create bool
+	// StaleCompact: a compaction request older than this that is still
+	// pending was lost (the process that should have run it died), so the
+	// next append asks again. 0 never asks twice.
+	StaleCompact time.Duration
+	Now          func() time.Time
+}
+
+func (o AppendOptions) now() time.Time {
+	if o.Now != nil {
+		return o.Now()
+	}
+
+	return time.Now()
+}
+
+// emptyLog is the log Create starts from: a LogOnly base with no documents.
+func emptyLog(normID uint32, unixMs int64) []byte {
+	out, _ := AppendDocs(EncodeBase(Base{NormID: normID, UnixMs: unixMs, LogOnly: true}), nil)
+
+	return out
 }
 
 // maxAttempts bounds the retries when another writer or the compactor got to
@@ -61,9 +88,19 @@ func Append(ctx context.Context, store blob.Blob, key string, normID uint32, cha
 	}
 
 	for attempt := range maxAttempts {
+		started := time.Now()
 		data, _, err := store.Get(ctx, key)
 		result.Requests++
 		result.BytesRead += int64(len(data))
+
+		missing := errors.Is(err, blob.ErrNotFound) && opts.Create
+		if missing {
+			if !slices.ContainsFunc(changes, func(c Change) bool { return !c.Del }) {
+				return result, nil
+			}
+
+			data, err = emptyLog(normID, opts.now().UnixMilli()), nil
+		}
 
 		if err != nil {
 			return result, fmt.Errorf("plog: read: %w", err)
@@ -104,18 +141,30 @@ func Append(ctx context.Context, store blob.Blob, key string, normID uint32, cha
 			grown = after.LiveDocs() >= opts.MinIndexDocs
 		}
 
-		if (appended > opts.CompactBytes || grown) && !log.CompactPending() {
-			payload = AppendCompact(payload, Compact{TargetSeq: result.LastSeq, UnixMs: time.Now().UnixMilli()})
+		now := opts.now()
+
+		if (appended > opts.CompactBytes || grown) && !log.compactAsked(now, opts.StaleCompact) {
+			payload = AppendCompact(payload, Compact{TargetSeq: result.LastSeq, UnixMs: now.UnixMilli()})
 			result.CompactRequested = true
 		}
 
-		result.Size, err = store.Append(ctx, key, payload, log.Size)
+		if missing {
+			full := append(data, payload...)
+
+			_, err = store.Put(ctx, key, full, blob.PutCond{IfNoneMatch: true})
+			result.Size = int64(len(full))
+			payload = full
+		} else {
+			result.Size, err = store.Append(ctx, key, payload, log.Size)
+		}
+
 		result.Requests++
 
-		if errors.Is(err, blob.ErrOffsetMismatch) {
+		// Lost the race: another writer appended, or created the log first.
+		if errors.Is(err, blob.ErrOffsetMismatch) || (missing && errors.Is(err, blob.ErrPrecondition)) {
 			result.CompactRequested = false
 
-			if err := Backoff(ctx, attempt); err != nil {
+			if err := Backoff(ctx, attempt, time.Since(started)); err != nil {
 				return result, err
 			}
 
@@ -135,9 +184,12 @@ func Append(ctx context.Context, store blob.Blob, key string, normID uint32, cha
 }
 
 // Backoff waits a jittered, doubling delay so that writers that lost a race
-// do not collide again on the next attempt.
-func Backoff(ctx context.Context, attempt int) error {
-	ceiling := time.Millisecond << min(attempt, 6)
+// do not collide again on the next attempt. The delay scales with roundTrip,
+// how long the lost attempt took: two writers collide while either is between
+// its read and its write, which is one round trip to the store (well under a
+// millisecond on disk, ~5 ms in the zone, ~100 ms across a WAN).
+func Backoff(ctx context.Context, attempt int, roundTrip time.Duration) error {
+	ceiling := max(roundTrip, time.Millisecond) << min(attempt, 5)
 	timer := time.NewTimer(time.Duration(rand.Int64N(int64(ceiling))) + time.Millisecond)
 	defer timer.Stop()
 

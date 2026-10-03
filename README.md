@@ -132,9 +132,22 @@ go run ./cmd/gxs build -csv ../scripts/perf/data/productos.csv
 go run ./cmd/gxs query polo spiderman rojo
 ```
 
-Only a local directory stands in for the bucket so far; the real S3 client is
-pending. Formats, query path, write path and measurements are in
-[`PLAN_5BIT.md`](PLAN_5BIT.md).
+From Go, a `genix.Client` serves every partition (one per company, say) of
+every collection in a bucket. A partition is created by its first write.
+
+```go
+cfg, _ := config.LoadDefaultConfig(ctx)
+store := s3blob.New(s3.NewFromConfig(cfg), "genix--use1-az4--x-s3")
+c, _ := genix.NewClient(store, genix.ClientOptions{Extra: [2]rune{'ñ', 0}})
+
+c.Apply(ctx, "productos", "p12", []genix.Doc{{ID: 7, Text: "Polo Spiderman rojo"}}, []uint32{9})
+resp, _ := c.Search(ctx, "productos", "p12", genix.Request{Query: "polo rojo", Limit: 20})
+c.Rebuild(ctx, "productos", "p12", source) // reprocess from the database
+```
+
+The integration tests against a real bucket run with
+`GENIX_S3_TEST_BUCKET=<bucket> go test ./s3blob`. Formats, query path, write
+path and measurements are in [`PLAN_5BIT.md`](PLAN_5BIT.md).
 
 ## License
 

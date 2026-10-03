@@ -34,6 +34,9 @@ type Options struct {
 	// ClaimTimeout is how long a claimed generation that never got published
 	// blocks the next compaction.
 	ClaimTimeout time.Duration
+	// StaleCompact is how old a pending compaction request gets before the
+	// next write asks again (plog.AppendOptions.StaleCompact).
+	StaleCompact time.Duration
 	Now          func() time.Time
 }
 
@@ -43,12 +46,20 @@ func DefaultOptions() Options {
 		CompactBytes: plog.DefaultCompactBytes,
 		MinIndexDocs: plog.DefaultMinIndexDocs,
 		ClaimTimeout: 5 * time.Minute,
+		StaleCompact: plog.DefaultStaleCompact,
 		Now:          time.Now,
 	}
 }
 
+// appendOptions: a write to a collection that does not exist yet creates it.
 func (c *Collection) appendOptions() plog.AppendOptions {
-	return plog.AppendOptions{CompactBytes: c.opts.CompactBytes, MinIndexDocs: c.opts.MinIndexDocs}
+	return plog.AppendOptions{
+		CompactBytes: c.opts.CompactBytes,
+		MinIndexDocs: c.opts.MinIndexDocs,
+		Create:       true,
+		StaleCompact: c.opts.StaleCompact,
+		Now:          c.opts.Now,
+	}
 }
 
 // indexed reports whether a collection of n documents gets an index.
@@ -149,19 +160,31 @@ func (c *Collection) Init(ctx context.Context, docs []Doc) (*manifest.Manifest, 
 
 // Put appends new versions of documents to p.log.
 func (c *Collection) Put(ctx context.Context, docs []Doc) (plog.AppendResult, error) {
-	changes := make([]plog.Change, len(docs))
-	for i, doc := range docs {
-		changes[i] = plog.Change{ID: doc.ID, Tokens: c.Tokens(doc.Text)}
-	}
-
-	return plog.Append(ctx, c.store, c.col.Log(), c.norm.ID(), changes, c.appendOptions())
+	return c.Apply(ctx, docs, nil)
 }
 
 // Delete appends deletes to p.log.
 func (c *Collection) Delete(ctx context.Context, ids ...uint32) (plog.AppendResult, error) {
-	changes := make([]plog.Change, len(ids))
-	for i, id := range ids {
-		changes[i] = plog.Change{ID: id, Del: true}
+	return c.Apply(ctx, nil, ids)
+}
+
+// Apply appends new versions of puts and the deletes of dels to p.log as one
+// batch: one read and one append, whatever the mix. The deletes go last, so
+// an ID in both ends up deleted. A collection that does not exist yet is
+// created by its first put; deletes alone leave it missing.
+func (c *Collection) Apply(ctx context.Context, puts []Doc, dels []uint32) (plog.AppendResult, error) {
+	changes := make([]plog.Change, 0, len(puts)+len(dels))
+
+	for _, doc := range puts {
+		changes = append(changes, plog.Change{ID: doc.ID, Tokens: c.Tokens(doc.Text)})
+	}
+
+	for _, id := range dels {
+		changes = append(changes, plog.Change{ID: id, Del: true})
+	}
+
+	if len(changes) == 0 {
+		return plog.AppendResult{}, nil
 	}
 
 	return plog.Append(ctx, c.store, c.col.Log(), c.norm.ID(), changes, c.appendOptions())

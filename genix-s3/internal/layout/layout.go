@@ -9,19 +9,19 @@ import (
 
 var namePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
 
-// Collection is the key prefix of one (collection, bucket).
+// Collection is the key prefix of one (collection, partition).
 type Collection struct {
 	prefix string
 }
 
-// New validates the names and builds the prefix `<root><collection>/<bucket>/`.
+// New validates the names and builds the prefix `<root><collection>/<partition>/`.
 // root is normally "genix/".
-func New(root, collection, bucket string) (Collection, error) {
-	if !namePattern.MatchString(collection) || !namePattern.MatchString(bucket) {
-		return Collection{}, fmt.Errorf("layout: invalid collection %q or bucket %q", collection, bucket)
+func New(root, collection, partition string) (Collection, error) {
+	if !namePattern.MatchString(collection) || !namePattern.MatchString(partition) {
+		return Collection{}, fmt.Errorf("layout: invalid collection %q or partition %q", collection, partition)
 	}
 
-	return Collection{prefix: root + collection + "/" + bucket + "/"}, nil
+	return Collection{prefix: root + collection + "/" + partition + "/"}, nil
 }
 
 func (c Collection) Log() string                { return c.prefix + "p.log" }

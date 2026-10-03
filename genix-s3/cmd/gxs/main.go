@@ -38,7 +38,7 @@ commands:
   log                             print p.log
   inspect [WORD]                  print the manifest, or the slot of WORD
 
-common flags: -root DIR (default data/gxs) -collection NAME -bucket NAME -extra CHARS
+common flags: -root DIR (default data/gxs) -collection NAME -partition NAME -extra CHARS
               -min-index-docs N (default 100): with fewer documents there is no
               index, only p.log; build, put, del and compact apply it`
 
@@ -59,7 +59,7 @@ func main() {
 	flags := flag.NewFlagSet(command, flag.ExitOnError)
 	root := flags.String("root", "data/gxs", "directory that stands in for the bucket")
 	name := flags.String("collection", "productos", "collection")
-	bucket := flags.String("bucket", "default", "bucket")
+	partition := flags.String("partition", "default", "partition of the collection")
 	extra := flags.String("extra", "", "up to two extra letters (codes 30 and 31), e.g. ñ")
 	csv := flags.String("csv", "", "catalogue file")
 	limit := flags.Int("limit", 10, "results")
@@ -72,7 +72,7 @@ func main() {
 
 	ctx := context.Background()
 
-	e, err := open(*root, *name, *bucket, *extra)
+	e, err := open(*root, *name, *partition, *extra)
 	if err != nil {
 		fail(err)
 	}
@@ -109,13 +109,13 @@ func fail(err error) {
 	os.Exit(1)
 }
 
-func open(root, name, bucket, extra string) (env, error) {
+func open(root, name, partition, extra string) (env, error) {
 	store, err := blob.NewFS(root)
 	if err != nil {
 		return env{}, err
 	}
 
-	col, err := layout.New("genix/", name, bucket)
+	col, err := layout.New("genix/", name, partition)
 	if err != nil {
 		return env{}, err
 	}

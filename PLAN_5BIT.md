@@ -186,12 +186,14 @@ NUM_n (1 unidad) + n unidades = el valor en binario, el bit más significativo p
 - **colbin solo** en el manifest (metadata) y en el protocolo de consulta y escritura.
 
 ```
-genix/<col>/<bucket>/k.<gen>          diccionario        bytes, se cachea entero
-genix/<col>/<bucket>/p.<gen>          postings           bytes, se lee por rangos
-genix/<col>/<bucket>/p.log            log de cambios     bytes, append
-genix/<col>/<bucket>/snap/<gen>.snap  snapshot           bytes
-genix/<col>/<bucket>/m/<gen>.cbm      manifest           colbin (metadata)
+genix/<col>/<part>/k.<gen>          diccionario        bytes, se cachea entero
+genix/<col>/<part>/p.<gen>          postings           bytes, se lee por rangos
+genix/<col>/<part>/p.log            log de cambios     bytes, append
+genix/<col>/<part>/snap/<gen>.snap  snapshot           bytes
+genix/<col>/<part>/m/<gen>.cbm      manifest           colbin (metadata)
 ```
+
+`<part>` es la partición de la colección (la empresa, en un ORM multi‑tenant): cada una es un índice independiente, con su `p.log` y sus generaciones.
 
 ### 5.1 `k.<gen>`: el diccionario
 
@@ -503,13 +505,15 @@ La última palabra se busca también como prefijo. Con 2 letras, el prefijo es e
 
 Implementado en `internal/collection` y `internal/plog`.
 
-**Append** (`Put`, `Delete`):
+**Append** (`Apply`; `Put` y `Delete` son sus casos de un solo tipo):
 
 1. El writer normaliza el texto y genera las claves y colas con las mismas funciones que el builder. La consulta usa las claves del log tal como están.
-2. Lee `p.log` (un GET) y arma un frame `Batch` con `seq` = último + 1, …
+2. Lee `p.log` (un GET) y arma un frame `Batch` con `seq` = último + 1, …: altas, ediciones y bajas en el mismo batch, las bajas al final (un ID en las dos queda borrado).
 3. Lo agrega con el append nativo de S3 Express (`WriteOffsetBytes` = el tamaño leído). Un batch es un solo append, que es atómico.
-4. Si el offset no coincide (otro writer o una compactación tocaron el log), vuelve a leer y reintenta. Así varios writers quedan serializados sin locks.
-5. Si lo agregado desde la base pasa `CompactBytes`, o la colección llega a `MinIndexDocs` (5.8), el mismo append lleva un frame `Compact` y el resultado dice `CompactRequested`. Quien escribe llama a `Compact`: la librería no dispara nada sola.
+4. Si el offset no coincide (otro writer o una compactación tocaron el log), vuelve a leer y reintenta, con un backoff proporcional a lo que tardó el intento perdido (dos writers chocan mientras alguno está entre su lectura y su escritura, que es una ronda al store). Así varios writers quedan serializados sin locks.
+5. Si lo agregado desde la base pasa `CompactBytes`, o la colección llega a `MinIndexDocs` (5.8), el mismo append lleva un frame `Compact` y el resultado dice `CompactRequested`. Quien escribe llama a `Compact` (o el `Client` según su modo, abajo).
+6. **Creación perezosa:** si `p.log` no existe, el primer alta lo crea con un PUT `If-None-Match`: base `LogOnly` sin documentos más el batch, en 2 requests (el GET 404 y el PUT). Si otro writer lo creó primero, recibe 412 y agrega sobre el suyo. Un batch de solo bajas sobre una colección inexistente no escribe nada.
+7. **Pedido perdido:** mientras haya un `Compact` pendiente, los appends no piden otro. Si el proceso que debía compactar murió, nadie lo pediría más; por eso un pedido pendiente más viejo que `StaleCompact` (1 min por defecto) se considera perdido y el siguiente append lo vuelve a pedir.
 
 **Compactación** (`Compact`):
 
@@ -526,6 +530,26 @@ Implementado en `internal/collection` y `internal/plog`.
 - Las ops que llegan durante la compactación tienen `seq > TargetSeq` y se conservan en el rebase.
 - Las consultas leen `p.log` entero, y S3 tiene consistencia fuerte: ven el log viejo con la base M o el nuevo con la base G, nunca una mezcla. Si la generación que la consulta tenía en caché ya no está, la descarta y reintenta.
 - Igual, el lector verifica `len` y `crc` de cada frame y descarta un frame final cortado.
+
+**Reconstrucción** (`Rebuild`): reprocesa la colección desde el sistema origen. Es también la forma de cambiar las letras extra o el normalizador (5.4).
+
+1. Lee `p.log` y anota su último `seq`, S0, **antes** de leer la fuente.
+2. Reclama la generación siguiente, como una compactación, para que ninguna compactación con índice publique mientras se lee la fuente (la suya choca con el reclamo y devuelve `ErrConflict`).
+3. Lee la fuente (`Source`, una función que la librería puede llamar más de una vez) y construye la generación, o un `p.log` `LogOnly` si queda bajo `MinIndexDocs`.
+4. Rebase de `p.log` con `If-Match`, conservando las ops posteriores a S0.
+
+Los writers agregan al log **después** de que su escritura en la fuente confirmó. Entonces una op con `seq ≤ S0` ya está en lo que devuelve la fuente, y las posteriores quedan pendientes encima; como son idempotentes, aplicar una que la fuente ya tenía no cambia nada. Si una compactación `LogOnly` (que no reclama nada) publica en el medio, o un writer crea la colección mientras se reconstruía una inexistente, la reconstrucción vuelve a empezar (hasta 4 veces). Un `p.log` de otro normalizador se reemplaza entero: sus ops están en claves que este no lee, y la fuente ya tiene su efecto.
+
+**Vaciado** (`Drop`): una reconstrucción con la fuente vacía, que además borra la generación vigente (una consulta en vuelo la encuentra borrada, relee `p.log` y lo ve vacío). `p.log` queda como un log `LogOnly` sin documentos, así la numeración de generaciones sigue desde donde estaba.
+
+**`Client`** (multi‑partición): un solo cliente para todas las particiones de todas las colecciones de un store. Guarda un LRU de buscadores (`MaxSearchers`, 256 por defecto), uno por partición consultada, cada uno con la caché de slots de su generación (8 MB como máximo cada uno). Una partición inexistente no tiene resultados. La compactación que pide una escritura la corre según `CompactMode`:
+
+| Modo | Quién compacta |
+|---|---|
+| `CompactSync` | la misma escritura, antes de que `Apply` vuelva (~133 ms a 100k documentos) |
+| `CompactAsync` | una goroutine, una a la vez por partición; si llega otro pedido mientras corre, corre una vez más al terminar |
+| `CompactCallback` | quien llamó, avisado por `OnCompact` (p. ej. para encolar en SQS) |
+| `CompactAuto` (por defecto) | `Sync` en AWS Lambda, que congela las goroutines al responder; `Async` en el resto |
 
 **Verificado en un directory bucket** (`s3blob`, 13.6): el append con `WriteOffsetBytes`, `If-None-Match` e `If-Match` se comportan como supone el diseño, también con escritores concurrentes. La cola SQS FIFO que se había previsto por si faltaba `If-Match` no hace falta.
 
@@ -576,9 +600,10 @@ Hecho: el alfabeto y las claves, el normalizador v4, `k` y `p`, `p.log` y el sna
 1. ~~**Cliente de S3 real.**~~ Hecho: `s3blob`, verificado contra un directory bucket (13.6). Falta medir la latencia por ronda desde la misma AZ.
 2. **D‑5B11**, el contrato del ranking, que decide D‑5B10 y si se puede bajar a 1 request de datos (6.3).
 3. **Suite de relevancia con juicios humanos.** La comparación de 13.3 es contra referencias que aplican las mismas reglas, no contra lo que un usuario espera. Casos: `spiderman polo` contra `polo spiderman rojo`, `pimienta moli`, `sunrise tequila`, tildes y `ñ`, `carrefour` ≡ `carefour`, `pollo` ≠ `polo`, `sin gluten`, typos (`spidreman`, `camizeta`), que un match con typo nunca supere al exacto, y cuánto cambia el ranking por el corte en 8.
-4. **Lambdas** de consulta y de escritura (protocolo de escritura en colbin) y el disparo asíncrono de la compactación.
+4. ~~**Disparo de la compactación.**~~ Hecho: los modos del `Client` (8). Quedan las Lambdas de consulta y de escritura con protocolo en colbin, si se usan fuera de Go; el ORM usa el `Client` directo.
 5. **Fuzzing** de los lectores de `k`, `p.log` y el snapshot.
-6. **Partición** (5.7) cuando la compactación pese.
+6. **Partir `p`** (5.7) cuando la compactación pese. No confundir con las particiones de una colección (5.0), que ya existen.
+7. **Integración con Genix ORM** (Scylla y DynamoDB): el `Client` es el backend de búsqueda de las tablas que la declaran.
 
 ---
 
@@ -590,7 +615,7 @@ El código anterior de `genix-s3` (shards con colbin) y sus planes se borraron. 
 
 | Paquete | Qué hace |
 |---|---|
-| `genix` (raíz) | API pública: `Config{Extra, MinIndexDocs}`, `NewIndexer`, `NewSearcher`, `Serve` (request/response en colbin) |
+| `genix` (raíz) | API pública: `Client` (todas las particiones: `Apply`, `Search`, `Compact`, `Rebuild`, `Drop`), y para una sola colección `Config{Partition, Extra, MinIndexDocs}`, `NewIndexer`, `NewSearcher`, `Serve` (request/response en colbin) |
 | `internal/bits` | Lector y escritor de bits LSB‑first |
 | `internal/blob` | La interfaz del store, `blob.FS` (directorio local) y `blobtest`, el contrato que todo store cumple |
 | `s3blob` | El store en S3: append nativo en un directory bucket (`--x-s3`), emulado con GET + PUT `If-Match` en un bucket de propósito general |
@@ -599,7 +624,7 @@ El código anterior de `genix-s3` (shards con colbin) y sus planes se borraron. 
 | `internal/index` | `k` y `p` (5.1–5.3): builder, reader por slot, decodificación de listas, páginas |
 | `internal/plog`, `internal/snapshot` | 5.4 y 5.5 en bytes |
 | `internal/manifest` | 5.6 en colbin |
-| `internal/collection` | Escritura (8): `Init`, `Put`, `Delete`, `Compact` (claim con If‑None‑Match, rebase de `p.log` con If‑Match, GC de la generación anterior, cambio de modo de 5.8) |
+| `internal/collection` | Escritura (8): `Init`, `Apply`, `Compact` (claim con If‑None‑Match, rebase de `p.log` con If‑Match, GC de la generación anterior, cambio de modo de 5.8), `Rebuild` y `Drop` |
 | `internal/query` | Consulta: plan (exacto, prefijo con presupuesto, typos), rondas, caché de slots, overlay, ranking |
 | `cmd/gxs` | CLI: `build`, `query`, `put`, `del`, `compact`, `log`, `inspect PALABRA` (el dump por slot de 5.2) |
 
@@ -679,5 +704,11 @@ Directory bucket `genix-test--use1-az4--x-s3` (us-east-1). Los tests corren con 
 
 - **Contrato** (`blobtest`, el mismo que cumple `blob.FS`): `If-None-Match` y `If-Match` devuelven 412, un `If-Match` sobre una clave inexistente cuenta como precondición fallida, el append con un offset viejo falla, y con 8 escritores a la vez sobre el mismo offset o la misma clave nueva gana exactamente uno. Un rango que empieza justo en el final devuelve vacío, como en el store local; S3 responde 416, y `s3blob` lo resuelve con un `HEAD`.
 - **Ciclo de vida con la API pública** (`TestLifecycle`): build de 300 documentos, 40 `Put` desde 4 escritores concurrentes, un `Delete`, compactación (gen 2, 41 ops, 4 lecturas, 5 escrituras, 19 KB) y búsquedas antes y después. En frío: 4 rondas y 5 requests. En caliente: 1 ronda y 2 requests.
+- **`Client` multi‑partición** (`TestClient`):
+  - Una partición nueva se crea con su primera escritura en 2 requests, y se consulta en 1 (`LogOnly`).
+  - Una partición inexistente responde vacío sin requests.
+  - Reconstruir 400 documentos con un alta y una baja concurrentes en medio: la escritura creó la partición durante la lectura de la fuente, la reconstrucción volvió a empezar y conservó las dos.
+  - `Drop` deja la partición vacía.
+- **Contención:** con 4 escritores sobre la misma partición y ~100 ms por request, el backoff con techo fijo de 64 ms agotaba los 16 reintentos (los escritores volvían a chocar, porque cada intento dura una ronda). Con el backoff proporcional a la duración del intento perdido (8) pasó 3 de 3 veces.
 - **Latencia desde fuera de AWS** (WAN, no la AZ): ~100 ms por request en GET, rango, append y PUT. Casi todo es el viaje de ida y vuelta; falta medir desde una Lambda en `use1-az4`.
 - Un bucket de propósito general no tiene append. `s3blob` lo emula con GET + PUT `If-Match`, que reescribe el objeto entero (`p.log` pesa ≤ 4 KB). Ese camino todavía no se probó contra S3.

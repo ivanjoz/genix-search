@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"math"
+	"time"
 )
 
 // Format is the layout version of p.log.
@@ -219,27 +220,38 @@ func appendFrame(dst []byte, tag byte, body []byte) []byte {
 // ErrNormID is a log written with another normalizer.
 var ErrNormID = errors.New("plog: the log was written with another normalizer or other extra letters")
 
-// Parse reads a whole log. normID is the reader's normalizer.
-func Parse(data []byte, normID uint32) (*Log, error) {
+// ParseBase reads only the Base, whatever normalizer wrote the log: what a
+// rebuild needs to replace a log of another normalizer.
+func ParseBase(data []byte) (Base, error) {
 	if len(data) < BaseSize || string(data[:4]) != magic {
-		return nil, errors.New("plog: not a p.log")
+		return Base{}, errors.New("plog: not a p.log")
 	}
 
 	if f := binary.LittleEndian.Uint16(data[4:]); f != Format {
-		return nil, fmt.Errorf("plog: format %d, this build reads %d", f, Format)
+		return Base{}, fmt.Errorf("plog: format %d, this build reads %d", f, Format)
 	}
 
 	if crc32.Checksum(data[:32], castagnoli) != binary.LittleEndian.Uint32(data[32:]) {
-		return nil, errors.New("plog: base CRC")
+		return Base{}, errors.New("plog: base CRC")
 	}
 
-	log := &Log{Base: Base{
+	return Base{
 		NormID:      binary.LittleEndian.Uint32(data[8:]),
 		ManifestGen: binary.LittleEndian.Uint32(data[12:]),
 		LastSeq:     binary.LittleEndian.Uint64(data[16:]),
 		UnixMs:      int64(binary.LittleEndian.Uint64(data[24:])),
 		LogOnly:     binary.LittleEndian.Uint16(data[6:])&baseLogOnly != 0,
-	}}
+	}, nil
+}
+
+// Parse reads a whole log. normID is the reader's normalizer.
+func Parse(data []byte, normID uint32) (*Log, error) {
+	base, err := ParseBase(data)
+	if err != nil {
+		return nil, err
+	}
+
+	log := &Log{Base: base}
 
 	if log.Base.NormID != normID {
 		return nil, ErrNormID
@@ -410,11 +422,29 @@ func (l *Log) LiveDocs() int {
 
 // CompactPending reports a compaction that was asked for and is not done yet.
 func (l *Log) CompactPending() bool {
+	_, pending := l.lastRequest()
+
+	return pending
+}
+
+// lastRequest is the time of the newest compaction request not done yet.
+func (l *Log) lastRequest() (unixMs int64, pending bool) {
 	for _, c := range l.Compacts {
 		if c.TargetSeq > l.Base.LastSeq {
-			return true
+			unixMs, pending = max(unixMs, c.UnixMs), true
 		}
 	}
 
-	return false
+	return unixMs, pending
+}
+
+// compactAsked reports a pending compaction request that is still fresh: one
+// older than stale (when stale > 0) is taken as lost, to be asked again.
+func (l *Log) compactAsked(now time.Time, stale time.Duration) bool {
+	unixMs, pending := l.lastRequest()
+	if !pending {
+		return false
+	}
+
+	return stale <= 0 || now.Sub(time.UnixMilli(unixMs)) < stale
 }
