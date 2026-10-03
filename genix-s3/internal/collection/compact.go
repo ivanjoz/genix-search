@@ -49,6 +49,11 @@ func (c *Collection) Compact(ctx context.Context) (CompactResult, error) {
 	data, _, err := c.store.Get(ctx, c.col.Log())
 	res.Requests++
 
+	// A collection never written, or dropped, has nothing to fold.
+	if errors.Is(err, blob.ErrNotFound) {
+		return res, nil
+	}
+
 	if err != nil {
 		return res, fmt.Errorf("collection: p.log: %w", err)
 	}
