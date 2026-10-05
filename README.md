@@ -125,6 +125,16 @@ letters in 5-bit units, and numbers to their binary value. Collections under
 100 documents (`MinIndexDocs`) have no index at all and are searched with a
 single read.
 
+A document is a group (`uint8`) and an ID (`uint32`) unique within the
+group, so several tables can share one index: the same ID in two groups is
+two documents. Every hit carries its group; the group takes no part in the
+score.
+
+A one-letter word has no key of its own: it continues the 2 nearest words
+before it. "Polo rojo M" stores `rojo›m` and `polo›m`, in the buckets of those
+words, and `polo m` or `m polo` finds it.
+Spanish stopwords are dropped unless `KeepStopwords` is set ("Salón A").
+
 ```sh
 cd genix-s3
 go test -race ./...
@@ -140,7 +150,7 @@ cfg, _ := config.LoadDefaultConfig(ctx)
 store := s3blob.New(s3.NewFromConfig(cfg), "genix--use1-az4--x-s3")
 c, _ := genix.NewClient(store, genix.ClientOptions{Extra: [2]rune{'ñ', 0}})
 
-c.Apply(ctx, "productos", "p12", []genix.Doc{{ID: 7, Text: "Polo Spiderman rojo"}}, []uint32{9})
+c.Apply(ctx, "productos", "p12", []genix.Doc{{Group: 1, ID: 7, Text: "Polo Spiderman rojo"}}, []genix.Ref{{Group: 1, ID: 9}})
 resp, _ := c.Search(ctx, "productos", "p12", genix.Request{Query: "polo rojo", Limit: 20})
 c.Rebuild(ctx, "productos", "p12", source) // reprocess from the database
 ```

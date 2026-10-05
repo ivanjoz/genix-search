@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/blob"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/docid"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
 )
 
@@ -26,8 +27,8 @@ func TestRoundTrip(t *testing.T) {
 
 	ops := []Op{
 		{Seq: 11, ID: 7, Tokens: tokens("polo", "rojo")},
-		{Seq: 12, ID: 4000000000, Del: true},
-		{Seq: 13, ID: 7, Tokens: tokens("polo", "azul", "50", "ml")},
+		{Seq: 12, ID: docid.New(200, 4000000000), Del: true},
+		{Seq: 13, ID: docid.New(1, 7), Tokens: tokens("polo", "azul", "50", "ml")},
 	}
 
 	data, err := AppendBatch(data, ops)
@@ -57,8 +58,9 @@ func TestRoundTrip(t *testing.T) {
 		}
 	}
 
+	// ID 7 of group 0 and of group 1 are two documents.
 	pending := log.Pending()
-	if len(pending) != 2 || pending[7].Seq != 13 || !pending[4000000000].Del {
+	if len(pending) != 3 || pending[7].Seq != 11 || pending[docid.New(1, 7)].Seq != 13 || !pending[docid.New(200, 4000000000)].Del {
 		t.Errorf("pending %+v", pending)
 	}
 
@@ -145,7 +147,7 @@ func TestCompactTrigger(t *testing.T) {
 
 	var docs []Doc
 	for i := range 90 {
-		docs = append(docs, Doc{ID: uint32(i), Tokens: tokens("producto", "numero", fmt.Sprint(i))})
+		docs = append(docs, Doc{ID: docid.Key(i), Tokens: tokens("producto", "numero", fmt.Sprint(i))})
 	}
 
 	start, _ := AppendDocs(EncodeBase(Base{NormID: normID, LogOnly: true}), docs)
@@ -163,7 +165,7 @@ func TestCompactTrigger(t *testing.T) {
 
 	// The 100th document asks for the index.
 	for i := 90; i < 100; i++ {
-		res, err = Append(ctx, store, "p.log", normID, []Change{{ID: uint32(i), Tokens: tokens("y")}}, opts)
+		res, err = Append(ctx, store, "p.log", normID, []Change{{ID: docid.Key(i), Tokens: tokens("y")}}, opts)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -190,7 +192,7 @@ func TestConcurrentAppends(t *testing.T) {
 
 	for i := range 20 {
 		wg.Go(func() {
-			if _, err := Append(ctx, store, "p.log", normID, []Change{{ID: uint32(i), Tokens: tokens("x")}}, AppendOptions{CompactBytes: 1 << 20}); err != nil {
+			if _, err := Append(ctx, store, "p.log", normID, []Change{{ID: docid.Key(i), Tokens: tokens("x")}}, AppendOptions{CompactBytes: 1 << 20}); err != nil {
 				t.Error(err)
 			}
 		})

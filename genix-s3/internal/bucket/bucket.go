@@ -14,13 +14,14 @@ import (
 	"sort"
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/bits"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/docid"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/layout"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/postings"
 )
 
 // Format is the layout version of .idx and .db. A reader rejects any other.
-const Format uint16 = 2
+const Format uint16 = 3
 
 const (
 	idxMagic = "GXI1"
@@ -374,32 +375,32 @@ func readKeys(b []byte, g *layout.Grouping, group uint16, keys int) ([]key5.Key,
 }
 
 func (x *Index) decodeFields(b []byte) error {
-	if len(b) < 8 {
+	if len(b) < fieldsHeader {
 		return fmt.Errorf("%w: fields", ErrCorrupt)
 	}
 
-	wCount, wDup, wFirst, wX := uint(b[0]), uint(b[1]), uint(b[2]), uint(b[3])
-	base := binary.LittleEndian.Uint32(b[4:])
+	wCount, wDup, wX := uint(b[0]), uint(b[1]), uint(b[3])
+	first := postings.Split{WID: uint(b[2]), WG: uint(b[4]), Group: b[5], ID: binary.LittleEndian.Uint32(b[8:])}
 
-	if wCount > 32 || wDup > 32 || wFirst > 32 || wX < postings.MinX || wX > 32 {
+	if wCount > 32 || wDup > 32 || !first.Valid() || wX < postings.MinX || wX > 32 {
 		return fmt.Errorf("%w: field widths", ErrCorrupt)
 	}
 
-	r := bits.NewReader(b[8:], 0)
+	r := bits.NewReader(b[fieldsHeader:], 0)
 
 	for i := range x.Words {
 		w := &x.Words[i]
 		w.Shape.Count = uint32(r.Read(wCount))
 		dup := uint32(r.Read(wDup))
-		first := uint64(base) + r.Read(wFirst)
+		key, err := first.Read(r)
 		w.Shape.SetV(r.Read(2 + wX))
 		w.Loc = Loc(r.Read(2))
 
-		if w.Shape.Count == 0 || dup >= w.Shape.Count || first > 1<<32-1 || (w.Loc == LocField) != (w.Shape.Count == 1) {
+		if err != nil || w.Shape.Count == 0 || dup >= w.Shape.Count || (w.Loc == LocField) != (w.Shape.Count == 1) {
 			return fmt.Errorf("%w: fields of %s", ErrCorrupt, w.Key)
 		}
 
-		w.Shape.First = uint32(first)
+		w.Shape.First = key
 		w.DF = w.Shape.Count - dup
 	}
 
@@ -466,18 +467,18 @@ func decodeExpansion(b []byte) (*Expansion, error) {
 
 		g := &e.Groups[i]
 		g.Tail = b[0]
-		tail, wID := b[1]&1 != 0, uint(b[2])
+		tail := b[1]&1 != 0
 		m := int(binary.LittleEndian.Uint16(b[4:]))
 		g.Total = binary.LittleEndian.Uint32(b[8:])
-		base := binary.LittleEndian.Uint32(b[12:])
+		keys := postings.Split{WID: uint(b[2]), Group: b[3], WG: uint(b[6]), ID: binary.LittleEndian.Uint32(b[12:])}
 		size := int(binary.LittleEndian.Uint32(b[16:]))
 
-		if wID > 32 || m > int(g.Total) || size > len(b)-groupHeader {
+		if !keys.Valid() || m > int(g.Total) || size > len(b)-groupHeader {
 			return nil, ErrCorrupt
 		}
 
 		var err error
-		if g.Entries, err = postings.ReadEntries(bits.NewReader(b[groupHeader:groupHeader+size], 0), base, wID, tail, m); err != nil {
+		if g.Entries, err = postings.ReadEntries(bits.NewReader(b[groupHeader:groupHeader+size], 0), keys, tail, m); err != nil {
 			return nil, err
 		}
 
@@ -505,9 +506,15 @@ func decodeExpansion(b []byte) (*Expansion, error) {
 	return e, nil
 }
 
-// groupHeader is tail u8 | flags u8 | wID u8 | 0 | m u16 | 0 u16 | total u32
-// | base u32 | size u32 (bytes of the entries).
+// groupHeader is tail u8 | flags u8 | wID u8 | base group u8 | m u16 | wGroup
+// u8 | 0 u8 | total u32 | base ID u32 | size u32 (bytes of the entries). The
+// keys of the entries are a postings.Split: the smallest group and the
+// smallest ID, and the widths above them.
 const groupHeader = 20
+
+// fieldsHeader is wCount u8 | wDup u8 | wFirst u8 | wX u8 | wGroup u8 | base
+// group u8 | 0 u16 | base ID u32: the first keys are a postings.Split.
+const fieldsHeader = 12
 
 // Block is a decoded combination block: per co-key, the lists of the
 // expanded word and of the co-key over the documents with both.
@@ -520,7 +527,7 @@ func DecodeBlock(data []byte) (Block, error) {
 	}
 
 	n := int(binary.LittleEndian.Uint16(data))
-	base := binary.LittleEndian.Uint32(data[4:])
+	base := docid.New(data[2], binary.LittleEndian.Uint32(data[4:]))
 	r := bits.NewReader(data[8:], 0)
 
 	keys, err := key5.ReadKeys(r, n)

@@ -1,7 +1,7 @@
 // Package genix is a search index on S3 Express One Zone that returns ranked
 // IDs (PLAN_5BIT.md for the keys, PLAN_BUCKETS.md for the index). Words are
 // their first 8 letters in 5-bit units and numbers are their binary value;
-// the index stores IDs and those keys, never text. A query reads p.log and
+// the index stores document keys (group and ID) and those keys, never text. A query reads p.log and
 // the index of the buckets of its words, <xy>.idx, in one round, and the
 // ranges of <xy>.db they point to in a second.
 //
@@ -29,8 +29,12 @@ import (
 type (
 	// Blob is the object store: S3 Express One Zone, or a directory.
 	Blob = blob.Blob
-	// Doc is a document to index: its ID and its text.
+	// Doc is a document to index: its group, its ID in the group and its
+	// text. An ID is unique within its group; the same ID in another group is
+	// another document. A document never changes group.
 	Doc = collection.Doc
+	// Ref names a document to delete: its group and its ID.
+	Ref = collection.Ref
 	// Request, Response and Hit are a search and its answer.
 	Request  = query.Request
 	Response = query.Response
@@ -69,6 +73,11 @@ type Config struct {
 	// (ñ) or treating them as separators. 0 is unused. Changing them for an
 	// existing collection means reprocessing it from the source system.
 	Extra [2]rune
+	// KeepStopwords indexes and matches the Spanish stopwords too ("de",
+	// "la", "y"…), which are dropped by default: for names where they are
+	// words, like "Salón A". Indexer and searchers must agree, which the
+	// files check; changing it means a Rebuild.
+	KeepStopwords bool
 	// MinIndexDocs: with fewer documents the collection has no index; its
 	// documents live in p.log and a search is one request. 0 means the
 	// default, 100; 1 always builds the index.
@@ -136,8 +145,11 @@ func (c Config) open() (layout.Collection, *normalize.Normalizer, error) {
 	}
 
 	norm, err := normalize.New(c.Extra)
+	if err != nil {
+		return col, nil, err
+	}
 
-	return col, norm, err
+	return col, norm.WithStopwords(c.KeepStopwords), nil
 }
 
 // Indexer writes a collection.
@@ -172,20 +184,20 @@ func (ix *Indexer) Init(ctx context.Context, docs []Doc) error {
 	return err
 }
 
-// Put writes new versions of documents (a new ID is a new document). The
-// first put of a collection that does not exist creates it.
+// Put writes new versions of documents (a new group and ID is a new
+// document). The first put of a collection that does not exist creates it.
 func (ix *Indexer) Put(ctx context.Context, docs ...Doc) (AppendResult, error) {
 	return ix.c.Put(ctx, docs)
 }
 
 // Delete removes documents.
-func (ix *Indexer) Delete(ctx context.Context, ids ...uint32) (AppendResult, error) {
-	return ix.c.Delete(ctx, ids...)
+func (ix *Indexer) Delete(ctx context.Context, refs ...Ref) (AppendResult, error) {
+	return ix.c.Delete(ctx, refs...)
 }
 
 // Apply writes puts and deletes as one batch of p.log (one read and one
-// append). An ID in both ends up deleted.
-func (ix *Indexer) Apply(ctx context.Context, puts []Doc, dels []uint32) (AppendResult, error) {
+// append). A document in both ends up deleted.
+func (ix *Indexer) Apply(ctx context.Context, puts []Doc, dels []Ref) (AppendResult, error) {
 	return ix.c.Apply(ctx, puts, dels)
 }
 
@@ -244,6 +256,7 @@ type QueryHit struct {
 	ID       uint32 `cb:"1"`
 	Coverage uint32 `cb:"2"`
 	Score    uint32 `cb:"3"`
+	Group    uint8  `cb:"4"`
 }
 
 // QueryResponse is the answer on the wire.
@@ -267,7 +280,7 @@ func (s *Searcher) Serve(ctx context.Context, body []byte) ([]byte, error) {
 
 	out := QueryResponse{Seq: resp.Seq, Approx: resp.Stats.Approx, Hits: make([]QueryHit, len(resp.Hits))}
 	for i, h := range resp.Hits {
-		out.Hits[i] = QueryHit(h)
+		out.Hits[i] = QueryHit{ID: h.ID, Coverage: h.Coverage, Score: h.Score, Group: h.Group}
 	}
 
 	return colbin.Marshal(&out)

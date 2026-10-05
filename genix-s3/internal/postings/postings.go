@@ -9,6 +9,7 @@ import (
 	"fmt"
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/bits"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/docid"
 )
 
 const (
@@ -22,18 +23,21 @@ const (
 	MinX = 4
 )
 
-// Codec is how the ID gaps of a list are written.
+// Codec is how the key gaps of a list are written (gaps.go).
 const (
-	CodecFixed  uint8 = 0 // every gap in W bits
+	CodecFixed  uint8 = 0 // every gap in W bits, a change of group escaped
 	CodecNibble uint8 = 1 // varint of nibbles: 3 value bits + 1 continue bit
 )
+
+// escShift: the X of CodecFixed is W | escape nibbles << escShift.
+const escShift = 6
 
 // ErrCorrupt is a list that does not decode.
 var ErrCorrupt = errors.New("postings: corrupt list")
 
 // Posting is one occurrence of a key in a document.
 type Posting struct {
-	ID   uint32
+	ID   docid.Key
 	Pos  uint8 // position of the token in the document, saturated at MaxPos
 	Tail uint8 // key5.Tail of the word
 }
@@ -41,16 +45,18 @@ type Posting struct {
 // Shape is what the dictionary records of a word's list: with it the list's
 // size is known without reading it.
 type Shape struct {
-	Count   uint32 // postings, a document with the word twice counts twice
-	First   uint32 // ID of the first posting
+	Count   uint32    // postings, a document with the word twice counts twice
+	First   docid.Key // key of the first posting
 	HasTail bool
 	Codec   uint8
-	X       uint32 // W for CodecFixed, the number of nibbles for CodecNibble
+	// X is W | escape nibbles << 6 for CodecFixed, the number of nibbles
+	// for CodecNibble.
+	X uint32
 	// Pos and Tail of the only posting, when Count == 1.
 	Pos, Tail uint8
 }
 
-// ShapeOf checks a list, sorted by (ID, Pos), and picks the codec that
+// ShapeOf checks a list, sorted by (key, Pos), and picks the codec that
 // writes its gaps in fewer bits.
 func ShapeOf(list []Posting) (Shape, error) {
 	if len(list) == 0 {
@@ -59,9 +65,6 @@ func ShapeOf(list []Posting) (Shape, error) {
 
 	sh := Shape{Count: uint32(len(list)), First: list[0].ID, Pos: list[0].Pos, Tail: list[0].Tail}
 
-	var maxGap uint32
-	var nibbles uint64
-
 	for i, p := range list {
 		if p.Pos > MaxPos || p.Tail > 3 {
 			return sh, fmt.Errorf("postings: position %d or tail %d out of range", p.Pos, p.Tail)
@@ -69,28 +72,34 @@ func ShapeOf(list []Posting) (Shape, error) {
 
 		sh.HasTail = sh.HasTail || p.Tail != 0
 
-		if i == 0 {
-			continue
+		if i > 0 && (p.ID < list[i-1].ID || (p.ID == list[i-1].ID && p.Pos < list[i-1].Pos)) {
+			return sh, errors.New("postings: list not sorted by (key, Pos)")
 		}
-
-		prev := list[i-1]
-		if p.ID < prev.ID || (p.ID == prev.ID && p.Pos < prev.Pos) {
-			return sh, errors.New("postings: list not sorted by (ID, Pos)")
-		}
-
-		gap := p.ID - prev.ID
-		maxGap = max(maxGap, gap)
-		nibbles += uint64(NibbleCount(uint64(gap)))
 	}
 
-	w := bits.Len(uint64(maxGap))
-	if uint64(sh.Count-1)*uint64(w) <= 4*nibbles {
-		sh.Codec, sh.X = CodecFixed, uint32(w)
+	g := planGaps(len(list), func(i int) docid.Key { return list[i].ID })
+	if g.escNibbles >= 1<<(32-escShift) || g.nibbles > 1<<32-1 {
+		return sh, errors.New("postings: list too long")
+	}
+
+	if g.fixed {
+		sh.Codec, sh.X = CodecFixed, uint32(g.w)|uint32(g.escNibbles)<<escShift
 	} else {
-		sh.Codec, sh.X = CodecNibble, uint32(nibbles)
+		sh.Codec, sh.X = CodecNibble, uint32(g.nibbles)
 	}
 
 	return sh, nil
+}
+
+// gaps is how the list writes its gaps.
+func (sh Shape) gaps() gaps {
+	if sh.Codec == CodecNibble {
+		return gaps{nibbles: uint64(sh.X)}
+	}
+
+	esc := uint64(sh.X >> escShift)
+
+	return gaps{fixed: true, esc: esc > 0, w: uint(sh.X & (1<<escShift - 1)), escNibbles: esc}
 }
 
 // V is the Tail|Codec|X field of the dictionary: for a list of one posting it
@@ -126,9 +135,11 @@ func (sh Shape) Bits() uint64 {
 		return 0
 	}
 
-	gapBits := uint64(sh.Count-1) * uint64(sh.X)
-	if sh.Codec == CodecNibble {
-		gapBits = 4 * uint64(sh.X)
+	g := sh.gaps()
+	gapBits := uint64(sh.Count-1)*uint64(g.w) + 4*g.escNibbles
+
+	if !g.fixed {
+		gapBits = 4 * g.nibbles
 	}
 
 	n := gapBits + PosBits*uint64(sh.Count)
@@ -146,14 +157,9 @@ func Write(w *bits.Writer, sh Shape, list []Posting) {
 		return
 	}
 
+	g := sh.gaps()
 	for i := 1; i < len(list); i++ {
-		gap := list[i].ID - list[i-1].ID
-
-		if sh.Codec == CodecFixed {
-			w.Write(uint64(gap), uint(sh.X))
-		} else {
-			WriteNibbles(w, uint64(gap))
-		}
+		g.write(w, list[i-1].ID, list[i].ID)
 	}
 
 	for _, p := range list {
@@ -180,25 +186,18 @@ func Read(r *bits.Reader, sh Shape, dst []Posting) ([]Posting, error) {
 	start := len(dst)
 	id := sh.First
 	dst = append(dst, Posting{ID: id})
+	g := sh.gaps()
+
+	if g.w > docid.Bits {
+		return nil, fmt.Errorf("%w: gap width %d", ErrCorrupt, g.w)
+	}
 
 	for range sh.Count - 1 {
-		var gap uint64
-
-		if sh.Codec == CodecFixed {
-			gap = r.Read(uint(sh.X))
-		} else {
-			var err error
-			if gap, err = ReadNibbles(r); err != nil {
-				return nil, err
-			}
+		var err error
+		if id, err = g.read(r, id); err != nil {
+			return nil, err
 		}
 
-		next := uint64(id) + gap
-		if next > 1<<32-1 {
-			return nil, fmt.Errorf("%w: ID overflow", ErrCorrupt)
-		}
-
-		id = uint32(next)
 		dst = append(dst, Posting{ID: id})
 	}
 

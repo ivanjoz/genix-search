@@ -185,7 +185,7 @@ func TestIncremental(t *testing.T) {
 	_, first := liveState(t, fs, col, normalize.Default)
 
 	// 2 changes from "camisa azul" to "camisa celeste"; 4 goes.
-	if _, err := c.Apply(ctx, []Doc{{ID: 2, Text: "camisa celeste"}}, []uint32{4}); err != nil {
+	if _, err := c.Apply(ctx, []Doc{{ID: 2, Text: "camisa celeste"}}, []Ref{{ID: 4}}); err != nil {
 		t.Fatal(err)
 	}
 

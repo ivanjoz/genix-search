@@ -1,8 +1,8 @@
 # Plan: índice por buckets (`.idx` + `.db`) sobre S3 Express
 
 > Estado: **implementado** (2026-10-03) en `genix-s3`. Reemplaza las secciones 5 a 8 de `PLAN_5BIT.md` (formatos, ruta de consulta, escritura): el diccionario global `k.<gen>`, los postings `p.<gen>`, el snapshot, el manifest y las generaciones desaparecen. **Siguen vigentes** las secciones 2 a 4 de `PLAN_5BIT.md`: el alfabeto de 5 bits, la clave de 8 letras con su cola de 2 bits, los números `NUM_n`, el normalizador y `NormID`.
-> **Qué se optimiza**, en orden: los requests a S3 por consulta, después los bytes leídos por consulta. El tamaño de los archivos no es el objetivo. No se supone nada del corpus ni de los IDs (`uint32` arbitrarios).
-> Lo que la implementación decidió por su cuenta, y lo que quedó para después (cabezas de prefijo, combinaciones de 3 palabras), está en 12. Las mediciones están en 13. La agrupación de buckets en menos objetos (flag `Grouping`; `es100` por defecto) está en 14.
+> **Qué se optimiza**, en orden: los requests a S3 por consulta, después los bytes leídos por consulta. El tamaño de los archivos no es el objetivo. No se supone nada del corpus ni de los IDs (`uint32` arbitrarios dentro de cada grupo de documentos, 15).
+> Lo que la implementación decidió por su cuenta, y lo que quedó para después (cabezas de prefijo, combinaciones de 3 palabras), está en 12. Las mediciones están en 13. La agrupación de buckets en menos objetos (flag `Grouping`; `es100` por defecto) está en 14. El grupo del documento (`uint8`, varias tablas en un índice) está en 15. Las palabras de una letra (continuaciones) y el flag de stopwords están en 16.
 
 ## 0. Resumen
 
@@ -19,7 +19,7 @@
 | Colección chica (sin índice) | 2 (el `.idx` da 404) | 1 |
 | En caliente (`.idx` en caché) | 1 + rangos del `.db` | 1 |
 
-Semántica de resultados: la de `PLAN_5BIT.md` 13.3, **O con niveles estrictos**: primero cuántas palabras de la consulta tiene el producto (cobertura), después el puntaje, después el ID.
+Semántica de resultados: la de `PLAN_5BIT.md` 13.3, **O con niveles estrictos**: primero cuántas palabras de la consulta tiene el producto (cobertura), después el puntaje, después la clave del documento (grupo, después ID; 15).
 
 ---
 
@@ -34,7 +34,7 @@ Semántica de resultados: la de `PLAN_5BIT.md` 13.3, **O con niveles estrictos**
 ```
 
 - **Un solo `p.log` para todo el corpus de la partición**, compartido por todos los buckets: no hay log por bucket. `ca` tiene `ca.idx` y `ca.db`, y nada más. Un registro que se agrega antes de la compactación vive solo en `p.log`; los buckets de sus palabras no cambian hasta que se compacta, y toda consulta lee `p.log` en la ronda 1 y le aplica esas ops (6.1).
-- **Nombre del bucket:** las dos primeras unidades de la clave, cada una con un carácter de `0abcdefghijklmnopqrstuvwxyz12345` (unidad 0 = `0`, 1–26 = `a`–`z`, 27–31 = `1`–`5`). `camisa` → `ca`; la palabra de una letra `x` → `x0`; el número 50 (`NUM_2`, unidad alta 1) → `2a`.
+- **Nombre del bucket:** las dos primeras unidades de la clave, cada una con un carácter de `0abcdefghijklmnopqrstuvwxyz12345` (unidad 0 = `0`, 1–26 = `a`–`z`, 27–31 = `1`–`5`). `camisa` → `ca`; el número 50 (`NUM_2`, unidad alta 1) → `2a`. Una palabra de una letra no tiene bucket propio: es una continuación de las 2 palabras anteriores más cercanas, en el bucket de cada una (16). Por eso todo bucket de letras es una combinación de 2 letras.
 - **Por defecto (`GroupingES100`, 14)** los objetos son por grupo de buckets contiguos: `ca.idx` sigue siendo solo `ca`, y `vo-y0.idx` tiene de `vo` a `y0`. Hay 100 grupos, así que como mucho 200 objetos en vez de 2 048. Con `GroupingNone` un objeto es un bucket. El resto de este documento habla de buckets: con agrupación, léase "el objeto del grupo del bucket".
 - **`<xy>.db` solo existe si alguna lista del bucket no entra en el `.idx`.** Medido en `productos.csv` (10k), sobre 379 buckets: 3 con IDs densos y 42 con IDs aleatorios. A 100k: 126 y 172.
 - Una colección con menos de `MinIndexDocs` documentos (100) no tiene `.idx`, `.db` ni `tokens`: todo está en `p.log` (`PLAN_5BIT.md` 5.8, sin cambios).
@@ -47,15 +47,15 @@ Reglas de `PLAN_5BIT.md` 5.0: solo bytes, little‑endian, streams de bits LSB�
 
 ### 2.1 Lista de una palabra
 
-Es el formato de `PLAN_5BIT.md` 5.2: n postings ordenados por `(ID, pos)`. Un producto con la palabra en dos posiciones tiene dos postings.
+Es el formato de `PLAN_5BIT.md` 5.2: n postings ordenados por `(clave, pos)`, con la clave del documento `grupo << 32 | ID` (15). Un producto con la palabra en dos posiciones tiene dos postings.
 
 ```
-diferencias de ID   n − 1 valores: W bits fijos (Codec 0) o varint de nibbles (Codec 1: 3 bits de valor + 1 de continuación)
+diferencias de clave n − 1 valores: W bits fijos (Codec 0, con o sin escapes de grupo, 15.2) o varint de nibbles (Codec 1: 3 bits de valor + 1 de continuación)
 posiciones          n × 4 bits (saturadas en 15)
 colas               n × 2 bits, solo si Tail = 1
 ```
 
-El diccionario guarda `count`, el primer ID y `V` (`Tail | Codec << 1 | X << 2`, con X = W o la cantidad de nibbles). Con eso el largo en bits se calcula, así que no se guarda.
+El diccionario guarda `count`, la primera clave y `V` (`Tail | Codec << 1 | X << 2`, con X = `W | nibbles de escape << 6` o la cantidad de nibbles). Con eso el largo en bits se calcula, así que no se guarda.
 
 ### 2.2 Columnas de una combinación
 
@@ -63,8 +63,8 @@ Las listas de dos palabras sobre los mismos productos. Se leen enteras y de adel
 
 ```
 docs          varint de nibbles    productos
-first         varint de nibbles    primer ID − base del bloque
-codec         1 bit                0: W (6 bits) y W bits por diferencia; 1: varint de nibbles por diferencia
+first         varint de nibbles    primera clave − base del bloque
+codec         1 bit                0: escapes (1 bit), W (6 bits) y W bits por diferencia; 1: varint de nibbles por diferencia
 por columna:  dup 1 bit | tail 1 bit
               con dup: por producto, sus postings − 1 (nibbles)
               por posting: pos (4 bits); después, con tail, por posting: cola (2 bits)
@@ -82,7 +82,7 @@ por columna:  dup 1 bit | tail 1 bit
 ```
 Header (64 B)
   0   magic "GXI1"
-  4   Format       uint16 = 2
+  4   Format       uint16 = 3
   6   ETagLen      uint16     largo del ETag del .db
   8   NormID       uint32
   12  Epoch        uint32     época del índice (7)
@@ -98,8 +98,8 @@ Header (64 B)
 ETag     [ETagLen]B   ETag que S3 devolvió al escribir el .db
 Keys     n u16 | por bucket del grupo que tiene claves: bucket u16 | claves u32
          y, por bucket en ese orden, sus claves ordenadas (2.3)
-Fields   wCount u8 | wDup u8 | wFirst u8 | wX u8 | base u32, y por clave, en bits:
-           count[wCount] | dup[wDup] | first−base[wFirst] | V[2+wX] | loc[2]
+Fields   wCount u8 | wDup u8 | wFirst u8 | wX u8 | wGroup u8 | grupo base u8 | 0 u16 | ID base u32, y por clave, en bits:
+           count[wCount] | dup[wDup] | grupo−base[wGroup] | ID−base[wFirst] | V[2+wX] | loc[2]
 Heads    reservada para las cabezas de prefijo (3.2): hoy siempre vacía
 Exp      expansiones (3.3), una por palabra expandida, en orden de clave
 Inline   las listas en línea, pegadas en bits en orden de clave
@@ -143,11 +143,11 @@ n × largo[wLen] bits                    bytes de cada bloque de combinaciones e
 ### 3.4 Grupo de cabeza
 
 ```
-tail u8 | flags u8 (bit 0 = hay colas) | wID u8 | 0 u8 | m u16 | 0 u16 | total u32 | base u32 | size u32     (20 B)
-m entradas, en bits (size bytes): ID−base[wID] | postings−1 (nibbles) | pos[4] por posting | cola[2] por posting (con el flag)
+tail u8 | flags u8 (bit 0 = hay colas) | wID u8 | grupo base u8 | m u16 | wGroup u8 | 0 u8 | total u32 | ID base u32 | size u32     (20 B)
+m entradas, en bits (size bytes): grupo−base[wGroup] | ID−base[wID] | postings−1 (nibbles) | pos[4] por posting | cola[2] por posting (con el flag)
 ```
 
-- **Orden:** por `min(primera posición, 2)` (primera palabra, segunda, resto: el bonus de posición de `PLAN_5BIT.md` 13.3) y después por ID ascendente. Es el orden del puntaje de una consulta de ese término solo, así que las m primeras entradas son el top exacto de la palabra.
+- **Orden:** por `min(primera posición, 2)` (primera palabra, segunda, resto: el bonus de posición de `PLAN_5BIT.md` 13.3) y después por clave ascendente. Es el orden del puntaje de una consulta de ese término solo, así que las m primeras entradas son el top exacto de la palabra.
 - **Cada entrada trae todos los postings de la palabra en el producto**, no solo la primera posición: el lector calcula el puntaje exacto.
 - `m ≤ H = 64`; `total` son los productos del grupo, para saber si la cabeza los tiene a todos.
 
@@ -156,7 +156,7 @@ m entradas, en bits (size bytes): ID−base[wID] | postings−1 (nibbles) | pos[
 ## 4. `<xy>.db`
 
 ```
-Header (32 B): magic "GXD1" | Format uint16 = 2 | Group uint16 | NormID uint32 | Epoch uint32 | Seq uint64
+Header (32 B): magic "GXD1" | Format uint16 = 3 | Group uint16 | NormID uint32 | Epoch uint32 | Seq uint64
                | CRC32C del cuerpo uint32 | Grouping uint8 | reservado 3 B
 Zona de palabras        las listas con loc 2 o 3, pegadas en bits en orden de clave
 Zona de combinaciones   desde DBCombos: los bloques, en orden de palabra expandida y de entrada del directorio
@@ -165,7 +165,7 @@ Zona de combinaciones   desde DBCombos: los bloques, en orden de palabra expandi
 Bloque de combinaciones (se lee entero):
 
 ```
-n u16 | 0 u16 | base u32
+n u16 | grupo de la base u8 | 0 u8 | ID de la base u32
 n co‑claves (2.3), alineadas a byte
 por co‑clave, en su orden: las columnas (2.2) de la palabra expandida y de la co‑clave
 ```
@@ -226,11 +226,11 @@ Un prefijo o un typo que tiene que leer muchas listas sigue limitado por `Prefix
 
 ## 7. Consistencia sin generaciones
 
-**Base de `p.log` (Format 2, 176 B):**
+**Base de `p.log` (Format 3, 176 B):**
 
 ```
 0   magic "GXL1"   4
-4   Format         uint16 = 2
+4   Format         uint16 = 3
 6   flags          uint16       bit 0 = LogOnly; byte alto (7) = Grouping del índice (14)
 8   NormID         uint32
 12  Epoch          uint32
@@ -242,7 +242,7 @@ Un prefijo o un typo que tiene que leer muchas listas sigue limitado por `Prefix
 172 CRC32C         uint32
 ```
 
-Los frames (`Batch`, `Compact`, `Docs`) no cambian.
+Los frames (`Batch`, `Compact`, `Docs`) son los de `PLAN_5BIT.md`, salvo que cada documento se nombra con su clave de 5 bytes (`ID u32 | grupo u8`, 15).
 
 **Reglas del lector**, para cada `.idx` de la ronda 1 (el header alcanza para decidir):
 
@@ -274,7 +274,7 @@ Los frames (`Batch`, `Compact`, `Docs`) no cambian.
 
 **Compactación** (`Compact`):
 
-1. Toma el lease. Lee `p.log` y `tokens` en paralelo, y aplica las ops pendientes al estado `ID → claves`. Si no hay nada que hacer (sin ops, sin cambio de modo, sin restos), termina sin escribir.
+1. Toma el lease. Lee `p.log` y `tokens` en paralelo, y aplica las ops pendientes al estado `documento → claves`. Si no hay nada que hacer (sin ops, sin cambio de modo, sin restos), termina sin escribir.
 2. Espera hasta `base.UnixMs + CompactSpacing`, salvo que la base sea `LogOnly` y no haya `tokens`: entonces nunca hubo buckets que confundir, y la primera indexación (`Init`, el paso a tener índice) no espera.
 3. **Bajo `MinIndexDocs`:** recorta `p.log` a una base `LogOnly` con `Docs`. Si había índice, la base sube de época y el índice viejo se borra en la siguiente compactación, cuando ninguna consulta lo lee.
 4. **Reescritura completa** (época nueva) si: hubo recuperación, la base era `LogOnly`, falta `tokens`, o `tokens` es de otra época. Si no, **incremental**.
@@ -616,3 +616,92 @@ Qué dicen:
   - consultas casi siempre en caliente: un proceso de vida larga con su caché.
   
   Si la mayoría de las consultas son en frío y se paga por byte, conviene `GroupingNone`.
+
+---
+
+## 15. Grupo del documento
+
+> Agregado el 2026-10-05. Un documento es un **grupo** (`uint8`) y un **ID** (`uint32`) único dentro del grupo: el mismo ID en dos grupos son dos documentos. Sirve para tener varias tablas en un índice, para que un agente busque un nombre sin saber qué es. Un documento nunca cambia de grupo, la búsqueda no filtra por grupo y el grupo no entra en el puntaje: cada resultado trae su grupo y su ID.
+>
+> No confundir con los grupos de buckets de 14 ni con los grupos de cabeza de 3.4.
+
+### 15.1 La clave
+
+- Todo el índice trabaja con la **clave del documento**, `grupo << 32 | ID` (40 bits, paquete `docid`). Las listas, las cabezas y las combinaciones están ordenadas por clave: por grupo y, dentro del grupo, por ID.
+- **Desempate:** con la misma cobertura y el mismo puntaje, va primero la clave menor (grupo menor, después ID menor). Es el mismo orden de las cabezas, que tiene que coincidir con el del ranking para que la cabeza dé el top exacto (6.1).
+- **En `p.log` y `tokens`** la clave ocupa 5 bytes: `ID u32 | grupo u8`. El directorio de chunks de `tokens` guarda la primera clave en un u64 (20 B por chunk).
+- **API:** `Doc{Group, ID, Text}`, `Ref{Group, ID}` para borrar, `Hit{Group, ID, …}`, `QueryHit.Group` (`cb:"4"`). En el CLI, un documento es `ID` (grupo 0) o `GRUPO:ID`.
+- Formatos: `p.log`, `.idx`, `.db` y `tokens` pasan a `Format = 3`. Los índices de antes se reconstruyen (`Rebuild`).
+
+### 15.2 Cómo se codifica sin pagar el grupo en cada documento
+
+Una lista es una corrida por grupo. Dentro de una corrida, la diferencia de claves es la de los IDs. **El salto a la corrida siguiente es enorme** (≈ Δgrupo · 2³²): con los formatos de antes, ensanchaba `W` a 33 bits o más para todas las diferencias de la lista. Por eso:
+
+- **Listas (2.1) y combinaciones (2.2):** hay tres formas, y se elige la más chica:
+  - **Codec 0 simple:** `W` es el de la mayor diferencia. Es el de siempre.
+  - **Codec 0 con escapes:** `W` es el de la mayor diferencia dentro de una corrida, más uno. El valor de `W` bits todo en unos es un **escape**: le siguen los grupos salteados (`Δgrupo − 1`) y el ID en el grupo nuevo, los dos en varint de nibbles. Para que el largo de la lista se pueda calcular desde el diccionario, `X = W | nibbles de escape << 6`. En las combinaciones, un bit dice si hay escapes.
+  - **Codec 1:** la diferencia de claves en varint de nibbles.
+- **Claves sin orden** (la primera clave de cada palabra en `Fields` y las entradas de una cabeza): se escriben como `grupo − grupo base` en `wGroup` bits e `ID − ID base` en `wID` bits. El ID base es el menor de todos los grupos, así que los IDs de todas las tablas comparten un rango.
+- **Con un solo grupo** no hay escapes y `wGroup = 0`: cuesta exactamente lo mismo que antes (medido: mismos bytes).
+
+### 15.3 Medición
+
+Mismo eval que 13 (`GroupingNone`), con `GXS_EVAL_GROUPS=n`: cada documento cae al azar en uno de n grupos, y cada grupo tiene sus propios IDs. Con IDs densos, cada grupo va de 1 a N/n (un autoincremental por tabla); con IDs aleatorios, `uint32` al azar. Es el caso pesimista: en tablas reales una palabra suele aparecer en pocas.
+
+Bytes promedio por consulta en frío, 1 · 2 · 3 palabras:
+
+| | 1 grupo | 8 grupos | 50 grupos |
+|---|---|---|---|
+| 10k, densos | 1,7 · 3,0 · 4,5 KB | 2,0 · 3,5 · 5,3 KB | 2,1 · 3,8 · 5,7 KB |
+| 10k, aleatorios | 2,7 · 5,0 · 7,8 KB | 2,8 · 5,3 · 8,2 KB | 2,9 · 5,4 · 8,5 KB |
+| 100k, densos | 3,7 · 7,7 · 12,4 KB | 3,9 · 8,2 · 13,3 KB | 4,1 · 8,8 · 14,2 KB |
+| 100k, aleatorios | 4,9 · 10,8 · 17,8 KB | 5,0 · 11,3 · 18,7 KB | 5,2 · 11,7 · 19,4 KB |
+
+| 100k | `.idx` total | `.db` total |
+|---|---|---|
+| densos, 1 · 8 · 50 grupos | 430 · 462 · 481 KB | 3,91 · 4,93 · 5,73 MB |
+| aleatorios, 1 · 8 · 50 grupos | 560 · 582 · 591 KB | 9,90 · 10,82 · 11,58 MB |
+
+Qué dicen:
+- **Las rondas y los requests no cambian.** Solo crecen los bytes.
+- **Con IDs aleatorios**, 8 grupos cuestan un 5 % más y 50 grupos un 9 %. Ahí el escape no ayuda: un ID al azar ocupa 32 bits igual, y gana el codec 0 simple o el 1.
+- **Con IDs densos por grupo** (el caso de varias tablas con autoincremental), sin escapes ni claves partidas costaba un 14 % y un 26 % más a 100k, y un 38 % y un 60 % a 10k. Con 15.2 queda en un 7 % y un 15 % a 100k, y en un 18 % y un 27 % a 10k.
+- **El ranking es el de la fuerza bruta** en 3 000/3 000 con cualquier cantidad de grupos, y `TestMatchesBruteForce` mezcla 5 grupos con IDs repetidos entre grupos.
+
+---
+
+## 16. Palabras de una letra y stopwords
+
+> Agregado el 2026-10-05. **Todo bucket de letras es una combinación de 2 letras.** Una palabra de una letra no tiene clave ni bucket propio: es la **continuación** de las 2 palabras anteriores más cercanas del documento. Las stopwords se pueden conservar con un flag.
+
+### 16.1 Continuaciones
+
+- **Al indexar** (`key5.FromTokens`): una palabra de una letra se guarda como continuación de **las 2 anfitrionas distintas más cercanas antes de ella** (`key5.MaxContinued`; anfitriona es una palabra de 2 letras o más; los números y las otras letras no lo son). "Polo rojo M" guarda `polo`, `rojo`, `rojo›m` y `polo›m`; "Polo rojo azul M", solo `azul›m` y `rojo›m`. Una anfitriona repetida cuenta por su aparición más reciente ("polo rojo azul polo M" → `polo›m`, `azul›m`). Si no hay ninguna palabra antes ("M polo rojo"), la letra no se guarda.
+- **La clave** `anfitriona›letra` son las primeras 6 unidades de la anfitriona, la unidad 0 como marca y la letra (`key5.Continuation`). Queda en el bucket de la anfitriona, justo después de su clave (`talla` < `talla›m` < `tallaa`). Dos anfitrionas que comparten 6 letras comparten la continuación (`refrigerante` y `refrigerado` → `refrig›x`).
+- **Posiciones:** las continuaciones de una letra ocupan posiciones consecutivas desde la de la letra, de la anfitriona más cercana a la más lejana. Las palabras siguientes se corren.
+- **Formatos:** no cambian. `Key.Len()` cuenta hasta la última unidad distinta de 0, así que los streams de claves llevan la continuación entera. El stream de tokens acepta la unidad 0 solo como marca, antes de la última unidad.
+- **Al consultar** (`Parse`): una letra va detrás de las palabras de la consulta, estén donde estén (`m talla` es `talla m`), y busca su continuación con **cada palabra anfitriona de la consulta**: basta una. Sin anfitriona en la consulta, la letra se descarta (`m` sola no encuentra nada). Nunca es prefijo (`m*` es `m`). La palabra abierta sigue siendo la última que se escribió (`m tal`: `tal` es prefijo).
+- **Ningún otro término ve una continuación:** `talla›m` no es prefijo ni typo de `talla`, y no suma a su IDF.
+- **Lectura:** la continuación está en el `.idx` de la anfitriona, que la consulta ya lee. Antes `talla m` leía dos `.idx` (`ta` y `m0`); ahora uno.
+
+### 16.2 Stopwords
+
+`Config.KeepStopwords` / `ClientOptions.KeepStopwords` / `gxs -keep-stopwords`: el normalizador conserva las stopwords del español (`a`, `de`, `la`, `y`…), que por defecto se descartan. Con el flag, "Salón A" guarda `salon›a`. El flag entra en `NormID`: un buscador con otro valor rechaza la colección, y cambiarlo exige `Rebuild`.
+
+### 16.3 Medición
+
+Mismo eval que 13. En `productos.csv`, el 36 % de los nombres tiene una letra suelta: casi siempre una unidad (`g` 2 434 veces, como en "500 g"; `l` 516; `d` 248). Hay 3 891 letras; pegadas a todas las anfitrionas anteriores dan 19 049 postings de continuación, y pegadas solo a la más cercana, 3 877.
+
+Bytes promedio en frío, 1 · 2 · 3 palabras, y `.db` total:
+
+| | Antes (bucket `x0`) | Solo la anfitriona más cercana | Las 2 más cercanas (lo implementado) | Todas |
+|---|---|---|---|---|
+| 10k, aleatorios | 2,7 · 5,0 · 7,8 KB | 2,9 · 5,2 · 8,1 KB | 3,0 · 5,5 · 8,5 KB | 3,4 · 6,0 · 9,3 KB |
+| 100k, aleatorios | 4,9 · 10,8 · 17,8 KB | 5,1 · 10,7 · 17,9 KB | 5,5 · 11,3 · 18,9 KB | 6,4 · 12,4 · 20,7 KB |
+| 100k, densos | 3,7 · 7,7 · 12,4 KB | 3,8 · 7,7 · 12,4 KB | 4,1 · 8,2 · 13,2 KB | 4,5 · 8,8 · 14,3 KB |
+| `.db`, 100k aleatorios | 9,90 MB | 9,19 MB | 9,71 MB | 12,16 MB |
+
+- Hay 356 buckets en vez de 379: desaparecen los 23 de una letra.
+- El ranking es el de la fuerza bruta en 3 000/3 000.
+- **Con todas las anfitrionas** la consulta en frío lee un 16 % más a 100k (un 30 % con 1 palabra): las continuaciones engordan el `.idx` de las palabras comunes. **Con solo la más cercana** cuesta lo mismo que antes, pero "Polo rojo M" ya no se encuentra con `polo m` por la letra (sí por `rojo m`).
+- **Se eligió las 2 más cercanas** (2026-10-05): un 4–5 % más que antes en frío a 100k, y la letra sigue a las dos palabras que suelen describirla ("polo rojo M", "vitamina C 500 mg"). Una palabra más lejana encuentra el documento por sí misma, no por la letra.

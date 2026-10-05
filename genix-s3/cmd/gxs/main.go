@@ -16,6 +16,7 @@ import (
 	"github.com/ivanjoz/genix-search/genix-s3/internal/blob"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/bucket"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/collection"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/docid"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/layout"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/normalize"
@@ -28,12 +29,13 @@ const usage = `usage: gxs <command> [flags] [args]
 
 commands:
   build   -csv FILE               create the collection from FILE: one name per
-                                  line (ID = line number), or "id<TAB>text" lines
+                                  line (ID = line number, group 0), or
+                                  "ref<TAB>text" lines
   query   [-limit N] [-fuzzy] [-csv FILE] TERMS...
                                   print the ranked IDs; -csv looks the names up in
                                   FILE, the way the application uses its database
-  put     ID TEXT...              write one document through p.log
-  del     ID                      delete one document through p.log
+  put     REF TEXT...             write one document through p.log
+  del     REF                     delete one document through p.log
   compact                         fold p.log into the buckets of the index
   log                             print p.log
   inspect [WORD]                  print the buckets, or the bucket of WORD
@@ -43,7 +45,11 @@ common flags: -root DIR (default data/gxs) -collection NAME -partition NAME -ext
               index, only p.log; build, put, del and compact apply it
               -grouping es100|none (default es100): how build and compact group
               the buckets into objects; another than the index's rewrites
-              every bucket. query, log and inspect follow the index`
+              every bucket. query, log and inspect follow the index
+              -keep-stopwords: index and match the stopwords too ("Salón A");
+              the same for every command on a collection
+
+a REF is ID (group 0) or GROUP:ID: the same ID in two groups is two documents`
 
 type env struct {
 	store    blob.Blob
@@ -69,6 +75,7 @@ func main() {
 	fuzzy := flags.Bool("fuzzy", false, "tolerate typos")
 	minIndex := flags.Int("min-index-docs", plog.DefaultMinIndexDocs, "documents below which there is no index, only p.log")
 	grouping := flags.String("grouping", "es100", "how the writers group the buckets: es100 or none")
+	keepStopwords := flags.Bool("keep-stopwords", false, "index and match the stopwords too")
 
 	if err := flags.Parse(args); err != nil {
 		fail(err)
@@ -76,7 +83,7 @@ func main() {
 
 	ctx := context.Background()
 
-	e, err := open(*root, *name, *partition, *extra, *grouping)
+	e, err := open(*root, *name, *partition, *extra, *grouping, *keepStopwords)
 	if err != nil {
 		fail(err)
 	}
@@ -113,7 +120,7 @@ func fail(err error) {
 	os.Exit(1)
 }
 
-func open(root, name, partition, extra, grouping string) (env, error) {
+func open(root, name, partition, extra, grouping string, keepStopwords bool) (env, error) {
 	store, err := blob.NewFS(root)
 	if err != nil {
 		return env{}, err
@@ -141,8 +148,11 @@ func open(root, name, partition, extra, grouping string) (env, error) {
 	}
 
 	norm, err := normalize.New(letters)
+	if err != nil {
+		return env{}, err
+	}
 
-	return env{store: store, col: col, norm: norm}, err
+	return env{store: store, col: col, norm: norm.WithStopwords(keepStopwords)}, nil
 }
 
 func (e env) writer() *collection.Collection {
@@ -166,21 +176,41 @@ func readDocs(path string) ([]collection.Doc, error) {
 
 	for line := 1; scanner.Scan(); line++ {
 		text := scanner.Text()
-		id := uint32(line)
+		ref := collection.Ref{ID: uint32(line)}
 
 		if before, after, ok := strings.Cut(text, "\t"); ok {
-			n, err := strconv.ParseUint(before, 10, 32)
-			if err != nil {
-				return nil, fmt.Errorf("%s:%d: id %q", path, line, before)
+			var err error
+			if ref, err = parseRef(before); err != nil {
+				return nil, fmt.Errorf("%s:%d: %w", path, line, err)
 			}
 
-			id, text = uint32(n), after
+			text = after
 		}
 
-		docs = append(docs, collection.Doc{ID: id, Text: text})
+		docs = append(docs, collection.Doc{Group: ref.Group, ID: ref.ID, Text: text})
 	}
 
 	return docs, scanner.Err()
+}
+
+// parseRef reads a document reference: ID, of group 0, or GROUP:ID.
+func parseRef(s string) (collection.Ref, error) {
+	group, id, ok := strings.Cut(s, ":")
+	if !ok {
+		group, id = "0", s
+	}
+
+	g, err := strconv.ParseUint(group, 10, 8)
+	if err != nil {
+		return collection.Ref{}, fmt.Errorf("group %q", group)
+	}
+
+	n, err := strconv.ParseUint(id, 10, 32)
+	if err != nil {
+		return collection.Ref{}, fmt.Errorf("id %q", id)
+	}
+
+	return collection.Ref{Group: uint8(g), ID: uint32(n)}, nil
 }
 
 func cmdBuild(ctx context.Context, e env, path string) error {
@@ -213,7 +243,7 @@ func cmdBuild(ctx context.Context, e env, path string) error {
 }
 
 func cmdQuery(ctx context.Context, e env, csv string, limit int, fuzzy bool, terms []string) error {
-	names := map[uint32]string{}
+	names := map[docid.Key]string{}
 
 	if csv != "" {
 		docs, err := readDocs(csv)
@@ -222,7 +252,7 @@ func cmdQuery(ctx context.Context, e env, csv string, limit int, fuzzy bool, ter
 		}
 
 		for _, d := range docs {
-			names[d.ID] = d.Text
+			names[d.Key()] = d.Text
 		}
 	}
 
@@ -234,7 +264,8 @@ func cmdQuery(ctx context.Context, e env, csv string, limit int, fuzzy bool, ter
 	}
 
 	for i, h := range resp.Hits {
-		fmt.Printf("%2d. %10d  cov %d  score %3d  %s\n", i+1, h.ID, h.Coverage, h.Score, names[h.ID])
+		k := docid.New(h.Group, h.ID)
+		fmt.Printf("%2d. %14v  cov %d  score %3d  %s\n", i+1, k, h.Coverage, h.Score, names[k])
 	}
 
 	s := resp.Stats
@@ -250,30 +281,30 @@ func cmdQuery(ctx context.Context, e env, csv string, limit int, fuzzy bool, ter
 
 func cmdPut(ctx context.Context, e env, args []string) error {
 	if len(args) < 2 {
-		return fmt.Errorf("put ID TEXT...")
+		return fmt.Errorf("put REF TEXT...")
 	}
 
-	id, err := strconv.ParseUint(args[0], 10, 32)
+	ref, err := parseRef(args[0])
 	if err != nil {
 		return err
 	}
 
-	res, err := e.writer().Put(ctx, []collection.Doc{{ID: uint32(id), Text: strings.Join(args[1:], " ")}})
+	res, err := e.writer().Put(ctx, []collection.Doc{{Group: ref.Group, ID: ref.ID, Text: strings.Join(args[1:], " ")}})
 
 	return report(res, err)
 }
 
 func cmdDel(ctx context.Context, e env, args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("del ID")
+		return fmt.Errorf("del REF")
 	}
 
-	id, err := strconv.ParseUint(args[0], 10, 32)
+	ref, err := parseRef(args[0])
 	if err != nil {
 		return err
 	}
 
-	res, err := e.writer().Delete(ctx, uint32(id))
+	res, err := e.writer().Delete(ctx, ref)
 
 	return report(res, err)
 }
@@ -338,7 +369,7 @@ func cmdLog(ctx context.Context, e env) error {
 				return err
 			}
 
-			fmt.Printf("  doc %d  %s\n", doc.ID, words)
+			fmt.Printf("  doc %v  %s\n", doc.ID, words)
 		}
 	} else {
 		touched := 0
@@ -359,7 +390,7 @@ func cmdLog(ctx context.Context, e env) error {
 
 	for _, op := range log.Ops {
 		if op.Del {
-			fmt.Printf("%6d  del %d\n", op.Seq, op.ID)
+			fmt.Printf("%6d  del %v\n", op.Seq, op.ID)
 
 			continue
 		}
@@ -369,7 +400,7 @@ func cmdLog(ctx context.Context, e env) error {
 			return err
 		}
 
-		fmt.Printf("%6d  put %d  %s\n", op.Seq, op.ID, words)
+		fmt.Printf("%6d  put %v  %s\n", op.Seq, op.ID, words)
 	}
 
 	for _, c := range log.Compacts {

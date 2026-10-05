@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/blob"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/docid"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/plog"
 )
 
@@ -108,10 +109,10 @@ func (c *Collection) rebuild(ctx context.Context, source Source, drop bool) (res
 		since = st.log.LastSeq()
 	}
 
-	byID := make(map[uint32][]byte)
+	byID := make(map[docid.Key][]byte)
 
 	err = source(ctx, func(doc Doc) error {
-		byID[doc.ID] = c.Tokens(doc.Text) // a repeated ID keeps its last version
+		byID[doc.Key()] = c.Tokens(doc.Text) // a repeated document keeps its last version
 
 		return nil
 	})

@@ -59,7 +59,7 @@ func TestClient(t *testing.T) {
 	source := func(ctx context.Context, yield func(genix.Doc) error) error {
 		for id := uint32(1); id <= 400; id++ {
 			if id == 200 {
-				if _, err := c.Apply(ctx, "productos", "p2", []genix.Doc{{ID: 9000, Text: "gorra edicion limitada"}}, []uint32{11}); err != nil {
+				if _, err := c.Apply(ctx, "productos", "p2", []genix.Doc{{ID: 9000, Text: "gorra edicion limitada"}}, []genix.Ref{{ID: 11}}); err != nil {
 					return err
 				}
 			}

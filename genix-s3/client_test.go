@@ -68,7 +68,7 @@ func TestClientPartitions(t *testing.T) {
 	}
 
 	// Deletes alone do not create a partition.
-	if res, err := c.Apply(ctx, "productos", "p4", nil, []uint32{1}); err != nil || res.Size != 0 {
+	if res, err := c.Apply(ctx, "productos", "p4", nil, []Ref{{ID: 1}}); err != nil || res.Size != 0 {
 		t.Errorf("delete on a missing partition: %+v %v", res, err)
 	}
 
@@ -77,7 +77,7 @@ func TestClientPartitions(t *testing.T) {
 	}
 
 	// Puts and deletes in one batch: one read and one append.
-	res, err := c.Apply(ctx, "productos", "p1", []Doc{{ID: 3, Text: "polo verde"}}, []uint32{2})
+	res, err := c.Apply(ctx, "productos", "p1", []Doc{{ID: 3, Text: "polo verde"}}, []Ref{{ID: 2}})
 	if err != nil || res.Requests != 2 {
 		t.Fatalf("mixed batch: %+v %v", res, err)
 	}

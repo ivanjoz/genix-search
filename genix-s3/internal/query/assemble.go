@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/bucket"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/docid"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/plog"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/postings"
@@ -33,9 +34,9 @@ func (d *docWords) set(pick int, list []postings.Posting) {
 	}
 }
 
-type docSet map[uint32]*docWords
+type docSet map[docid.Key]*docWords
 
-func (s docSet) doc(id uint32) *docWords {
+func (s docSet) doc(id docid.Key) *docWords {
 	d := s[id]
 	if d == nil {
 		d = &docWords{}
@@ -45,7 +46,7 @@ func (s docSet) doc(id uint32) *docWords {
 	return d
 }
 
-// addList adds a list, sorted by ID, as the postings of pick.
+// addList adds a list, sorted by key, as the postings of pick.
 func (s docSet) addList(pick int, list []postings.Posting) {
 	for i := 0; i < len(list); {
 		j := i + 1
@@ -62,7 +63,7 @@ func (s docSet) addList(pick int, list []postings.Posting) {
 // list, a combination or a head, with the postings of each word it has; then
 // p.log on top: a document with a pending op is replaced by its new version,
 // matched by the same rules, or removed.
-func assemble(terms []Term, p *readPlan, data *dbData, pending map[uint32]plog.Op) (*candidates, error) {
+func assemble(terms []Term, p *readPlan, data *dbData, pending map[docid.Key]plog.Op) (*candidates, error) {
 	index := make(map[*pick]int, len(p.picks))
 	for i, pk := range p.picks {
 		index[pk] = i

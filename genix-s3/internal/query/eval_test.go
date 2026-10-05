@@ -7,11 +7,13 @@ import (
 	"math/rand/v2"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/collection"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/docid"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/layout"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/normalize"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/tokens"
@@ -29,7 +31,9 @@ import (
 // general case, nothing assumed), or dense 1..N (an auto-increment key, and
 // what the previous genix-s3 evaluation used). The rankings, typos and
 // writes are measured with random IDs only. GXS_EVAL_GROUPING=es100 builds
-// the index grouped.
+// the index grouped. GXS_EVAL_GROUPS=n spreads the documents at random over n
+// document groups (n tables in one index), each with its own IDs: dense 1..N
+// per group, or random.
 func TestEval(t *testing.T) {
 	path := os.Getenv("GXS_EVAL_CSV")
 	if path == "" {
@@ -38,6 +42,14 @@ func TestEval(t *testing.T) {
 
 	names := readLines(t, path)
 	queries := sampleQueries(names, 3000)
+
+	groups := 1
+	if n := os.Getenv("GXS_EVAL_GROUPS"); n != "" {
+		var err error
+		if groups, err = strconv.Atoi(n); err != nil || groups < 1 || groups > 256 {
+			t.Fatalf("GXS_EVAL_GROUPS=%q: 1 to 256", n)
+		}
+	}
 
 	for _, scale := range []int{1, 10} {
 		for _, dense := range []bool{true, false} {
@@ -48,20 +60,27 @@ func TestEval(t *testing.T) {
 
 			t.Run(fmt.Sprintf("x%d/%s", scale, mode), func(t *testing.T) {
 				r := rand.New(rand.NewPCG(uint64(scale), 99))
-				used := map[uint32]bool{}
+				used := map[docid.Key]bool{}
+				next := make([]uint32, groups) // the last dense ID of each group
 
 				var docs []collection.Doc
 
 				for range scale {
 					for _, name := range names {
-						id := uint32(len(docs) + 1)
-
-						for !dense && (id == uint32(len(docs)+1) || used[id]) {
-							id = r.Uint32()
+						group := uint8(0)
+						if groups > 1 {
+							group = uint8(r.IntN(groups))
 						}
 
-						used[id] = true
-						docs = append(docs, collection.Doc{ID: id, Text: name})
+						next[group]++
+						k := docid.New(group, next[group])
+
+						for !dense && (k.ID() == next[group] || used[k]) {
+							k = docid.New(group, r.Uint32())
+						}
+
+						used[k] = true
+						docs = append(docs, collection.Doc{Group: group, ID: k.ID(), Text: name})
 					}
 				}
 
@@ -201,9 +220,9 @@ func evalScale(t *testing.T, docs []collection.Doc, queries []string, r *rand.Ra
 		return
 	}
 
-	state := map[uint32]string{}
+	state := map[docid.Key]string{}
 	for _, d := range docs {
-		state[d.ID] = d.Text
+		state[d.Key()] = d.Text
 	}
 
 	ref := newReference(normalize.Default, state, state)
@@ -229,7 +248,7 @@ func evalScale(t *testing.T, docs []collection.Doc, queries []string, r *rand.Ra
 		}
 
 		want := full.top(parsed, 10, len(docs))
-		got := ids(resp.Hits)
+		got := keys(resp.Hits)
 
 		if slices.Equal(got, want) {
 			sameFull++
@@ -261,7 +280,7 @@ func evalScale(t *testing.T, docs []collection.Doc, queries []string, r *rand.Ra
 
 // evalFuzzy types two words of a document's name, one of them with a typo,
 // and looks for a document with that name in the top 10.
-func evalFuzzy(t *testing.T, f *fixture, docs []collection.Doc, textOf map[uint32]string, r *rand.Rand) {
+func evalFuzzy(t *testing.T, f *fixture, docs []collection.Doc, textOf map[docid.Key]string, r *rand.Rand) {
 	ctx := context.Background()
 	warm := f.engine(DefaultOptions())
 
@@ -317,7 +336,7 @@ func evalFuzzy(t *testing.T, f *fixture, docs []collection.Doc, textOf map[uint3
 			t.Fatal(err)
 		}
 
-		if slices.ContainsFunc(resp.Hits, func(h Hit) bool { return textOf[h.ID] == doc.Text }) {
+		if slices.ContainsFunc(resp.Hits, func(h Hit) bool { return textOf[docid.New(h.Group, h.ID)] == doc.Text }) {
 			found++
 		}
 
@@ -334,7 +353,7 @@ func evalFuzzy(t *testing.T, f *fixture, docs []collection.Doc, textOf map[uint3
 			t.Fatal(err)
 		}
 
-		if slices.ContainsFunc(whole.Hits, func(h Hit) bool { return textOf[h.ID] == doc.Text }) {
+		if slices.ContainsFunc(whole.Hits, func(h Hit) bool { return textOf[docid.New(h.Group, h.ID)] == doc.Text }) {
 			foundAll++
 		}
 
@@ -384,7 +403,7 @@ func evalWrites(t *testing.T, f *fixture, docs []collection.Doc, r *rand.Rand, q
 	appends := 1
 	for !res.CompactRequested {
 		doc := docs[r.IntN(len(docs))]
-		if res, err = f.w.Put(ctx, []collection.Doc{{ID: doc.ID, Text: doc.Text + " nuevo"}}); err != nil {
+		if res, err = f.w.Put(ctx, []collection.Doc{{Group: doc.Group, ID: doc.ID, Text: doc.Text + " nuevo"}}); err != nil {
 			t.Fatal(err)
 		}
 
@@ -429,12 +448,12 @@ func evalWrites(t *testing.T, f *fixture, docs []collection.Doc, r *rand.Rand, q
 // fullText ranks by whole words, the way the index would if it kept every
 // letter: exact is the same word, a prefix is a prefix of the whole word.
 type fullText struct {
-	ids    []uint32
+	ids    []docid.Key
 	tokens [][]string
 	byWord map[string][]int
 }
 
-func newFullText(norm *normalize.Normalizer, docs map[uint32]string) *fullText {
+func newFullText(norm *normalize.Normalizer, docs map[docid.Key]string) *fullText {
 	f := &fullText{byWord: map[string][]int{}}
 
 	for id, text := range docs {
@@ -464,7 +483,7 @@ func (f *fullText) matches(t *Term, tok string) matchKind {
 	return noMatch
 }
 
-func (f *fullText) top(q Parsed, limit, docs int) []uint32 {
+func (f *fullText) top(q Parsed, limit, docs int) []docid.Key {
 	cand := map[int]bool{}
 
 	for word, list := range f.byWord {
@@ -499,7 +518,7 @@ func (f *fullText) top(q Parsed, limit, docs int) []uint32 {
 	}
 
 	results := rankAll(q.Terms, cands, idfs(df, docs), 1<<30)
-	out := make([]uint32, 0, limit)
+	out := make([]docid.Key, 0, limit)
 
 	for _, r := range results[:min(limit, len(results))] {
 		out = append(out, r.id)

@@ -13,6 +13,7 @@ import (
 	"github.com/ivanjoz/genix-search/genix-s3/internal/blob"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/bucket"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/collection"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/docid"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/layout"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/normalize"
@@ -80,6 +81,16 @@ func ids(hits []Hit) []uint32 {
 	out := make([]uint32, len(hits))
 	for i, h := range hits {
 		out[i] = h.ID
+	}
+
+	return out
+}
+
+// keys are the document keys of hits, in order.
+func keys(hits []Hit) []docid.Key {
+	out := make([]docid.Key, len(hits))
+	for i, h := range hits {
+		out[i] = docid.New(h.Group, h.ID)
 	}
 
 	return out
@@ -191,6 +202,110 @@ func TestBudget(t *testing.T) {
 	}
 }
 
+// TestGroups: the same ID in two groups is two documents. Every hit carries
+// its group, and a write or a delete of one leaves the other, in p.log and in
+// the index.
+func TestGroups(t *testing.T) {
+	ctx := context.Background()
+	docs := []collection.Doc{
+		{Group: 1, ID: 7, Text: "Nike"},
+		{Group: 2, ID: 7, Text: "Zapatilla Nike Air"},
+		{Group: 2, ID: 8, Text: "Polo Adidas"},
+		{Group: 255, ID: 4000000000, Text: "Tienda Nike"},
+	}
+
+	for _, minIndex := range []int{1, 100} {
+		opts := testOptions()
+		opts.MinIndexDocs = minIndex
+		f := newFixtureOpts(t, normalize.Default, docs, opts)
+		e := f.engine(DefaultOptions())
+
+		check := func(step string, want ...docid.Key) {
+			t.Helper()
+
+			if got := keys(search(t, e, "nike", false).Hits); !slices.Equal(got, want) {
+				t.Fatalf("min %d, %s: nike %v, want %v", minIndex, step, got, want)
+			}
+		}
+
+		check("built", docid.New(1, 7), docid.New(2, 7), docid.New(255, 4000000000))
+
+		if _, err := f.w.Apply(ctx, []collection.Doc{{Group: 3, ID: 7, Text: "Nike"}}, []collection.Ref{{Group: 1, ID: 7}}); err != nil {
+			t.Fatal(err)
+		}
+
+		check("pending", docid.New(3, 7), docid.New(2, 7), docid.New(255, 4000000000))
+
+		if _, err := f.w.Compact(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		check("compacted", docid.New(3, 7), docid.New(2, 7), docid.New(255, 4000000000))
+	}
+}
+
+// TestLetters: a one-letter word is a continuation of the words before it in
+// the document, found after any word of the query, with no bucket of its own.
+// The stopwords flag makes "a" a letter like any other.
+func TestLetters(t *testing.T) {
+	ctx := context.Background()
+	docs := []collection.Doc{
+		{ID: 1, Text: "Polo rojo M"},
+		{ID: 2, Text: "M polo rojo"},
+		{ID: 3, Text: "Polo azul L"},
+		{ID: 4, Text: "Salón A"},
+	}
+
+	type hit struct{ id, coverage uint32 }
+
+	top := func(e *Engine, q string) []hit {
+		t.Helper()
+
+		var out []hit
+		for _, h := range search(t, e, q, false).Hits {
+			out = append(out, hit{h.ID, h.Coverage})
+		}
+
+		return out
+	}
+
+	f := newFixture(t, normalize.Default, docs)
+	e := f.engine(DefaultOptions())
+
+	cases := map[string][]hit{
+		"polo m":      {{1, 2}, {2, 1}, {3, 1}},
+		"m polo":      {{1, 2}, {2, 1}, {3, 1}}, // the letter goes after the word
+		"rojo m":      {{1, 2}, {2, 1}},
+		"polo rojo m": {{1, 3}, {2, 2}, {3, 1}},
+		"azul l":      {{3, 2}},
+		"m":           nil,      // no word to continue
+		"salon a":     {{4, 1}}, // a stopword
+	}
+
+	for q, want := range cases {
+		if got := top(e, q); !slices.Equal(got, want) {
+			t.Errorf("%q: %v, want %v", q, got, want)
+		}
+	}
+
+	if _, _, err := f.store.Get(ctx, f.col.Idx(key5.FromToken("m").Key.Slot())); err == nil {
+		t.Error("m0.idx exists: a letter got a bucket of its own")
+	}
+
+	keep := normalize.Default.WithStopwords(true)
+	fk := newFixture(t, keep, docs)
+
+	if got := top(fk.engine(DefaultOptions()), "salon a"); !slices.Equal(got, []hit{{4, 2}}) {
+		t.Errorf("salon a, keeping stopwords: %v", got)
+	}
+
+	// Indexer and searcher must agree on the flag.
+	other := New(fk.store, fk.col, normalize.Default, DefaultOptions())
+	if _, err := other.Search(ctx, Request{Query: "salon"}); err == nil {
+		t.Error("a searcher that drops stopwords read a collection that keeps them")
+	}
+}
+
 func TestExtraLetters(t *testing.T) {
 	norm, err := normalize.New([2]rune{'ñ', 0})
 	if err != nil {
@@ -269,7 +384,7 @@ func TestOverlayAndCompaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := f.w.Delete(ctx, 900001); err != nil {
+	if _, err := f.w.Delete(ctx, collection.Ref{ID: 900001}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -292,9 +407,10 @@ func TestOverlayAndCompaction(t *testing.T) {
 	}
 
 	// Rewritten: the buckets of the old and new words of 77, 17 and 900001,
-	// and nothing else.
+	// and nothing else. The M of 900001 has no bucket: it was talla›m,
+	// rojo›m… in the buckets of its host words.
 	want := map[string]bool{}
-	for _, w := range []string{"polo", "spiderman", "rojo", "azul", "gorra", "verde", "basico", "talla", "m"} {
+	for _, w := range []string{"polo", "spiderman", "rojo", "azul", "gorra", "verde", "basico", "talla"} {
 		want[layout.BucketName(key5.FromToken(w).Key.Slot())] = true
 	}
 
@@ -310,7 +426,7 @@ func TestOverlayAndCompaction(t *testing.T) {
 
 	// Gorra goes: its bucket becomes a tombstone, then goes away with the
 	// next compaction.
-	if _, err := f.w.Delete(ctx, 17); err != nil {
+	if _, err := f.w.Delete(ctx, collection.Ref{ID: 17}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -350,13 +466,13 @@ func TestLogOnly(t *testing.T) {
 	f := newFixtureOpts(t, normalize.Default, smallDocs, opts)
 	e := f.engine(DefaultOptions())
 
-	state := map[uint32]string{}
+	state := map[docid.Key]string{}
 	for _, d := range smallDocs {
-		state[d.ID] = d.Text
+		state[d.Key()] = d.Text
 	}
 
 	base := maps.Clone(state)
-	queries := []string{"polo spiderman rojo", "chocolate", "agua 500 ml", "pol", "agua 50", "spiderman*", "pina", "x m l", "talla m"}
+	queries := []string{"polo spiderman rojo", "chocolate", "agua 500 ml", "pol", "agua 50", "spiderman*", "pina", "m talla", "talla m"}
 
 	check := func(stage string, logOnly bool) {
 		t.Helper()
@@ -396,7 +512,7 @@ func TestLogOnly(t *testing.T) {
 	for i := range 95 {
 		id := uint32(5000 + i)
 		text := fmt.Sprintf("Polo básico color %d talla m", i)
-		state[id] = text
+		state[docid.Key(id)] = text
 
 		put, err := f.w.Put(ctx, []collection.Doc{{ID: id, Text: text}})
 		if err != nil {
@@ -430,9 +546,9 @@ func TestLogOnly(t *testing.T) {
 	// Deletes below the threshold drop the index.
 	for i := range 10 {
 		id := uint32(5000 + i)
-		delete(state, id)
+		delete(state, docid.Key(id))
 
-		if _, err := f.w.Delete(ctx, id); err != nil {
+		if _, err := f.w.Delete(ctx, collection.Ref{ID: id}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -473,12 +589,12 @@ func TestLogOnly(t *testing.T) {
 
 	check("95 documents after another compaction", true)
 
-	// Growing again builds the index in a new epoch.
+	// Growing again, in another group, builds the index in a new epoch.
 	for i := range 10 {
 		id := uint32(9000 + i)
-		state[id] = "Zapato rojo"
+		state[docid.New(4, id)] = "Zapato rojo"
 
-		if _, err := f.w.Put(ctx, []collection.Doc{{ID: id, Text: "Zapato rojo"}}); err != nil {
+		if _, err := f.w.Put(ctx, []collection.Doc{{Group: 4, ID: id, Text: "Zapato rojo"}}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -607,7 +723,8 @@ func bruteQueries(r *rand.Rand, n int) []string {
 	}
 
 	return append(queries, "pol", "ca", "c", "chocolat*", "1", "19", "x m l", "chocolate", "chocolatera", "polo", "rojo azul",
-		"refrigerado", "refrigerante", "chocolatina leche", "polo polo", "polo pol", "ca casa cama")
+		"refrigerado", "refrigerante", "chocolatina leche", "polo polo", "polo pol", "ca casa cama",
+		"m polo", "polo rojo m", "m*", "polo m*", "m pol", "x refrigerante refrigerado", "ca m", "l x polo")
 }
 
 // TestMatchesBruteForce compares the engine with a ranking of every
@@ -638,15 +755,39 @@ func TestMatchesBruteForce(t *testing.T) {
 			ctx := context.Background()
 			r := rand.New(rand.NewPCG(11, 12))
 
+			// Several groups, and IDs from a small range half the time, so
+			// that the same ID is a document of more than one group.
+			groups := []uint8{0, 1, 2, 7, 200}
+			randomKey := func() docid.Key {
+				id := r.Uint32()
+				if r.IntN(2) == 0 {
+					id = r.Uint32N(1500)
+				}
+
+				return docid.New(groups[r.IntN(len(groups))], id)
+			}
+
+			doc := func(k docid.Key) collection.Doc {
+				return collection.Doc{Group: k.Group(), ID: k.ID(), Text: bruteText(r)}
+			}
+
 			var docs []collection.Doc
-			used := map[uint32]bool{}
+			used := map[docid.Key]bool{}
 
 			for len(docs) < 3000 {
-				id := r.Uint32()
-				if !used[id] {
-					used[id] = true
-					docs = append(docs, collection.Doc{ID: id, Text: bruteText(r)})
+				if k := randomKey(); !used[k] {
+					used[k] = true
+					docs = append(docs, doc(k))
 				}
+			}
+
+			shared := map[uint32]int{}
+			for k := range used {
+				shared[k.ID()]++
+			}
+
+			if n := len(used) - len(shared); n < 100 {
+				t.Fatalf("only %d documents share their ID with another group", n)
 			}
 
 			opts := testOptions()
@@ -681,9 +822,9 @@ func TestMatchesBruteForce(t *testing.T) {
 				t.Fatalf("%d buckets of several slots", multi)
 			}
 
-			base := map[uint32]string{}
+			base := map[docid.Key]string{}
 			for _, d := range docs {
-				base[d.ID] = d.Text
+				base[d.Key()] = d.Text
 			}
 
 			state := maps.Clone(base)
@@ -691,13 +832,13 @@ func TestMatchesBruteForce(t *testing.T) {
 			// Pending ops: new documents, new versions and deletes.
 			var puts []collection.Doc
 			for i := range 40 {
-				id := docs[r.IntN(len(docs))].ID
+				k := docs[r.IntN(len(docs))].Key()
 				if i%3 == 0 {
-					id = r.Uint32()
+					k = randomKey()
 				}
 
-				puts = append(puts, collection.Doc{ID: id, Text: bruteText(r)})
-				state[id] = puts[len(puts)-1].Text
+				puts = append(puts, doc(k))
+				state[k] = puts[len(puts)-1].Text
 			}
 
 			if _, err := f.w.Put(ctx, puts); err != nil {
@@ -705,12 +846,12 @@ func TestMatchesBruteForce(t *testing.T) {
 			}
 
 			for range 10 {
-				id := docs[r.IntN(len(docs))].ID
-				if _, err := f.w.Delete(ctx, id); err != nil {
+				k := docs[r.IntN(len(docs))].Key()
+				if _, err := f.w.Delete(ctx, collection.Ref{Group: k.Group(), ID: k.ID()}); err != nil {
 					t.Fatal(err)
 				}
 
-				delete(state, id)
+				delete(state, k)
 			}
 
 			ref := newReference(normalize.Default, base, state)
@@ -771,12 +912,12 @@ func TestMatchesBruteForce(t *testing.T) {
 // index; the rarity of a term comes from the dictionary documents, those the
 // index was built from.
 type reference struct {
-	ids    []uint32
+	ids    []docid.Key
 	tokens [][]key5.Token
 	dict   [][]key5.Token
 }
 
-func newReference(norm *normalize.Normalizer, dict, live map[uint32]string) *reference {
+func newReference(norm *normalize.Normalizer, dict, live map[docid.Key]string) *reference {
 	ref := &reference{}
 
 	for id, text := range live {
@@ -807,7 +948,7 @@ func (r *reference) top(q Parsed, offset, limit int, fuzzy bool) []Hit {
 	hits := []Hit{}
 
 	for _, res := range results[min(offset, len(results)):min(offset+limit, len(results))] {
-		hits = append(hits, Hit{ID: res.id, Coverage: res.score.coverage, Score: res.score.score})
+		hits = append(hits, Hit{Group: res.id.Group(), ID: res.id.ID(), Coverage: res.score.coverage, Score: res.score.score})
 	}
 
 	return hits

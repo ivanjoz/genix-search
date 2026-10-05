@@ -2,6 +2,7 @@
 package query
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
@@ -21,6 +22,23 @@ type Term struct {
 	Position int  // in the query, for the query-position bonus
 	Auto     bool // the last word: also matches as a prefix
 	Explicit bool // `foo*`: matches only as a prefix, and is required
+	// Conts are the keys of a one-letter term: its continuation of every
+	// host word of the query (PLAN_BUCKETS.md §16). "m talla" looks for
+	// talla›m. Nil for any other term.
+	Conts []key5.Key
+}
+
+// letter reports a one-letter term, matched through its continuations.
+func (t *Term) letter() bool { return t.Conts != nil }
+
+// exactKeys are the keys the term matches exactly: its own, or its
+// continuations.
+func (t *Term) exactKeys() []key5.Key {
+	if t.letter() {
+		return t.Conts
+	}
+
+	return []key5.Key{t.Token.Key}
 }
 
 // Parsed is a query split into terms.
@@ -30,16 +48,20 @@ type Parsed struct {
 
 // Parse splits a query: only the first `*` term counts (later ones are
 // dropped), and without one the last complete word also acts as a prefix.
+//
+// A one-letter word continues the host words of the query, wherever they
+// are: it goes after them, so "m talla" is "talla m", and matches talla›m.
+// With no host word it is dropped. It is never a prefix: "m*" is "m".
 func Parse(norm *normalize.Normalizer, input string) Parsed {
 	var words []string
 	var explicit string
 
 	for _, raw := range strings.Fields(input) {
 		if body, ok := strings.CutSuffix(raw, "*"); ok {
-			if explicit == "" {
-				if tokens := norm.Normalize(body); len(tokens) > 0 {
-					explicit = tokens[0]
-				}
+			if tokens := norm.Normalize(body); len(tokens) > 0 && key5.IsLetter(tokens[0]) {
+				words = append(words, norm.Tokens(body)...)
+			} else if explicit == "" && len(tokens) > 0 {
+				explicit = tokens[0]
 			}
 
 			continue
@@ -50,16 +72,44 @@ func Parse(norm *normalize.Normalizer, input string) Parsed {
 
 	words = words[:min(len(words), MaxWords)]
 
+	var hosts []key5.Key
+	var letters []string
 	var p Parsed
 
 	for i, w := range words {
-		t := newTerm(w, i)
+		if key5.IsLetter(w) {
+			letters = append(letters, w)
+
+			continue
+		}
+
+		// The last word typed is the open one; a letter typed before it
+		// moves behind it ("m tal" is "tal m", tal still open).
+		t := newTerm(w, len(p.Terms))
 		t.Auto = explicit == "" && i == len(words)-1
 		p.Terms = append(p.Terms, t)
+
+		if k := t.Token.Key; k.IsHost() && !slices.Contains(hosts, k) {
+			hosts = append(hosts, k)
+		}
+	}
+
+	if len(hosts) > 0 {
+		for _, w := range letters {
+			t := newTerm(w, len(p.Terms))
+			// Hosts that share their first 6 letters share the continuation.
+			for _, h := range hosts {
+				if k := key5.Continuation(h, key5.Unit(w[0])); !slices.Contains(t.Conts, k) {
+					t.Conts = append(t.Conts, k)
+				}
+			}
+
+			p.Terms = append(p.Terms, t)
+		}
 	}
 
 	if explicit != "" {
-		t := newTerm(explicit, len(words))
+		t := newTerm(explicit, len(p.Terms))
 		t.Explicit = true
 		p.Terms = append(p.Terms, t)
 	}

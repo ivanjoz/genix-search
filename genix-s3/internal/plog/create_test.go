@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/blob"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/docid"
 )
 
 func readLog(t *testing.T, store blob.Blob, key string) *Log {
@@ -103,7 +104,7 @@ func TestCreateRace(t *testing.T) {
 
 	for i := range writers {
 		wg.Go(func() {
-			_, errs[i] = Append(ctx, store, "p.log", normID, []Change{{ID: uint32(i + 1), Tokens: tokens("polo")}}, opts)
+			_, errs[i] = Append(ctx, store, "p.log", normID, []Change{{ID: docid.Key(i + 1), Tokens: tokens("polo")}}, opts)
 		})
 	}
 
@@ -131,7 +132,7 @@ func TestStaleCompact(t *testing.T) {
 	now := time.UnixMilli(1_000_000)
 	opts := AppendOptions{CompactBytes: 1, Create: true, StaleCompact: time.Minute, Now: func() time.Time { return now }}
 
-	put := func(id uint32) AppendResult {
+	put := func(id docid.Key) AppendResult {
 		t.Helper()
 
 		res, err := Append(ctx, store, "p.log", normID, []Change{{ID: id, Tokens: tokens("polo")}}, opts)

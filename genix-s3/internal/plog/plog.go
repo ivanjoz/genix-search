@@ -1,7 +1,7 @@
 // Package plog is p.log, the change log every query reads (PLAN_5BIT.md §5.4,
 // PLAN_BUCKETS.md §7). It is plain bytes: a fixed Base, then one frame per
-// append. It holds no text: each op carries the document's ID and its 5-bit
-// tokens.
+// append. It holds no text: each op carries the document's key (its group and
+// ID, docid) and its 5-bit tokens.
 //
 // A collection under the index threshold (PLAN_5BIT.md §5.8) has no index:
 // its Base is flagged LogOnly and is followed by one Docs frame with every
@@ -15,10 +15,12 @@ import (
 	"hash/crc32"
 	"math"
 	"time"
+
+	"github.com/ivanjoz/genix-search/genix-s3/internal/docid"
 )
 
 // Format is the layout version of p.log.
-const Format uint16 = 2
+const Format uint16 = 3
 
 // Slots is the number of buckets, one per pair of leading 5-bit units.
 const Slots = 1024
@@ -27,8 +29,8 @@ const (
 	magic      = "GXL1"
 	BaseSize   = 176
 	baseCRC    = BaseSize - 4
-	frameHead  = 9 // tag u8 | len u32 | crc32c u32
-	opHead     = 7 // ID u32 | flags u8 | tokLen u16
+	frameHead  = 9              // tag u8 | len u32 | crc32c u32
+	opHead     = docid.Size + 3 // key (ID u32 | group u8) | flags u8 | tokLen u16
 	flagDel    = 1
 	tagBatch   = 1
 	tagCompact = 2
@@ -36,7 +38,7 @@ const (
 	// baseLogOnly is bit 0 of the Base flags (offset 6); the grouping is
 	// their high byte (offset 7).
 	baseLogOnly = 1
-	docHead     = 6 // ID u32 | tokLen u16
+	docHead     = docid.Size + 2 // key | tokLen u16
 	// MaxTokens is the largest token stream of one document.
 	MaxTokens = math.MaxUint16
 	maxBatch  = math.MaxUint16
@@ -82,9 +84,9 @@ func (t *Touched) All() {
 	}
 }
 
-// Doc is a document of the Docs frame: its ID and its key5 token stream.
+// Doc is a document of the Docs frame: its key and its key5 token stream.
 type Doc struct {
-	ID     uint32
+	ID     docid.Key
 	Tokens []byte
 }
 
@@ -92,7 +94,7 @@ type Doc struct {
 // the document (key5.AppendTokens); empty for a delete.
 type Op struct {
 	Seq    uint64
-	ID     uint32
+	ID     docid.Key
 	Del    bool
 	Tokens []byte
 }
@@ -106,7 +108,7 @@ type Compact struct {
 // Log is a parsed p.log.
 type Log struct {
 	Base     Base
-	Docs     []Doc // LogOnly: every document as of Base.LastSeq, sorted by ID
+	Docs     []Doc // LogOnly: every document as of Base.LastSeq, sorted by key
 	Ops      []Op
 	Compacts []Compact
 	// Size is the number of valid bytes, which is the offset of the next append.
@@ -155,7 +157,7 @@ func AppendBatch(dst []byte, ops []Op) ([]byte, error) {
 			}
 
 			if len(op.Tokens) > MaxTokens {
-				return nil, fmt.Errorf("plog: document %d has %d bytes of tokens, at most %d", op.ID, len(op.Tokens), MaxTokens)
+				return nil, fmt.Errorf("plog: document %v has %d bytes of tokens, at most %d", op.ID, len(op.Tokens), MaxTokens)
 			}
 
 			var flags byte
@@ -163,7 +165,7 @@ func AppendBatch(dst []byte, ops []Op) ([]byte, error) {
 				flags |= flagDel
 			}
 
-			body = binary.LittleEndian.AppendUint32(body, op.ID)
+			body = docid.Append(body, op.ID)
 			body = append(body, flags)
 			body = binary.LittleEndian.AppendUint16(body, uint16(len(op.Tokens)))
 			body = append(body, op.Tokens...)
@@ -177,20 +179,21 @@ func AppendBatch(dst []byte, ops []Op) ([]byte, error) {
 }
 
 // AppendDocs appends the Docs frame of a LogOnly base: n u32, then per
-// document ID u32 | tokLen u16 | tokens. docs must be sorted by ID.
+// document key (ID u32 | group u8) | tokLen u16 | tokens. docs must be sorted
+// by key.
 func AppendDocs(dst []byte, docs []Doc) ([]byte, error) {
 	body := binary.LittleEndian.AppendUint32(nil, uint32(len(docs)))
 
 	for i, doc := range docs {
 		if i > 0 && doc.ID <= docs[i-1].ID {
-			return nil, errors.New("plog: documents not sorted by ID")
+			return nil, errors.New("plog: documents not sorted by key")
 		}
 
 		if len(doc.Tokens) > MaxTokens {
-			return nil, fmt.Errorf("plog: document %d has %d bytes of tokens, at most %d", doc.ID, len(doc.Tokens), MaxTokens)
+			return nil, fmt.Errorf("plog: document %v has %d bytes of tokens, at most %d", doc.ID, len(doc.Tokens), MaxTokens)
 		}
 
-		body = binary.LittleEndian.AppendUint32(body, doc.ID)
+		body = docid.Append(body, doc.ID)
 		body = binary.LittleEndian.AppendUint16(body, uint16(len(doc.Tokens)))
 		body = append(body, doc.Tokens...)
 	}
@@ -216,8 +219,8 @@ func parseDocs(body []byte) ([]Doc, error) {
 			return nil, errors.New("short doc")
 		}
 
-		docs[i].ID = binary.LittleEndian.Uint32(body[at:])
-		tokLen := int(binary.LittleEndian.Uint16(body[at+4:]))
+		docs[i].ID = docid.Read(body[at:])
+		tokLen := int(binary.LittleEndian.Uint16(body[at+docid.Size:]))
 		at += docHead
 
 		if len(body)-at < tokLen {
@@ -390,9 +393,9 @@ func parseBatch(body []byte) ([]Op, error) {
 
 		op := &ops[i]
 		op.Seq = first + uint64(i)
-		op.ID = binary.LittleEndian.Uint32(body[at:])
-		op.Del = body[at+4]&flagDel != 0
-		tokLen := int(binary.LittleEndian.Uint16(body[at+5:]))
+		op.ID = docid.Read(body[at:])
+		op.Del = body[at+docid.Size]&flagDel != 0
+		tokLen := int(binary.LittleEndian.Uint16(body[at+docid.Size+1:]))
 		at += opHead
 
 		if len(body)-at < tokLen {
@@ -420,10 +423,10 @@ func (l *Log) LastSeq() uint64 {
 	return last
 }
 
-// Pending returns, per ID, the last op the base does not include yet: the
-// overlay a query applies on top of k and p.
-func (l *Log) Pending() map[uint32]Op {
-	pending := make(map[uint32]Op)
+// Pending returns, per document, the last op the base does not include yet:
+// the overlay a query applies on top of the index.
+func (l *Log) Pending() map[docid.Key]Op {
+	pending := make(map[docid.Key]Op)
 
 	for _, op := range l.Ops {
 		if op.Seq <= l.Base.LastSeq {
@@ -441,7 +444,7 @@ func (l *Log) Pending() map[uint32]Op {
 // LiveDocs is the number of documents once the pending ops apply, for a
 // LogOnly log (Docs plus Pending).
 func (l *Log) LiveDocs() int {
-	live := make(map[uint32]bool, len(l.Docs))
+	live := make(map[docid.Key]bool, len(l.Docs))
 	for _, doc := range l.Docs {
 		live[doc.ID] = true
 	}

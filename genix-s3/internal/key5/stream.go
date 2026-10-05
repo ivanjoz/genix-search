@@ -282,11 +282,17 @@ func ReadTokens(data []byte) ([]Token, error) {
 		switch {
 		case header == End:
 		case header <= MaxUnits:
+			// End only as the mark of a continuation: after a host of two
+			// letters or more, before the last unit.
 			for i := range int(header) {
 				units[i] = uint8(r.Read(5))
-				if u := units[i]; u == End || (u >= Num1 && u <= Num3) {
+				if u := units[i]; (u >= Num1 && u <= Num3) || (u == End && (i != int(header)-2 || header < 4)) {
 					return nil, ErrCorrupt
 				}
+			}
+
+			if units[header-1] == End {
+				return nil, ErrCorrupt
 			}
 
 			tokens = append(tokens, Token{Key: FromUnits(units[:header])})

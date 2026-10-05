@@ -111,7 +111,7 @@ func TestLifecycle(t *testing.T) {
 		t.Fatalf("concurrent puts: %v", errs)
 	}
 
-	if _, err := ix.Delete(ctx, 11); err != nil {
+	if _, err := ix.Delete(ctx, genix.Ref{ID: 11}); err != nil {
 		t.Fatal(err)
 	}
 

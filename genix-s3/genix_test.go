@@ -22,7 +22,7 @@ func TestPublicAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := ix.Init(ctx, []Doc{{ID: 10, Text: "Polo Spiderman rojo"}, {ID: 20, Text: "Piña"}}); err != nil {
+	if err := ix.Init(ctx, []Doc{{ID: 10, Text: "Polo Spiderman rojo"}, {Group: 9, ID: 20, Text: "Piña"}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -47,7 +47,7 @@ func TestPublicAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(resp.Hits) != 1 || resp.Hits[0].ID != 20 {
+	if len(resp.Hits) != 1 || resp.Hits[0].ID != 20 || resp.Hits[0].Group != 9 {
 		t.Fatalf("piña: %+v", resp)
 	}
 

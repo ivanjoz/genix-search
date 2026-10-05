@@ -14,6 +14,7 @@ import (
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/blob"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/bucket"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/docid"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/layout"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/normalize"
@@ -62,9 +63,10 @@ type Request struct {
 	Fuzzy  bool
 }
 
-// Hit is one result: the ID, which the caller resolves in its own database,
-// and how it ranked.
+// Hit is one result: the document, its group and its ID in it, which the
+// caller resolves in its own database, and how it ranked.
 type Hit struct {
+	Group    uint8
 	ID       uint32
 	Coverage uint32
 	Score    uint32
@@ -404,7 +406,7 @@ func (e *Engine) answer(ctx context.Context, q Parsed, req Request, p *readPlan,
 			resp.Hits = make([]Hit, 0, to-from)
 
 			for _, r := range results[from:to] {
-				resp.Hits = append(resp.Hits, Hit{ID: r.id, Coverage: r.score.coverage, Score: r.score.score})
+				resp.Hits = append(resp.Hits, Hit{Group: r.id.Group(), ID: r.id.ID(), Coverage: r.score.coverage, Score: r.score.score})
 			}
 
 			return nil
@@ -780,7 +782,7 @@ func (e *Engine) searchLog(q Parsed, req Request, log *plog.Log, resp *Response)
 	pending := log.Pending()
 
 	docs := make([][]key5.Token, 0, len(log.Docs))
-	ids := make([]uint32, 0, len(log.Docs))
+	ids := make([]docid.Key, 0, len(log.Docs))
 
 	for _, doc := range log.Docs {
 		if _, changed := pending[doc.ID]; changed {
@@ -789,7 +791,7 @@ func (e *Engine) searchLog(q Parsed, req Request, log *plog.Log, resp *Response)
 
 		tokens, err := key5.ReadTokens(doc.Tokens)
 		if err != nil {
-			return fmt.Errorf("query: p.log document %d: %w", doc.ID, err)
+			return fmt.Errorf("query: p.log document %v: %w", doc.ID, err)
 		}
 
 		docs = append(docs, tokens)
@@ -832,7 +834,7 @@ func (e *Engine) searchLog(q Parsed, req Request, log *plog.Log, resp *Response)
 	resp.Hits = make([]Hit, 0, to-from)
 
 	for _, r := range results[from:to] {
-		resp.Hits = append(resp.Hits, Hit{ID: r.id, Coverage: r.score.coverage, Score: r.score.score})
+		resp.Hits = append(resp.Hits, Hit{Group: r.id.Group(), ID: r.id.ID(), Coverage: r.score.coverage, Score: r.score.score})
 	}
 
 	resp.Stats.LogOnly = true

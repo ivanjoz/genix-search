@@ -13,6 +13,7 @@ import (
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/blob"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/bucket"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/docid"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/layout"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/normalize"
@@ -78,7 +79,7 @@ func (c *Collection) indexed(n int) bool {
 
 // logOnlyLog is the start of the p.log of a collection without index: the
 // Base, flagged LogOnly, and the Docs frame with every document.
-func (c *Collection) logOnlyLog(base plog.Base, byID map[uint32][]byte) ([]byte, error) {
+func (c *Collection) logOnlyLog(base plog.Base, byID map[docid.Key][]byte) ([]byte, error) {
 	base.LogOnly = true
 	base.Docs = uint32(len(byID))
 	base.Touched = plog.Touched{}
@@ -86,7 +87,7 @@ func (c *Collection) logOnlyLog(base plog.Base, byID map[uint32][]byte) ([]byte,
 	return plog.AppendDocs(plog.EncodeBase(base), sortedDocs(byID))
 }
 
-func sortedDocs(byID map[uint32][]byte) []plog.Doc {
+func sortedDocs(byID map[docid.Key][]byte) []plog.Doc {
 	docs := make([]plog.Doc, 0, len(byID))
 	for id, tokens := range byID {
 		docs = append(docs, plog.Doc{ID: id, Tokens: tokens})
@@ -121,9 +122,25 @@ func New(store blob.Blob, col layout.Collection, norm *normalize.Normalizer, opt
 // Doc is a document as the caller sends it. The text is normalized on
 // arrival; only its 5-bit tokens are stored.
 type Doc struct {
-	ID   uint32
-	Text string
+	// Group and ID are the document: an ID is unique within its group, and
+	// a document never changes group. The group is returned with every hit
+	// and takes no part in the score.
+	Group uint8
+	ID    uint32
+	Text  string
 }
+
+// Ref names a document: its group and its ID in it.
+type Ref struct {
+	Group uint8
+	ID    uint32
+}
+
+// Key is the index key of the document.
+func (d Doc) Key() docid.Key { return docid.New(d.Group, d.ID) }
+
+// Key is the index key of the document.
+func (r Ref) Key() docid.Key { return docid.New(r.Group, r.ID) }
 
 // Tokens is the key5 token stream of a text.
 func (c *Collection) Tokens(text string) []byte {
@@ -137,9 +154,9 @@ var ErrExists = errors.New("collection: already exists")
 // MinIndexDocs on, the compaction that builds the index from it. No bucket is
 // written before p.log exists, so a failed Init leaves nothing a query reads.
 func (c *Collection) Init(ctx context.Context, docs []Doc) (CompactResult, error) {
-	byID := make(map[uint32][]byte, len(docs))
+	byID := make(map[docid.Key][]byte, len(docs))
 	for _, doc := range docs {
-		byID[doc.ID] = c.Tokens(doc.Text) // a repeated ID keeps its last version
+		byID[doc.Key()] = c.Tokens(doc.Text) // a repeated document keeps its last version
 	}
 
 	data, err := c.logOnlyLog(plog.Base{NormID: c.norm.ID(), UnixMs: c.opts.Now().UnixMilli()}, byID)
@@ -168,23 +185,23 @@ func (c *Collection) Put(ctx context.Context, docs []Doc) (plog.AppendResult, er
 }
 
 // Delete appends deletes to p.log.
-func (c *Collection) Delete(ctx context.Context, ids ...uint32) (plog.AppendResult, error) {
-	return c.Apply(ctx, nil, ids)
+func (c *Collection) Delete(ctx context.Context, refs ...Ref) (plog.AppendResult, error) {
+	return c.Apply(ctx, nil, refs)
 }
 
 // Apply appends new versions of puts and the deletes of dels to p.log as one
 // batch: one read and one append, whatever the mix. The deletes go last, so
-// an ID in both ends up deleted. A collection that does not exist yet is
+// a document in both ends up deleted. A collection that does not exist yet is
 // created by its first put; deletes alone leave it missing.
-func (c *Collection) Apply(ctx context.Context, puts []Doc, dels []uint32) (plog.AppendResult, error) {
+func (c *Collection) Apply(ctx context.Context, puts []Doc, dels []Ref) (plog.AppendResult, error) {
 	changes := make([]plog.Change, 0, len(puts)+len(dels))
 
 	for _, doc := range puts {
-		changes = append(changes, plog.Change{ID: doc.ID, Tokens: c.Tokens(doc.Text)})
+		changes = append(changes, plog.Change{ID: doc.Key(), Tokens: c.Tokens(doc.Text)})
 	}
 
-	for _, id := range dels {
-		changes = append(changes, plog.Change{ID: id, Del: true})
+	for _, ref := range dels {
+		changes = append(changes, plog.Change{ID: ref.Key(), Del: true})
 	}
 
 	if len(changes) == 0 {

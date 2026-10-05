@@ -36,9 +36,12 @@ const (
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
 // Normalizer is the normalizer of one collection: the fixed rules plus the
-// two extra letters its owner configured.
+// two extra letters its owner configured, and whether it keeps stopwords.
 type Normalizer struct {
 	extra [2]rune
+	// keepStopwords indexes and matches the stopwords too: "Salón A", where
+	// "a" is a name, not a preposition.
+	keepStopwords bool
 }
 
 // Default has no extra letters.
@@ -71,15 +74,32 @@ func New(extra [2]rune) (*Normalizer, error) {
 // Extra returns the configured extra letters.
 func (n *Normalizer) Extra() [2]rune { return n.extra }
 
-// ID is NormID: CRC32C of the version and the extra letters. Every file
-// carries it, and a reader rejects a file with another one.
+// WithStopwords returns the normalizer that keeps the stopwords, or drops
+// them (the default).
+func (n *Normalizer) WithStopwords(keep bool) *Normalizer {
+	c := *n
+	c.keepStopwords = keep
+
+	return &c
+}
+
+// KeepsStopwords reports a normalizer that keeps the stopwords.
+func (n *Normalizer) KeepsStopwords() bool { return n.keepStopwords }
+
+// ID is NormID: CRC32C of the version, the extra letters and, when set, the
+// flag that keeps stopwords. Every file carries it, and a reader rejects a
+// file with another one.
 func (n *Normalizer) ID() uint32 {
-	var buf [10]byte
+	buf := make([]byte, 10, 11)
 	binary.LittleEndian.PutUint16(buf[0:], Version)
 	binary.LittleEndian.PutUint32(buf[2:], uint32(n.extra[0]))
 	binary.LittleEndian.PutUint32(buf[6:], uint32(n.extra[1]))
 
-	return crc32.Checksum(buf[:], castagnoli)
+	if n.keepStopwords {
+		buf = append(buf, 1)
+	}
+
+	return crc32.Checksum(buf, castagnoli)
 }
 
 // maxRun is how many times in a row a letter is kept; a longer run is cut.
@@ -149,9 +169,14 @@ func (n *Normalizer) Normalize(input string) []string {
 	return tokens
 }
 
-// Tokens is Normalize without Spanish stopwords: what gets indexed and scored.
+// Tokens is Normalize without Spanish stopwords, unless the normalizer keeps
+// them: what gets indexed and scored.
 func (n *Normalizer) Tokens(input string) []string {
 	tokens := n.Normalize(input)
+	if n.keepStopwords {
+		return tokens
+	}
+
 	kept := tokens[:0]
 
 	for _, token := range tokens {

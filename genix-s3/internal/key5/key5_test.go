@@ -255,3 +255,72 @@ func TestKeyDistance(t *testing.T) {
 		}
 	}
 }
+
+// TestContinuations: a one-letter word is a key of every host word before it,
+// in the host's slot, right after the host; every stream carries it whole.
+func TestContinuations(t *testing.T) {
+	str := func(tokens []Token) string {
+		var out []string
+		for _, tok := range tokens {
+			out = append(out, tok.Key.String())
+		}
+
+		return strings.Join(out, " ")
+	}
+
+	cases := map[string]string{
+		"polo rojo m":           "polo rojo rojo›m polo›m",
+		"m polo":                "polo",                         // nothing before the letter
+		"polo rojo azul m":      "polo rojo azul azul›m rojo›m", // the 2 nearest
+		"polo rojo azul polo m": "polo rojo azul polo polo›m azul›m",
+		"polo polo m":           "polo polo polo›m",          // one continuation per host
+		"vitamina c 500 mg":     "vitamina vitami›c #500 mg", // the host cut to 6 units
+		"talla 40 x l":          "talla #40 talla›x talla›l", // numbers and letters are not hosts
+		"camiseta camisetas m":  "camiseta camiseta camise›m",
+	}
+
+	for in, want := range cases {
+		tokens := FromTokens(strings.Fields(in))
+		if got := str(tokens); got != want {
+			t.Errorf("%q: %q, want %q", in, got, want)
+		}
+
+		back, err := ReadTokens(AppendTokens(nil, tokens))
+		if err != nil || !slices.Equal(back, tokens) {
+			t.Errorf("%q: stream %v %v", in, err, back)
+		}
+	}
+
+	talla := Word("talla").Key
+	m := Continuation(talla, Unit('m'))
+
+	if !m.IsContinuation() || m.IsHost() || talla.IsContinuation() || !talla.IsHost() || Word("m").Key.IsHost() || m.Slot() != talla.Slot() {
+		t.Fatal("continuation predicates")
+	}
+
+	if !(talla < m && m < Word("tallaa").Key) || m.Len() != 7 {
+		t.Fatalf("talla›m sorts at %v, len %d", m, m.Len())
+	}
+
+	// The dictionary of a slot and a list of keys of any slot.
+	keys := []Key{talla, m, Continuation(talla, Unit('x')), Word("tallas").Key, Continuation(Word("tallarin").Key, Unit('a'))}
+	slices.Sort(keys)
+
+	w := bits.NewWriter(nil)
+	if err := AppendBucket(w, keys); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, err := ReadSlot(bits.NewReader(w.Bytes(), 0), talla.Slot(), len(keys)); err != nil || !slices.Equal(got, keys) {
+		t.Fatalf("slot stream: %v %v", got, err)
+	}
+
+	w = bits.NewWriter(nil)
+	if err := AppendKeys(w, keys); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, err := ReadKeys(bits.NewReader(w.Bytes(), 0), len(keys)); err != nil || !slices.Equal(got, keys) {
+		t.Fatalf("key stream: %v %v", got, err)
+	}
+}

@@ -10,6 +10,7 @@ import (
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/blob"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/bucket"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/docid"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/layout"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/parallel"
@@ -34,7 +35,7 @@ type CompactResult struct {
 // Compact folds the pending ops of p.log into the index (PLAN_BUCKETS.md §8):
 //
 //  1. Take the lease.
-//  2. Read p.log and tokens; apply the ops to the ID → tokens state.
+//  2. Read p.log and tokens; apply the ops to the document → tokens state.
 //  3. Wait until CompactSpacing has passed since the last compaction.
 //  4. Build the whole index in memory and write the buckets whose content
 //     changed: <xy>.db first, then <xy>.idx with its ETag.
@@ -95,12 +96,12 @@ type state struct {
 	tok *tokens.State // nil when missing or unreadable
 }
 
-// current is the ID → tokens state the base of the log stands for: the Docs
+// current is the document → tokens state the base of the log stands for: the Docs
 // frame of a LogOnly log, or tokens. A tokens object ahead of the log (a
 // compaction that died after writing it) is as good: the ops are idempotent.
-func (s *state) current() (map[uint32][]byte, error) {
+func (s *state) current() (map[docid.Key][]byte, error) {
 	base := s.log.Base
-	byID := map[uint32][]byte{}
+	byID := map[docid.Key][]byte{}
 
 	if s.tok != nil && s.tok.Epoch >= base.Epoch && s.tok.Seq >= base.LastSeq {
 		for _, doc := range s.tok.Docs {
@@ -169,7 +170,7 @@ func (c *Collection) readState(ctx context.Context, res *CompactResult) (*state,
 
 // publish writes the state byID as of target on top of the log of st, and
 // commits it by rebasing p.log. full writes every bucket in a new epoch.
-func (c *Collection) publish(ctx context.Context, l *lease, st *state, byID map[uint32][]byte, target uint64, full bool, res *CompactResult) error {
+func (c *Collection) publish(ctx context.Context, l *lease, st *state, byID map[docid.Key][]byte, target uint64, full bool, res *CompactResult) error {
 	base, tok := st.log.Base, st.tok
 
 	res.Docs = len(byID)
@@ -246,7 +247,7 @@ func (c *Collection) publish(ctx context.Context, l *lease, st *state, byID map[
 	for _, d := range sortedDocs(byID) {
 		toks, err := key5.ReadTokens(d.Tokens)
 		if err != nil {
-			return fmt.Errorf("collection: document %d: %w", d.ID, err)
+			return fmt.Errorf("collection: document %v: %w", d.ID, err)
 		}
 
 		docs = append(docs, bucket.Doc{ID: d.ID, Tokens: toks})

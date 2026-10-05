@@ -31,11 +31,13 @@ const (
 
 // ClientOptions configure a Client.
 type ClientOptions struct {
-	Root         string   // key prefix in the bucket; default "genix/"
-	Extra        [2]rune  // see Config.Extra: the same for every collection
-	MinIndexDocs int      // see Config.MinIndexDocs
-	Grouping     Grouping // see Config.Grouping: the same for every collection
-	Search       SearchOptions
+	Root  string  // key prefix in the bucket; default "genix/"
+	Extra [2]rune // see Config.Extra: the same for every collection
+	// KeepStopwords: see Config.KeepStopwords; the same for every collection.
+	KeepStopwords bool
+	MinIndexDocs  int      // see Config.MinIndexDocs
+	Grouping      Grouping // see Config.Grouping: the same for every collection
+	Search        SearchOptions
 	// MaxSearchers bounds the searchers kept, one per partition searched,
 	// each with the .idx it cached. Default 256.
 	MaxSearchers int
@@ -82,6 +84,8 @@ func NewClient(store Blob, opts ClientOptions) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	norm = norm.WithStopwords(opts.KeepStopwords)
 
 	if _, err := opts.Grouping.layout(); err != nil {
 		return nil, err
@@ -143,9 +147,10 @@ type ApplyResult struct {
 }
 
 // Apply writes puts and deletes to a partition as one batch of p.log: one
-// read and one append, whatever the mix. An ID in both ends up deleted. The
-// first put creates the partition; deletes alone on a missing one do nothing.
-func (c *Client) Apply(ctx context.Context, collection, partition string, puts []Doc, dels []uint32) (ApplyResult, error) {
+// read and one append, whatever the mix. A document in both ends up deleted.
+// The first put creates the partition; deletes alone on a missing one do
+// nothing.
+func (c *Client) Apply(ctx context.Context, collection, partition string, puts []Doc, dels []Ref) (ApplyResult, error) {
 	var res ApplyResult
 
 	k := partKey{collection, partition}

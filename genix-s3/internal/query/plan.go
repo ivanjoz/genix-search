@@ -52,10 +52,14 @@ type readPlan struct {
 // one. Several slots may share a bucket.
 type indexSource func(slot uint16) *bucket.Index
 
-// termSlots are the buckets a term needs: its own (exact key and typos) and
-// those of its prefix ranges.
+// termSlots are the buckets a term needs: its own (exact key and typos), or
+// those of its host words for a one-letter term, and those of its prefix
+// ranges.
 func termSlots(t *Term) []uint16 {
-	slots := []uint16{t.Token.Key.Slot()}
+	var slots []uint16
+	for _, k := range t.exactKeys() {
+		slots = append(slots, k.Slot())
+	}
 
 	for _, r := range t.prefixRanges() {
 		for s := r.lo.Slot(); s <= r.hi.Slot(); s++ {
@@ -108,11 +112,13 @@ func planQuery(terms []Term, source indexSource, budget int64, fuzzy bool) *read
 		found := false
 
 		if !t.Explicit {
-			if x := source(t.Token.Key.Slot()); x != nil {
-				if w, ok := x.Find(t.Token.Key); ok {
-					p.add(candidate{x: x, w: w}, use{term: i, kind: exactKey})
-					p.df[i] += int(w.DF)
-					found = true
+			for _, k := range t.exactKeys() {
+				if x := source(k.Slot()); x != nil {
+					if w, ok := x.Find(k); ok {
+						p.add(candidate{x: x, w: w}, use{term: i, kind: exactKey})
+						p.df[i] += int(w.DF)
+						found = true
+					}
 				}
 			}
 		}
@@ -135,7 +141,7 @@ func planQuery(terms []Term, source indexSource, budget int64, fuzzy bool) *read
 
 						in := x.Range(r.lo, r.hi)
 						for j := range in {
-							if w := &in[j]; w.Key != t.Token.Key || t.Explicit {
+							if w := &in[j]; (w.Key != t.Token.Key || t.Explicit) && !w.Key.IsContinuation() {
 								prefix = append(prefix, candidate{x: x, w: w})
 							}
 						}

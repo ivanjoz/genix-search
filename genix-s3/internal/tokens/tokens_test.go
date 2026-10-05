@@ -6,6 +6,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/ivanjoz/genix-search/genix-s3/internal/docid"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
 )
 
@@ -22,7 +23,7 @@ func TestRoundTrip(t *testing.T) {
 		}
 
 		for i := range n {
-			s.Docs = append(s.Docs, Doc{ID: uint32(i * 3), Tokens: []byte(fmt.Sprint("tokens of ", i))[:i%15]})
+			s.Docs = append(s.Docs, Doc{ID: docid.New(uint8(i/700), uint32(i*3)), Tokens: []byte(fmt.Sprint("tokens of ", i))[:i%15]})
 		}
 
 		data, err := Encode(s)

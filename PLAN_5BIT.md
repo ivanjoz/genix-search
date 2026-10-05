@@ -42,7 +42,7 @@ Lo único "aprendido" que lee el backend es el propio índice. No hay diccionari
 ### 2.1 Tabla recomendada: 26 letras, sin pérdida
 
 ```
-0       END   fin de palabra (solo en el slot de una palabra de 1 letra: "x", "l")
+0       END   fin de palabra; dentro de una clave, la marca de una continuación (PLAN_BUCKETS.md 16)
 1..26   a..z  (después del normalizador: sin acentos, ñ → n)
 27      NUM_1 le sigue 1 unidad:  número uint5  (sección 4)
 28      NUM_2 le siguen 2 unidades: número uint10

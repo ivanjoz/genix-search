@@ -1,10 +1,15 @@
 // Package key5 turns tokens into keys of 5-bit units (PLAN_5BIT.md §2–4):
 // a word is its first 8 letters, a number is NUM_n plus n units holding its
 // value in binary. The first two units are the key's slot.
+//
+// A word of one letter has no key of its own: it is a continuation of the
+// two words before it in the document (PLAN_BUCKETS.md §16). "Polo rojo M"
+// holds rojo›m and polo›m, each in the slot of its host word.
 package key5
 
 import (
 	"hash/crc32"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -13,7 +18,7 @@ import (
 
 // The 5-bit table.
 const (
-	End    uint8 = 0  // end of word: only seen as the second unit of a one-letter word
+	End    uint8 = 0  // end of word; inside a key, the mark of a continuation
 	Num1   uint8 = 27 // followed by 1 unit: uint5
 	Num2   uint8 = 28 // followed by 2 units: uint10
 	Num3   uint8 = 29 // followed by 3 units: uint15
@@ -99,18 +104,44 @@ func (k Key) IsNumber() bool {
 	return u >= Num1 && u <= Num3
 }
 
-// Len is the number of units: n+1 for a number, the letters for a word.
+// Len is the number of units: n+1 for a number, the letters for a word,
+// and for a continuation its host's, the mark and the letter.
 func (k Key) Len() int {
 	if k.IsNumber() {
 		return int(k.Unit(0)-Num1) + 2
 	}
 
-	n := 0
-	for n < MaxUnits && k.Unit(n) != End {
-		n++
+	n := MaxUnits
+	for n > 0 && k.Unit(n-1) == End {
+		n--
 	}
 
 	return n
+}
+
+// MaxHost is the units of the host word a continuation keeps.
+const MaxHost = MaxUnits - 2
+
+// Continuation is the key of the one-letter word letter after the word host
+// (§16): host's first MaxHost units, End and the letter. It sorts right after
+// host and lives in host's slot.
+func Continuation(host Key, letter uint8) Key {
+	n := min(host.Len(), MaxHost)
+
+	return host.prefix(n) | Key(letter&31)<<(35-5*(n+1))
+}
+
+// IsContinuation reports the key of a one-letter word after a host word.
+func (k Key) IsContinuation() bool {
+	n := k.Len()
+
+	return !k.IsNumber() && n >= 4 && k.Unit(n-2) == End
+}
+
+// IsHost reports a key a one-letter word continues: a word of two letters
+// or more.
+func (k Key) IsHost() bool {
+	return !k.IsNumber() && !k.IsContinuation() && k.Len() >= 2
 }
 
 // Units appends the key's units to dst.
@@ -140,7 +171,11 @@ func (k Key) String() string {
 
 	var b strings.Builder
 	for i := range k.Len() {
-		b.WriteByte(Letter(k.Unit(i)))
+		if u := k.Unit(i); u == End {
+			b.WriteString("›")
+		} else {
+			b.WriteByte(Letter(u))
+		}
 	}
 
 	return b.String()
@@ -214,11 +249,45 @@ func FromToken(token string) Token {
 	return Word(token)
 }
 
-// FromTokens converts a document's normalized tokens.
+// IsLetter reports a normalized token of one letter: a continuation, not a
+// word of its own.
+func IsLetter(token string) bool {
+	return len(token) == 1 && !normalize.IsNumber(token)
+}
+
+// MaxContinued is how many host words a one-letter word continues: the
+// nearest before it. "Polo rojo azul M" holds azul›m and rojo›m, not polo›m.
+const MaxContinued = 2
+
+// FromTokens converts a document's normalized tokens. A one-letter word
+// becomes a continuation of the MaxContinued nearest distinct host words
+// before it, the nearest first, at consecutive positions; with no host
+// before it, it is dropped.
 func FromTokens(tokens []string) []Token {
-	out := make([]Token, len(tokens))
-	for i, token := range tokens {
-		out[i] = FromToken(token)
+	out := make([]Token, 0, len(tokens))
+	var hosts []Key // distinct, the most recent last
+
+	for _, token := range tokens {
+		if !IsLetter(token) {
+			t := FromToken(token)
+			if t.Key.IsHost() {
+				hosts = append(slices.DeleteFunc(hosts, func(k Key) bool { return k == t.Key }), t.Key)
+			}
+
+			out = append(out, t)
+
+			continue
+		}
+
+		letter := Unit(token[0])
+		var done []Key
+
+		for i := len(hosts) - 1; i >= 0 && len(done) < MaxContinued; i-- {
+			if k := Continuation(hosts[i], letter); !slices.Contains(done, k) {
+				done = append(done, k)
+				out = append(out, Token{Key: k})
+			}
+		}
 	}
 
 	return out

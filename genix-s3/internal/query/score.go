@@ -5,6 +5,7 @@ import (
 	"math"
 	"slices"
 
+	"github.com/ivanjoz/genix-search/genix-s3/internal/docid"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
 )
 
@@ -79,7 +80,18 @@ const (
 // typo match for this term (the engine enables it only for terms the
 // dictionary does not have). A typo is never in the first two letters: the
 // key must be in the term's bucket (PLAN_BUCKETS.md §6.1).
+//
+// A one-letter term matches only its continuations, and no other term
+// matches a continuation: talla›m is neither a prefix nor a typo of talla.
 func (t *Term) classifyKey(k key5.Key, fuzzy bool, scratch []uint8) (keyKind, uint8) {
+	if t.letter() || k.IsContinuation() {
+		if t.letter() && slices.Contains(t.Conts, k) {
+			return exactKey, 0
+		}
+
+		return noKey, 0
+	}
+
 	if !t.Explicit && k == t.Token.Key {
 		return exactKey, 0
 	}
@@ -281,8 +293,9 @@ func (s docScore) withIDF(idf []uint32) docScore {
 	return s
 }
 
-// compareScores is the result order: coverage and score descending, then ID.
-func compareScores(a, b docScore, aID, bID uint32) int {
+// compareScores is the result order: coverage and score descending, then the
+// document key (group, then ID), which only breaks ties.
+func compareScores(a, b docScore, aID, bID docid.Key) int {
 	return cmp.Or(
 		cmp.Compare(b.coverage, a.coverage),
 		cmp.Compare(b.score, a.score),
@@ -357,7 +370,7 @@ func fuzzyScore(length, distance int) uint32 {
 
 // Ranked is a scored document.
 type ranked struct {
-	id    uint32
+	id    docid.Key
 	score docScore
 }
 
@@ -381,7 +394,7 @@ func orderRanked(a, b ranked) int { return compareScores(a.score, b.score, a.id,
 func rankAll(terms []Term, cands *candidates, idf []uint32, top int) []ranked {
 	results := make([]ranked, 0, cands.len())
 
-	cands.each(func(id uint32, matches []termMatch) {
+	cands.each(func(id docid.Key, matches []termMatch) {
 		s, ok := scoreDoc(terms, matches)
 		if !ok || s.coverage == 0 {
 			return

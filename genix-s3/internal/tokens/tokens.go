@@ -1,10 +1,11 @@
 // Package tokens is the tokens object of a partition (PLAN_BUCKETS.md §1, §8):
-// the ID → tokens state the index was built from, the expanded words and the
+// the document → tokens state the index was built from, the expanded words and the
 // hash of every bucket. Only the compaction reads it, to know what a changed
 // document had and which buckets it has to rewrite; queries never do.
 package tokens
 
 import (
+	"cmp"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -12,27 +13,28 @@ import (
 	"math"
 	"slices"
 
+	"github.com/ivanjoz/genix-search/genix-s3/internal/docid"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
 )
 
 // Format is the layout version.
-const Format uint16 = 2
+const Format uint16 = 3
 
 const (
 	magic      = "GXT1"
 	headerSize = 48
-	dirEntry   = 16 // FirstID u32 | Off u32 | Len u32 | CRC32C u32
-	slotEntry  = 12 // group u16 | flags u8 | grouping u8 (garbage) | hash u64
-	docHead    = 6  // ID u32 | tokLen u16
+	dirEntry   = 20             // first key u64 | Off u32 | Len u32 | CRC32C u32
+	slotEntry  = 12             // group u16 | flags u8 | grouping u8 (garbage) | hash u64
+	docHead    = docid.Size + 2 // key (ID u32 | group u8) | tokLen u16
 	// ChunkDocs is how many documents go in a chunk.
 	ChunkDocs = 1000
 )
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
-// Doc is one document: its ID and its key5 token stream.
+// Doc is one document: its key and its key5 token stream.
 type Doc struct {
-	ID     uint32
+	ID     docid.Key
 	Tokens []byte
 }
 
@@ -41,7 +43,7 @@ type State struct {
 	NormID   uint32
 	Epoch    uint32
 	Seq      uint64     // the ops up to Seq are in Docs
-	Docs     []Doc      // sorted by ID
+	Docs     []Doc      // sorted by key
 	Expanded []key5.Key // sorted
 	// Grouping is the layout.Grouping ID of Buckets.
 	Grouping uint8
@@ -74,8 +76,8 @@ const (
 // Encode writes s.
 func Encode(s *State) ([]byte, error) {
 	docs := s.Docs
-	if !slices.IsSortedFunc(docs, func(a, b Doc) int { return cmpID(a.ID, b.ID) }) {
-		return nil, errors.New("tokens: documents not sorted by ID")
+	if !slices.IsSortedFunc(docs, func(a, b Doc) int { return cmp.Compare(a.ID, b.ID) }) {
+		return nil, errors.New("tokens: documents not sorted by key")
 	}
 
 	slots := make([]uint16, 0, len(s.Buckets))
@@ -128,14 +130,14 @@ func Encode(s *State) ([]byte, error) {
 
 		for i, doc := range part {
 			if i > 0 && doc.ID == part[i-1].ID || c > 0 && i == 0 && doc.ID == docs[c*ChunkDocs-1].ID {
-				return nil, fmt.Errorf("tokens: document %d twice", doc.ID)
+				return nil, fmt.Errorf("tokens: document %v twice", doc.ID)
 			}
 
 			if len(doc.Tokens) > math.MaxUint16 {
-				return nil, fmt.Errorf("tokens: document %d has %d bytes of tokens", doc.ID, len(doc.Tokens))
+				return nil, fmt.Errorf("tokens: document %v has %d bytes of tokens", doc.ID, len(doc.Tokens))
 			}
 
-			out = binary.LittleEndian.AppendUint32(out, doc.ID)
+			out = docid.Append(out, doc.ID)
 			out = binary.LittleEndian.AppendUint16(out, uint16(len(doc.Tokens)))
 			out = append(out, doc.Tokens...)
 		}
@@ -145,10 +147,10 @@ func Encode(s *State) ([]byte, error) {
 		}
 
 		e := out[headerSize+c*dirEntry:]
-		binary.LittleEndian.PutUint32(e, part[0].ID)
-		binary.LittleEndian.PutUint32(e[4:], uint32(off))
-		binary.LittleEndian.PutUint32(e[8:], uint32(len(out)-off))
-		binary.LittleEndian.PutUint32(e[12:], crc32.Checksum(out[off:], castagnoli))
+		binary.LittleEndian.PutUint64(e, uint64(part[0].ID))
+		binary.LittleEndian.PutUint32(e[8:], uint32(off))
+		binary.LittleEndian.PutUint32(e[12:], uint32(len(out)-off))
+		binary.LittleEndian.PutUint32(e[16:], crc32.Checksum(out[off:], castagnoli))
 	}
 
 	copy(out, magic)
@@ -230,14 +232,14 @@ func Decode(data []byte, normID uint32) (*State, error) {
 
 	for c := range chunks {
 		e := data[headerSize+c*dirEntry:]
-		off, n := int(binary.LittleEndian.Uint32(e[4:])), int(binary.LittleEndian.Uint32(e[8:]))
+		off, n := int(binary.LittleEndian.Uint32(e[8:])), int(binary.LittleEndian.Uint32(e[12:]))
 
 		if off < headerSize+tables || n > len(data) || off+n > len(data) {
 			return nil, fmt.Errorf("tokens: chunk %d out of range", c)
 		}
 
 		chunk := data[off : off+n]
-		if crc32.Checksum(chunk, castagnoli) != binary.LittleEndian.Uint32(e[12:]) {
+		if crc32.Checksum(chunk, castagnoli) != binary.LittleEndian.Uint32(e[16:]) {
 			return nil, fmt.Errorf("tokens: chunk %d CRC", c)
 		}
 
@@ -246,8 +248,8 @@ func Decode(data []byte, normID uint32) (*State, error) {
 				return nil, fmt.Errorf("tokens: chunk %d is cut", c)
 			}
 
-			id := binary.LittleEndian.Uint32(chunk[at:])
-			tokLen := int(binary.LittleEndian.Uint16(chunk[at+4:]))
+			id := docid.Read(chunk[at:])
+			tokLen := int(binary.LittleEndian.Uint16(chunk[at+docid.Size:]))
 			at += docHead
 
 			if len(chunk)-at < tokLen {
@@ -264,15 +266,4 @@ func Decode(data []byte, normID uint32) (*State, error) {
 	}
 
 	return s, nil
-}
-
-func cmpID(a, b uint32) int {
-	switch {
-	case a < b:
-		return -1
-	case a > b:
-		return 1
-	}
-
-	return 0
 }

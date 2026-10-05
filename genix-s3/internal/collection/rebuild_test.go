@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/blob"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/docid"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/layout"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/normalize"
@@ -17,9 +18,9 @@ import (
 	"github.com/ivanjoz/genix-search/genix-s3/internal/tokens"
 )
 
-// liveState is the live ID → tokens of a collection: its base (tokens or Docs
+// liveState is the live document → tokens of a collection: its base (tokens or Docs
 // frame) with the pending ops of p.log applied.
-func liveState(t *testing.T, store blob.Blob, col layout.Collection, norm *normalize.Normalizer) (map[uint32][]byte, plog.Base) {
+func liveState(t *testing.T, store blob.Blob, col layout.Collection, norm *normalize.Normalizer) (map[docid.Key][]byte, plog.Base) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -34,7 +35,7 @@ func liveState(t *testing.T, store blob.Blob, col layout.Collection, norm *norma
 		t.Fatal(err)
 	}
 
-	byID := map[uint32][]byte{}
+	byID := map[docid.Key][]byte{}
 
 	if log.Base.LogOnly {
 		for _, d := range log.Docs {
@@ -71,7 +72,7 @@ func liveState(t *testing.T, store blob.Blob, col layout.Collection, norm *norma
 	return byID, log.Base
 }
 
-func ids(byID map[uint32][]byte) []uint32 {
+func ids(byID map[docid.Key][]byte) []docid.Key {
 	return slices.Sorted(maps.Keys(byID))
 }
 
@@ -132,12 +133,12 @@ func TestRebuildReplaces(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// The source has 10..30; while it is read, a writer adds 500 and
-		// deletes 12.
+		// The source has 10..30 of group 0; while it is read, a writer adds
+		// 500 of group 3 and deletes 12, and 13 of group 1, which is not 13.
 		source := func(ctx context.Context, yield func(Doc) error) error {
 			for i, d := range numbered(10, 30) {
 				if i == 5 {
-					if _, err := c.Apply(ctx, []Doc{{ID: 500, Text: "durante"}}, []uint32{12}); err != nil {
+					if _, err := c.Apply(ctx, []Doc{{Group: 3, ID: 500, Text: "durante"}}, []Ref{{ID: 12}, {Group: 1, ID: 13}}); err != nil {
 						return err
 					}
 				}
@@ -154,11 +155,11 @@ func TestRebuildReplaces(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		want := append(slices.DeleteFunc(slices.Collect(func(yield func(uint32) bool) {
-			for i := uint32(10); i < 30; i++ {
+		want := append(slices.DeleteFunc(slices.Collect(func(yield func(docid.Key) bool) {
+			for i := docid.Key(10); i < 30; i++ {
 				yield(i)
 			}
-		}), func(id uint32) bool { return id == 12 }), 500)
+		}), func(id docid.Key) bool { return id == 12 }), docid.New(3, 500))
 
 		byID, base := liveState(t, fs, col, normalize.Default)
 		if got := ids(byID); !slices.Equal(got, want) {
@@ -169,7 +170,7 @@ func TestRebuildReplaces(t *testing.T) {
 		data, _, _ := fs.Get(ctx, col.Log())
 		log, _ := plog.Parse(data, normalize.Default.ID())
 
-		if len(log.Pending()) != 2 || base.LogOnly != (minIndex > 20) {
+		if len(log.Pending()) != 3 || base.LogOnly != (minIndex > 20) {
 			t.Errorf("min %d: pending %v, base %+v", minIndex, log.Pending(), base)
 		}
 

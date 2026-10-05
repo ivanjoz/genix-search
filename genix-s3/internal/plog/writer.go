@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/blob"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/docid"
 )
 
 // DefaultCompactBytes is the default CompactBytes: once the appends since the
@@ -61,7 +62,7 @@ const maxAttempts = 16
 
 // Change is one write: the new tokens of a document, or its delete.
 type Change struct {
-	ID     uint32
+	ID     docid.Key
 	Del    bool
 	Tokens []byte // key5.AppendTokens
 }
