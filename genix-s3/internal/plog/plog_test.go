@@ -58,7 +58,7 @@ func TestRoundTrip(t *testing.T) {
 		}
 	}
 
-	// ID 7 of group 0 and of group 1 are two documents.
+	// ID 7 of origin 0 and of origin 1 are two documents.
 	pending := log.Pending()
 	if len(pending) != 3 || pending[7].Seq != 11 || pending[docid.New(1, 7)].Seq != 13 || !pending[docid.New(200, 4000000000)].Del {
 		t.Errorf("pending %+v", pending)

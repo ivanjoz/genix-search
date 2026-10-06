@@ -6,6 +6,7 @@ import (
 	"maps"
 	"math/rand/v2"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -90,7 +91,7 @@ func ids(hits []Hit) []uint32 {
 func keys(hits []Hit) []docid.Key {
 	out := make([]docid.Key, len(hits))
 	for i, h := range hits {
-		out[i] = docid.New(h.Group, h.ID)
+		out[i] = docid.New(h.OriginID, h.ID)
 	}
 
 	return out
@@ -202,16 +203,16 @@ func TestBudget(t *testing.T) {
 	}
 }
 
-// TestGroups: the same ID in two groups is two documents. Every hit carries
-// its group, and a write or a delete of one leaves the other, in p.log and in
-// the index.
-func TestGroups(t *testing.T) {
+// TestOrigins: the same ID in two origins is two documents. Every hit
+// carries its origin, and a write or a delete of one leaves the other, in
+// p.log and in the index.
+func TestOrigins(t *testing.T) {
 	ctx := context.Background()
 	docs := []collection.Doc{
-		{Group: 1, ID: 7, Text: "Nike"},
-		{Group: 2, ID: 7, Text: "Zapatilla Nike Air"},
-		{Group: 2, ID: 8, Text: "Polo Adidas"},
-		{Group: 255, ID: 4000000000, Text: "Tienda Nike"},
+		{OriginID: 1, ID: 7, Text: "Nike"},
+		{OriginID: 2, ID: 7, Text: "Zapatilla Nike Air"},
+		{OriginID: 2, ID: 8, Text: "Polo Adidas"},
+		{OriginID: 255, ID: 4000000000, Text: "Tienda Nike"},
 	}
 
 	for _, minIndex := range []int{1, 100} {
@@ -230,7 +231,7 @@ func TestGroups(t *testing.T) {
 
 		check("built", docid.New(1, 7), docid.New(2, 7), docid.New(255, 4000000000))
 
-		if _, err := f.w.Apply(ctx, []collection.Doc{{Group: 3, ID: 7, Text: "Nike"}}, []collection.Ref{{Group: 1, ID: 7}}); err != nil {
+		if _, err := f.w.Apply(ctx, []collection.Doc{{OriginID: 3, ID: 7, Text: "Nike"}}, []collection.Ref{{OriginID: 1, ID: 7}}); err != nil {
 			t.Fatal(err)
 		}
 
@@ -327,6 +328,119 @@ func TestExtraLetters(t *testing.T) {
 	other := New(f.store, f.col, normalize.Default, DefaultOptions())
 	if _, err := other.Search(context.Background(), Request{Query: "pina"}); err == nil {
 		t.Error("an engine with other extra letters read the collection")
+	}
+}
+
+// TestNearWords: a word finds those with 1 or 2 letters more or fewer at the
+// end, below the word itself (PLAN_BUCKETS.md §19), wherever it is in the
+// query.
+func TestNearWords(t *testing.T) {
+	docs := []collection.Doc{
+		{ID: 1, Text: "Bolsa de basura"},
+		{ID: 2, Text: "Bolsas basura grandes"},
+		{ID: 3, Text: "Pan de molde"},
+		{ID: 4, Text: "Panes integrales"},
+		{ID: 5, Text: "Tomate frito"},
+		{ID: 6, Text: "Tomates cherry"},
+		{ID: 7, Text: "Salsa de tomate"},
+		{ID: 8, Text: "Sal fina"},
+		{ID: 9, Text: "Galleta maría"},
+		{ID: 10, Text: "Galletas chocolate"},
+		{ID: 11, Text: "Bolsitas de té"},
+		{ID: 12, Text: "Galletones de avena"},
+	}
+
+	f := newFixture(t, normalize.Default, docs)
+	e := f.engine(DefaultOptions())
+
+	cases := map[string][]uint32{
+		"bolsas basura":     {2, 1},    // bolsa: one letter fewer
+		"bolsa basura":      {1, 2},    // bolsas: one more, though bolsa is not the last word
+		"bolsas":            {2, 1},    // bolsitas is 2 letters past bolsa, 3 past bolsas
+		"pan molde":         {3, 4},    // panes
+		"panes":             {4, 3},    // pan: two fewer
+		"tomates":           {6, 5, 7}, // tomate first in 5, second in 7
+		"galleta chocolate": {10, 9},   // galletas has 8 letters and no tail: whole
+		"sal fina":          {8},       // salsa: 2 more letters, not "es"
+		"galletones":        {12},      // galleta is 3 letters short
+		"bolsas grandes":    {2, 1},
+	}
+
+	for q, want := range cases {
+		if got := ids(search(t, e, q, false).Hits); !slices.Equal(got, want) {
+			t.Errorf("%q: %v, want %v", q, got, want)
+		}
+	}
+
+	// The exact word earns more than a near one.
+	hits := search(t, e, "bolsas", false).Hits
+	if len(hits) == 2 && hits[0].Score <= hits[1].Score {
+		t.Errorf("bolsas: exact %d, near %d", hits[0].Score, hits[1].Score)
+	}
+}
+
+// TestRepeatedWords: a word typed twice counts once.
+func TestRepeatedWords(t *testing.T) {
+	docs := []collection.Doc{{ID: 1, Text: "Polo rojo"}, {ID: 2, Text: "Polo azul"}, {ID: 3, Text: "Camisa roja"}}
+	e := newFixture(t, normalize.Default, docs).engine(DefaultOptions())
+
+	for twice, once := range map[string]string{"polo polo": "polo", "polo rojo rojo": "polo rojo", "rojo polo rojo": "rojo polo"} {
+		a, b := search(t, e, twice, false).Hits, search(t, e, once, false).Hits
+		if !slices.Equal(a, b) {
+			t.Errorf("%q: %v; %q: %v", twice, a, once, b)
+		}
+	}
+}
+
+// TestQueryFirstWord: the first word typed leads; it earns QueryFirstWord.
+func TestQueryFirstWord(t *testing.T) {
+	docs := []collection.Doc{{ID: 1, Text: "Pack cafe"}, {ID: 2, Text: "Pack miel"}}
+	e := newFixture(t, normalize.Default, docs).engine(DefaultOptions())
+
+	for query, first := range map[string]uint32{"cafe miel": 1, "miel cafe": 2} {
+		hits := search(t, e, query, false).Hits
+		if len(hits) != 2 || hits[0].ID != first || hits[0].Score-hits[1].Score != QueryFirstWord {
+			t.Errorf("%q: %v", query, hits)
+		}
+	}
+}
+
+// TestGroupCountsOnce: the words of the query that the document's group
+// matched count once, by the text or by the group (PLAN_BUCKETS.md §17.5),
+// and the group never lowers a score.
+func TestGroupCountsOnce(t *testing.T) {
+	docs := []collection.Doc{
+		{ID: 1, Text: "Crema corporal", Group: "Cuidado corporal"},
+		{ID: 2, Text: "Crema hidratante", Group: "Cuidado corporal"},
+		{ID: 3, Text: "Aceite de girasol", Group: "Aceite"},
+		{ID: 4, Text: "Aceite de girasol", Group: "Aceite, vinagre y sal"},
+		{ID: 5, Text: "Aceite de girasol"},
+		{ID: 6, Text: "Aceite corporal"},
+	}
+
+	e := newFixture(t, normalize.Default, docs).engine(DefaultOptions())
+
+	// corporal was typed as the group, which both have: hidratante decides.
+	// Counting corporal twice, they tied.
+	if got := ids(search(t, e, "hidratante cuidado corporal", false).Hits); len(got) == 0 || got[0] != 2 {
+		t.Errorf("hidratante cuidado corporal: %v", got)
+	}
+
+	// The whole query is the group: the name saying it too counts.
+	score := map[uint32]uint32{}
+	for _, h := range search(t, e, "cuidado corporal", false).Hits {
+		score[h.ID] = h.Score
+	}
+
+	if score[1] <= score[6] || score[1] <= score[2] {
+		t.Errorf("cuidado corporal: %v", score)
+	}
+
+	// With girasol besides, the group aceite explains a word the name
+	// already has: no more, no less.
+	hits := search(t, e, "aceite girasol", false).Hits
+	if len(hits) < 3 || hits[0].Score != hits[1].Score || hits[1].Score != hits[2].Score {
+		t.Errorf("aceite girasol: %v", hits)
 	}
 }
 
@@ -482,7 +596,7 @@ func TestLogOnly(t *testing.T) {
 			dict = state
 		}
 
-		ref := newReference(normalize.Default, dict, state)
+		ref := newReference(normalize.Default, textDocs(dict), textDocs(state), nil, 0)
 
 		for _, q := range queries {
 			resp := search(t, e, q, false)
@@ -589,12 +703,12 @@ func TestLogOnly(t *testing.T) {
 
 	check("95 documents after another compaction", true)
 
-	// Growing again, in another group, builds the index in a new epoch.
+	// Growing again, in another origin, builds the index in a new epoch.
 	for i := range 10 {
 		id := uint32(9000 + i)
 		state[docid.New(4, id)] = "Zapato rojo"
 
-		if _, err := f.w.Put(ctx, []collection.Doc{{Group: 4, ID: id, Text: "Zapato rojo"}}); err != nil {
+		if _, err := f.w.Put(ctx, []collection.Doc{{OriginID: 4, ID: id, Text: "Zapato rojo"}}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -701,13 +815,48 @@ func bruteText(r *rand.Rand) string {
 	return s
 }
 
+// bruteGroups are the groups of the brute-force documents: some share their
+// first words, or their signature ("centro civico" and "cerro civico" do
+// not, "centro civico" and "centro civico norte" share a prefix), and some
+// words are also words of the texts.
+var bruteGroups = []string{"centro civico", "centro civico norte", "centro historico", "cerro civico", "los condes",
+	"condes", "villa a", "sector 5", "rio de la plata", "polo norte", "casa azul", "x"}
+
+// bruteGroup is a group for a document, or none: the first groups far more
+// often, so that some pass the cap of group words.
+func bruteGroup(r *rand.Rand) string {
+	if r.IntN(3) == 0 {
+		return ""
+	}
+
+	return bruteGroups[r.IntN(1+r.IntN(len(bruteGroups)))]
+}
+
 func bruteQueries(r *rand.Rand, n int) []string {
 	var queries []string
 
 	for range n {
 		q := ""
-		for range 1 + r.IntN(3) {
+		for range r.IntN(3) {
 			q += bruteWords[r.IntN(len(bruteWords))] + " "
+		}
+
+		// Some or all words of a group, the last one maybe cut.
+		if r.IntN(3) == 0 {
+			words := strings.Fields(bruteGroups[r.IntN(len(bruteGroups))])
+			from := r.IntN(len(words))
+			words = words[from : from+1+r.IntN(len(words)-from)]
+
+			if r.IntN(4) == 0 {
+				last := words[len(words)-1]
+				words[len(words)-1] = last[:1+r.IntN(len(last))]
+			}
+
+			q += strings.Join(words, " ") + " "
+		}
+
+		if q == "" {
+			q = bruteWords[r.IntN(len(bruteWords))] + " "
 		}
 
 		if r.IntN(3) == 0 {
@@ -724,7 +873,9 @@ func bruteQueries(r *rand.Rand, n int) []string {
 
 	return append(queries, "pol", "ca", "c", "chocolat*", "1", "19", "x m l", "chocolate", "chocolatera", "polo", "rojo azul",
 		"refrigerado", "refrigerante", "chocolatina leche", "polo polo", "polo pol", "ca casa cama",
-		"m polo", "polo rojo m", "m*", "polo m*", "m pol", "x refrigerante refrigerado", "ca m", "l x polo")
+		"m polo", "polo rojo m", "m*", "polo m*", "m pol", "x refrigerante refrigerado", "ca m", "l x polo",
+		"polo centro civico", "centro civico", "centro civico norte", "civico", "civ", "polo civ", "condes", "los condes",
+		"villa a", "sector 5", "rio plata", "polo norte", "casa azul polo", "cerro civico rojo", "centro*", "cent")
 }
 
 // TestMatchesBruteForce compares the engine with a ranking of every
@@ -732,7 +883,7 @@ func bruteQueries(r *rand.Rand, n int) []string {
 // parameters small enough that most words expand: heads, combinations,
 // grouped combination blocks and deep pages all take part.
 func TestMatchesBruteForce(t *testing.T) {
-	small := bucket.Params{MinSplit: 64, ExpandCost: 32, HeadSize: 8, InlineBudget: 64, ComboDictBudget: 16}
+	small := bucket.Params{MinSplit: 64, ExpandCost: 32, HeadSize: 8, InlineBudget: 64, ComboDictBudget: 16, GroupWordDocs: 5}
 
 	type testCase struct {
 		name     string
@@ -755,20 +906,20 @@ func TestMatchesBruteForce(t *testing.T) {
 			ctx := context.Background()
 			r := rand.New(rand.NewPCG(11, 12))
 
-			// Several groups, and IDs from a small range half the time, so
-			// that the same ID is a document of more than one group.
-			groups := []uint8{0, 1, 2, 7, 200}
+			// Several origins, and IDs from a small range half the time, so
+			// that the same ID is a document of more than one origin.
+			origins := []uint8{0, 1, 2, 7, 200}
 			randomKey := func() docid.Key {
 				id := r.Uint32()
 				if r.IntN(2) == 0 {
 					id = r.Uint32N(1500)
 				}
 
-				return docid.New(groups[r.IntN(len(groups))], id)
+				return docid.New(origins[r.IntN(len(origins))], id)
 			}
 
 			doc := func(k docid.Key) collection.Doc {
-				return collection.Doc{Group: k.Group(), ID: k.ID(), Text: bruteText(r)}
+				return collection.Doc{OriginID: k.Origin(), ID: k.ID(), Text: bruteText(r), Group: bruteGroup(r)}
 			}
 
 			var docs []collection.Doc
@@ -787,7 +938,7 @@ func TestMatchesBruteForce(t *testing.T) {
 			}
 
 			if n := len(used) - len(shared); n < 100 {
-				t.Fatalf("only %d documents share their ID with another group", n)
+				t.Fatalf("only %d documents share their ID with another origin", n)
 			}
 
 			opts := testOptions()
@@ -822,12 +973,13 @@ func TestMatchesBruteForce(t *testing.T) {
 				t.Fatalf("%d buckets of several slots", multi)
 			}
 
-			base := map[docid.Key]string{}
+			base := map[docid.Key]collection.Doc{}
 			for _, d := range docs {
-				base[d.Key()] = d.Text
+				base[d.Key()] = d
 			}
 
 			state := maps.Clone(base)
+			pending := map[docid.Key]bool{}
 
 			// Pending ops: new documents, new versions and deletes.
 			var puts []collection.Doc
@@ -838,7 +990,8 @@ func TestMatchesBruteForce(t *testing.T) {
 				}
 
 				puts = append(puts, doc(k))
-				state[k] = puts[len(puts)-1].Text
+				state[k] = puts[len(puts)-1]
+				pending[k] = true
 			}
 
 			if _, err := f.w.Put(ctx, puts); err != nil {
@@ -847,14 +1000,15 @@ func TestMatchesBruteForce(t *testing.T) {
 
 			for range 10 {
 				k := docs[r.IntN(len(docs))].Key()
-				if _, err := f.w.Delete(ctx, collection.Ref{Group: k.Group(), ID: k.ID()}); err != nil {
+				if _, err := f.w.Delete(ctx, collection.Ref{OriginID: k.Origin(), ID: k.ID()}); err != nil {
 					t.Fatal(err)
 				}
 
 				delete(state, k)
+				pending[k] = true
 			}
 
-			ref := newReference(normalize.Default, base, state)
+			ref := newReference(normalize.Default, base, state, pending, tc.params.GroupWordDocs)
 			e := f.engine(DefaultOptions())
 			e.opts.PrefixBudget = 1 << 40
 
@@ -896,7 +1050,7 @@ func TestMatchesBruteForce(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			ref = newReference(normalize.Default, state, state)
+			ref = newReference(normalize.Default, state, state, nil, tc.params.GroupWordDocs)
 
 			for _, q := range bruteQueries(r, 100) {
 				resp := search(t, e, q, false)
@@ -910,23 +1064,59 @@ func TestMatchesBruteForce(t *testing.T) {
 
 // reference ranks every live document by the matching rules, without the
 // index; the rarity of a term comes from the dictionary documents, those the
-// index was built from.
+// index was built from. The documents of the index keep the group words of
+// the first cap of each group, as the compaction does; those pending in
+// p.log keep them all.
 type reference struct {
 	ids    []docid.Key
 	tokens [][]key5.Token
 	dict   [][]key5.Token
 }
 
-func newReference(norm *normalize.Normalizer, dict, live map[docid.Key]string) *reference {
-	ref := &reference{}
-
-	for id, text := range live {
-		ref.ids = append(ref.ids, id)
-		ref.tokens = append(ref.tokens, key5.FromTokens(norm.Tokens(text)))
+// textDocs are documents of texts alone.
+func textDocs(texts map[docid.Key]string) map[docid.Key]collection.Doc {
+	docs := make(map[docid.Key]collection.Doc, len(texts))
+	for k, text := range texts {
+		docs[k] = collection.Doc{OriginID: k.Origin(), ID: k.ID(), Text: text}
 	}
 
-	for _, text := range dict {
-		ref.dict = append(ref.dict, key5.FromTokens(norm.Tokens(text)))
+	return docs
+}
+
+func newReference(norm *normalize.Normalizer, dict, live map[docid.Key]collection.Doc, pending map[docid.Key]bool, cap int) *reference {
+	tokensOf := func(d collection.Doc) []key5.Token {
+		tokens, err := key5.ReadTokens(collection.New(nil, layout.Collection{}, norm, collection.Options{}).Tokens(d))
+		if err != nil {
+			panic(err)
+		}
+
+		return tokens
+	}
+
+	var indexed []bucket.Doc
+	for _, k := range slices.Sorted(maps.Keys(dict)) {
+		indexed = append(indexed, bucket.Doc{ID: k, Tokens: tokensOf(dict[k])})
+	}
+
+	capped := map[docid.Key][]key5.Token{}
+	for _, d := range bucket.CapGroupWords(indexed, cap) {
+		capped[d.ID] = d.Tokens
+	}
+
+	ref := &reference{}
+
+	for id, d := range live {
+		tokens := capped[id]
+		if pending[id] {
+			tokens = tokensOf(d)
+		}
+
+		ref.ids = append(ref.ids, id)
+		ref.tokens = append(ref.tokens, tokens)
+	}
+
+	for _, d := range indexed {
+		ref.dict = append(ref.dict, d.Tokens)
 	}
 
 	return ref
@@ -948,7 +1138,7 @@ func (r *reference) top(q Parsed, offset, limit int, fuzzy bool) []Hit {
 	hits := []Hit{}
 
 	for _, res := range results[min(offset, len(results)):min(offset+limit, len(results))] {
-		hits = append(hits, Hit{Group: res.id.Group(), ID: res.id.ID(), Coverage: res.score.coverage, Score: res.score.score})
+		hits = append(hits, Hit{OriginID: res.id.Origin(), ID: res.id.ID(), Coverage: res.score.coverage, Score: res.score.score})
 	}
 
 	return hits
@@ -1078,4 +1268,102 @@ func TestRegroupEngine(t *testing.T) {
 
 	check("index regrouped to none", true)
 	check("warm", false)
+}
+
+// TestTextGroups: a group adds to the score of a search that names it, below
+// the text (PLAN_BUCKETS.md §17): the signature finds every member, the group
+// words the first ones of each group, and neither costs a request.
+func TestTextGroups(t *testing.T) {
+	docs := []collection.Doc{
+		{ID: 1, Text: "Juan Carlos", Group: "centro civico"},
+		{ID: 2, Text: "Centro Civico"},
+		{ID: 3, Text: "Juan Carlos", Group: "los condes"},
+		{ID: 4, Text: "Juan", Group: "centro civico norte"},
+		{ID: 5, Text: "Pedro Ignacio", Group: "centro civico"},
+	}
+
+	for i := range 95 {
+		docs = append(docs, collection.Doc{ID: uint32(100 + i), Text: fmt.Sprintf("Relleno %d", i)})
+	}
+
+	opts := testOptions()
+	opts.Params.GroupWordDocs = 1
+	f := newFixtureOpts(t, normalize.Default, docs, opts)
+	e := f.engine(DefaultOptions())
+
+	score := func(resp Response, id uint32) int {
+		for _, h := range resp.Hits {
+			if h.ID == id {
+				return int(h.Score)
+			}
+		}
+
+		t.Fatalf("%d not in %v", id, resp.Hits)
+
+		return 0
+	}
+
+	// The example of PLAN_BUCKETS.md §17.5, plus the rarity of each word.
+	resp := search(t, e, "juan carlos centro civico", false)
+	if got := ids(resp.Hits); !slices.Equal(got, []uint32{1, 2, 3, 4, 5}) {
+		t.Fatalf("order %v", resp.Hits)
+	}
+
+	idf := func(df int) int { return int(idfBonus(df, len(docs))) }
+	// Position: 2 for the document's first word, 1 for its second, and 2
+	// more for juan, the first word typed.
+	want := map[uint32]int{
+		1: 21 + 27 + 10 + 6 + 5 + idf(3) + idf(2),
+		2: 27 + 27 + 6 + 3 + idf(1) + idf(1),
+		3: 21 + 27 + 6 + 5 + idf(3) + idf(2),
+		4: 21 + 8 + 4 + idf(3),
+		5: 10,
+	}
+
+	for id, w := range want {
+		if got := score(resp, id); got != w {
+			t.Errorf("%d scores %d, want %d", id, got, w)
+		}
+	}
+
+	if resp.Hits[0].Coverage != 4 || resp.Hits[4].Coverage != 2 {
+		t.Errorf("coverage %v", resp.Hits)
+	}
+
+	// The signatures live in the buckets of the words: one round, p.log and
+	// ju, ca, ce and ci.
+	cold := f.engine(DefaultOptions())
+	if resp := search(t, cold, "juan carlos centro civico", false); resp.Stats.Requests != 5 || resp.Stats.Rounds != 1 {
+		t.Errorf("cold: %d requests in %d rounds", resp.Stats.Requests, resp.Stats.Rounds)
+	}
+
+	// The group alone: the text first, then every member, the whole
+	// signature before the one that only starts with it.
+	if got := ids(search(t, e, "centro civico", false).Hits); !slices.Equal(got, []uint32{2, 1, 5, 4}) {
+		t.Errorf("centro civico: %v", got)
+	}
+
+	// One word of the group: only the group words find it, and with
+	// GroupWordDocs 1 only the first member of each group has them. juan,
+	// typed first, and its group word tie the text "Centro Civico".
+	resp = search(t, e, "juan civico", false)
+	if got := ids(resp.Hits); !slices.Equal(got, []uint32{1, 2, 4, 3}) {
+		t.Errorf("juan civico: %v", resp.Hits)
+	}
+
+	if d := score(resp, 1) - score(resp, 3); d != GroupWord {
+		t.Errorf("a group word adds %d", d)
+	}
+
+	// The open word: a prefix of the group words, and a signature once its
+	// segment is complete.
+	if got := ids(search(t, e, "juan carlos centro civ", false).Hits); !slices.Equal(got[:3], []uint32{1, 3, 2}) {
+		t.Errorf("juan carlos centro civ: %v", got)
+	}
+
+	// A one-word group (los is a stopword): its signature is one segment.
+	resp = search(t, e, "juan carlos condes", false)
+	if got := ids(resp.Hits); got[0] != 3 || score(resp, 3)-score(resp, 1) != GroupSegment+GroupFull {
+		t.Errorf("juan carlos condes: %v", resp.Hits)
+	}
 }

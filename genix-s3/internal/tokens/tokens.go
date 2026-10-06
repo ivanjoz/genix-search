@@ -25,7 +25,7 @@ const (
 	headerSize = 48
 	dirEntry   = 20             // first key u64 | Off u32 | Len u32 | CRC32C u32
 	slotEntry  = 12             // group u16 | flags u8 | grouping u8 (garbage) | hash u64
-	docHead    = docid.Size + 2 // key (ID u32 | group u8) | tokLen u16
+	docHead    = docid.Size + 2 // key (ID u32 | origin u8) | tokLen u16
 	// ChunkDocs is how many documents go in a chunk.
 	ChunkDocs = 1000
 )

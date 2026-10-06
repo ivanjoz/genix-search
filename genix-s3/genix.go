@@ -1,7 +1,7 @@
 // Package genix is a search index on S3 Express One Zone that returns ranked
 // IDs (PLAN_5BIT.md for the keys, PLAN_BUCKETS.md for the index). Words are
 // their first 8 letters in 5-bit units and numbers are their binary value;
-// the index stores document keys (group and ID) and those keys, never text. A query reads p.log and
+// the index stores document keys (origin and ID) and those keys, never text. A query reads p.log and
 // the index of the buckets of its words, <xy>.idx, in one round, and the
 // ranges of <xy>.db they point to in a second.
 //
@@ -29,11 +29,14 @@ import (
 type (
 	// Blob is the object store: S3 Express One Zone, or a directory.
 	Blob = blob.Blob
-	// Doc is a document to index: its group, its ID in the group and its
-	// text. An ID is unique within its group; the same ID in another group is
-	// another document. A document never changes group.
+	// Doc is a document to index: its origin (the table it comes from), its
+	// ID in the origin, its text and optionally its group, a parent text many
+	// documents share ("Juan Carlos" lives in "centro civico"), which only
+	// adds to the score of a search that names it. An ID is unique within its
+	// origin; the same ID in another origin is another document. A document
+	// never changes origin.
 	Doc = collection.Doc
-	// Ref names a document to delete: its group and its ID.
+	// Ref names a document to delete: its origin and its ID.
 	Ref = collection.Ref
 	// Request, Response and Hit are a search and its answer.
 	Request  = query.Request
@@ -184,7 +187,7 @@ func (ix *Indexer) Init(ctx context.Context, docs []Doc) error {
 	return err
 }
 
-// Put writes new versions of documents (a new group and ID is a new
+// Put writes new versions of documents (a new origin and ID is a new
 // document). The first put of a collection that does not exist creates it.
 func (ix *Indexer) Put(ctx context.Context, docs ...Doc) (AppendResult, error) {
 	return ix.c.Put(ctx, docs)
@@ -256,7 +259,7 @@ type QueryHit struct {
 	ID       uint32 `cb:"1"`
 	Coverage uint32 `cb:"2"`
 	Score    uint32 `cb:"3"`
-	Group    uint8  `cb:"4"`
+	OriginID uint8  `cb:"4"`
 }
 
 // QueryResponse is the answer on the wire.
@@ -280,7 +283,7 @@ func (s *Searcher) Serve(ctx context.Context, body []byte) ([]byte, error) {
 
 	out := QueryResponse{Seq: resp.Seq, Approx: resp.Stats.Approx, Hits: make([]QueryHit, len(resp.Hits))}
 	for i, h := range resp.Hits {
-		out.Hits[i] = QueryHit{ID: h.ID, Coverage: h.Coverage, Score: h.Score, Group: h.Group}
+		out.Hits[i] = QueryHit{ID: h.ID, Coverage: h.Coverage, Score: h.Score, OriginID: h.OriginID}
 	}
 
 	return colbin.Marshal(&out)

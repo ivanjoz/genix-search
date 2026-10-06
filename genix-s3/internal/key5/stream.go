@@ -3,6 +3,7 @@ package key5
 import (
 	"errors"
 	"fmt"
+	"math"
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/bits"
 )
@@ -79,14 +80,14 @@ func AppendSlot(w *bits.Writer, keys []Key) ([]uint32, error) {
 	return restarts, nil
 }
 
-// AppendBucket writes the keys of one slot as AppendSlot does, without
-// restarts: what a bucket's dictionary holds, which is always decoded whole
-// (PLAN_BUCKETS.md §2.2). ReadSlot reads it.
+// AppendBucket writes the keys of one slot and one space as AppendSlot does,
+// without restarts: what a bucket's dictionary holds, which is always decoded
+// whole (PLAN_BUCKETS.md §2.2). ReadSlot reads it.
 func AppendBucket(w *bits.Writer, keys []Key) error {
 	var prev Key
 
 	for i, k := range keys {
-		if i > 0 && (k <= prev || k.Slot() != prev.Slot()) {
+		if i > 0 && (k <= prev || k.Slot() != prev.Slot() || k.Space() != prev.Space()) {
 			return fmt.Errorf("key5: slot keys out of order: %s after %s", k, prev)
 		}
 
@@ -111,10 +112,30 @@ func AppendBucket(w *bits.Writer, keys []Key) error {
 	return nil
 }
 
-// AppendKeys writes keys of any slot, sorted and distinct, front-coded: per
-// key the units it shares with the previous one (3 bits), its units − 1 (3
-// bits), and its other units (PLAN_BUCKETS.md §2.2).
+// AppendKeys writes keys of any slot and space, sorted and distinct,
+// front-coded: a bit set when some keys are not words, and then how many
+// group words and signatures end the keys (nibble varints; PLAN_BUCKETS.md
+// §17.2); then per key the units it shares with the previous one (3 bits), its
+// units − 1 (3 bits), and its other units (§2.2).
 func AppendKeys(w *bits.Writer, keys []Key) error {
+	var spaces [Spaces]uint64
+
+	for _, k := range keys {
+		if k.Space() >= Spaces {
+			return fmt.Errorf("key5: key %x of no space", uint64(k))
+		}
+
+		spaces[k.Space()]++
+	}
+
+	if spaces[SpaceGroupWord]+spaces[SpaceSignature] == 0 {
+		w.Write(0, 1)
+	} else {
+		w.Write(1, 1)
+		writeNibbles(w, spaces[SpaceGroupWord])
+		writeNibbles(w, spaces[SpaceSignature])
+	}
+
 	var prev Key
 	prevLen := 0
 
@@ -150,6 +171,19 @@ func AppendKeys(w *bits.Writer, keys []Key) error {
 func ReadKeys(r *bits.Reader, n int) ([]Key, error) {
 	keys := make([]Key, n)
 
+	// The first key of each space: the keys are sorted, so by space.
+	from := [Spaces]int{SpaceGroupWord: n, SpaceSignature: n}
+
+	if r.Read(1) == 1 {
+		groupWords, sigs := readNibbles(r), readNibbles(r)
+		if groupWords+sigs > uint64(n) {
+			return nil, ErrCorrupt
+		}
+
+		from[SpaceSignature] = n - int(sigs)
+		from[SpaceGroupWord] = from[SpaceSignature] - int(groupWords)
+	}
+
 	var prev Key
 	prevLen := 0
 
@@ -159,7 +193,14 @@ func ReadKeys(r *bits.Reader, n int) ([]Key, error) {
 			return nil, ErrCorrupt
 		}
 
-		k := prev.prefix(s)
+		space := SpaceWord
+		if i >= from[SpaceSignature] {
+			space = SpaceSignature
+		} else if i >= from[SpaceGroupWord] {
+			space = SpaceGroupWord
+		}
+
+		k := prev.prefix(s).In(space)
 		for j := s; j < l; j++ {
 			k |= Key(r.Read(5)) << (35 - 5*j)
 		}
@@ -191,10 +232,10 @@ func (k Key) Prefix(n int) Key { return k.prefix(n) }
 // ErrCorrupt is a slot stream that does not decode.
 var ErrCorrupt = errors.New("key5: corrupt slot stream")
 
-// ReadSlot decodes the n keys of slot.
-func ReadSlot(r *bits.Reader, slot uint16, n int) ([]Key, error) {
+// ReadSlot decodes the n keys of slot in space.
+func ReadSlot(r *bits.Reader, slot uint16, space Space, n int) ([]Key, error) {
 	keys := make([]Key, n)
-	base := Key(slot) << 30
+	base := (Key(slot) << 30).In(space)
 
 	var prev Key
 
@@ -230,25 +271,35 @@ func ReadSlot(r *bits.Reader, slot uint16, n int) ([]Key, error) {
 	return keys, nil
 }
 
+// Header units of the token stream that mark the space of the next token
+// (PLAN_BUCKETS.md §17.2). A group word follows its mark as a word or a
+// number does; a signature follows its mark as its length and its units.
+const (
+	GroupWordMark uint8 = 30
+	SignatureMark uint8 = 31
+)
+
 // AppendTokens writes a document's tokens (PLAN_5BIT.md §5.4): per token a
-// header unit (1..8 = a word of that many letters, NUM_1..NUM_3 = a number)
-// and its units, then End, then a 2-bit tail per word of 8 letters, then
-// padding to the byte.
+// header unit (1..8 = a word of that many letters, NUM_1..NUM_3 = a number,
+// after GroupWordMark or SignatureMark for the group's tokens) and its units,
+// then End, then a 2-bit tail per word of the text of 8 letters, then padding
+// to the byte.
 func AppendTokens(dst []byte, tokens []Token) []byte {
 	w := bits.NewWriter(dst)
 
 	for _, t := range tokens {
 		n := t.Key.Len()
 
-		if t.Key.IsNumber() {
-			for i := range n {
-				w.Write(uint64(t.Key.Unit(i)), 5)
-			}
-
-			continue
+		switch t.Key.Space() {
+		case SpaceGroupWord:
+			w.Write(uint64(GroupWordMark), 5)
+		case SpaceSignature:
+			w.Write(uint64(SignatureMark), 5)
 		}
 
-		w.Write(uint64(n), 5)
+		if !t.Key.IsNumber() {
+			w.Write(uint64(n), 5)
+		}
 
 		for i := range n {
 			w.Write(uint64(t.Key.Unit(i)), 5)
@@ -258,12 +309,18 @@ func AppendTokens(dst []byte, tokens []Token) []byte {
 	w.Write(uint64(End), 5)
 
 	for _, t := range tokens {
-		if !t.Key.IsNumber() && t.Key.Len() == MaxUnits {
+		if hasTail(t.Key) {
 			w.Write(uint64(t.Tail), 2)
 		}
 	}
 
 	return w.Bytes()
+}
+
+// hasTail reports a key whose token stream keeps the tail: a word of the
+// text cut at 8 letters.
+func hasTail(k Key) bool {
+	return k.Space() == SpaceWord && !k.IsNumber() && k.Len() == MaxUnits
 }
 
 // ReadTokens decodes what AppendTokens wrote.
@@ -279,14 +336,36 @@ func ReadTokens(data []byte) ([]Token, error) {
 			return nil, ErrCorrupt
 		}
 
+		space := SpaceWord
+
+		switch header {
+		case GroupWordMark:
+			space, header = SpaceGroupWord, uint8(r.Read(5))
+		case SignatureMark:
+			space, header = SpaceSignature, uint8(r.Read(5))
+		}
+
 		switch {
-		case header == End:
-		case header <= MaxUnits:
-			// End only as the mark of a continuation: after a host of two
-			// letters or more, before the last unit.
+		case header == End && space == SpaceWord:
+		case space == SpaceSignature && header >= 1 && header <= MaxUnits:
+			// Any unit: 0 pads a word of one letter, NUM_n starts a number.
 			for i := range int(header) {
 				units[i] = uint8(r.Read(5))
-				if u := units[i]; (u >= Num1 && u <= Num3) || (u == End && (i != int(header)-2 || header < 4)) {
+			}
+
+			if units[0] == End || units[header-1] == End {
+				return nil, ErrCorrupt
+			}
+
+			tokens = append(tokens, Token{Key: FromUnits(units[:header]).In(space)})
+
+			continue
+		case header >= 1 && header <= MaxUnits && (space == SpaceWord || header >= 2):
+			// End only as the mark of a continuation of the text: after a
+			// host of two letters or more, before the last unit.
+			for i := range int(header) {
+				units[i] = uint8(r.Read(5))
+				if u := units[i]; (u >= Num1 && u <= Num3) || (u == End && (i != int(header)-2 || header < 4 || space != SpaceWord)) {
 					return nil, ErrCorrupt
 				}
 			}
@@ -295,10 +374,10 @@ func ReadTokens(data []byte) ([]Token, error) {
 				return nil, ErrCorrupt
 			}
 
-			tokens = append(tokens, Token{Key: FromUnits(units[:header])})
+			tokens = append(tokens, Token{Key: FromUnits(units[:header]).In(space)})
 
 			continue
-		case header >= Num1 && header <= Num3:
+		case header >= Num1 && header <= Num3 && space != SpaceSignature:
 			n := int(header-Num1) + 1
 			units[0] = header
 
@@ -306,7 +385,7 @@ func ReadTokens(data []byte) ([]Token, error) {
 				units[i] = uint8(r.Read(5))
 			}
 
-			tokens = append(tokens, Token{Key: FromUnits(units[:n+1])})
+			tokens = append(tokens, Token{Key: FromUnits(units[:n+1]).In(space)})
 
 			continue
 		default:
@@ -317,7 +396,7 @@ func ReadTokens(data []byte) ([]Token, error) {
 	}
 
 	for i := range tokens {
-		if !tokens[i].Key.IsNumber() && tokens[i].Key.Len() == MaxUnits {
+		if hasTail(tokens[i].Key) {
 			tokens[i].Tail = uint8(r.Read(2))
 		}
 	}
@@ -327,4 +406,32 @@ func ReadTokens(data []byte) ([]Token, error) {
 	}
 
 	return tokens, nil
+}
+
+// writeNibbles writes v as a varint of nibbles: 3 value bits, low first, and
+// a continue bit (postings.WriteNibbles, which key5 cannot import).
+func writeNibbles(w *bits.Writer, v uint64) {
+	for v >= 8 {
+		w.Write(v&7|8, 4)
+		v >>= 3
+	}
+
+	w.Write(v, 4)
+}
+
+// readNibbles reads what writeNibbles wrote; a stream that does not end
+// reads as a huge value, which the caller rejects.
+func readNibbles(r *bits.Reader) uint64 {
+	var v uint64
+
+	for shift := uint(0); shift <= 60; shift += 3 {
+		nibble := r.Read(4)
+		v |= (nibble & 7) << shift
+
+		if nibble&8 == 0 || r.Err() != nil {
+			return v
+		}
+	}
+
+	return math.MaxUint64
 }

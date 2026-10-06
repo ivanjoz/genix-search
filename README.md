@@ -125,15 +125,24 @@ letters in 5-bit units, and numbers to their binary value. Collections under
 100 documents (`MinIndexDocs`) have no index at all and are searched with a
 single read.
 
-A document is a group (`uint8`) and an ID (`uint32`) unique within the
-group, so several tables can share one index: the same ID in two groups is
-two documents. Every hit carries its group; the group takes no part in the
-score.
+A document is an origin (`uint8`, the table it comes from) and an ID
+(`uint32`) unique within the origin, so several tables can share one index:
+the same ID in two origins is two documents. Every hit carries its origin;
+the origin takes no part in the score.
 
 A one-letter word has no key of its own: it continues the 2 nearest words
 before it. "Polo rojo M" stores `rojo›m` and `polo›m`, in the buckets of those
 words, and `polo m` or `m polo` finds it.
 Spanish stopwords are dropped unless `KeepStopwords` is set ("Salón A").
+
+A document may have a group, a parent text many documents share
+(`Doc{Text: "Juan Carlos", Group: "centro civico"}`). The group only adds to
+the score of a search that names it, below the text: a signature of 2
+letters per group word (the word itself for a one-word group) finds every
+member, and the group's own words the
+first 100 members of each group, both in the buckets the query already reads.
+Results are ranked by points: letters matched, whole words, the group, the
+words' closeness and position, and their rarity.
 
 ```sh
 cd genix-s3
@@ -150,7 +159,7 @@ cfg, _ := config.LoadDefaultConfig(ctx)
 store := s3blob.New(s3.NewFromConfig(cfg), "genix--use1-az4--x-s3")
 c, _ := genix.NewClient(store, genix.ClientOptions{Extra: [2]rune{'ñ', 0}})
 
-c.Apply(ctx, "productos", "p12", []genix.Doc{{Group: 1, ID: 7, Text: "Polo Spiderman rojo"}}, []genix.Ref{{Group: 1, ID: 9}})
+c.Apply(ctx, "productos", "p12", []genix.Doc{{OriginID: 1, ID: 7, Text: "Polo Spiderman rojo"}}, []genix.Ref{{OriginID: 1, ID: 9}})
 resp, _ := c.Search(ctx, "productos", "p12", genix.Request{Query: "polo rojo", Limit: 20})
 c.Rebuild(ctx, "productos", "p12", source) // reprocess from the database
 ```

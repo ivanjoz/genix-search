@@ -224,36 +224,54 @@ func shortHeads(terms []Term, p *readPlan, idf []uint32, results []ranked, need 
 // entry: a document of the word that the head does not show ranks after it.
 // A complete head has none.
 func headBounds(t *Term, u use, exp *bucket.Expansion, idf uint32) []ranked {
-	qpos := queryPositionBonus(t.Position)
-	exact := wordBaseScore(t.Text) + qpos
-
 	var out []ranked
 
-	bound := func(g *bucket.Group, base uint32) {
+	// A match of the text also earns its first position, its place in the
+	// query and its rarity; a group word or a signature earns the same in
+	// every document, and its head goes by key (PLAN_BUCKETS.md §17.5).
+	bound := func(g *bucket.Group, base uint32, text bool) {
 		if g == nil || g.Complete() || len(g.Entries) == 0 {
 			return
 		}
 
 		last := &g.Entries[len(g.Entries)-1]
-		pos, _ := bucket.FirstPos(last, g.Tail)
 
-		out = append(out, ranked{id: last.ID, score: docScore{coverage: 1, score: base + docPositionBonus(pos) + idf}})
+		if text {
+			pos, _ := bucket.FirstPos(last, g.Tail)
+			base += docPositionBonus(pos) + queryPositionBonus(t) + idf
+		}
+
+		out = append(out, ranked{id: last.ID, score: docScore{coverage: 1, score: base}})
 	}
 
 	all := exp.Group(bucket.AllTails)
+	stem := letterPoints(t.letters())
+	exact := stem + WordFull
 
 	switch {
+	case t.virtual():
+		bound(all, signaturePoints(t, u.kind == exactKey), false)
+	case u.kind == groupKey:
+		bound(all, GroupWord, false)
 	case u.kind == prefixKey:
-		bound(all, PrefixScore+qpos)
+		bound(all, stem, true)
+	case u.kind.near():
+		// Read through its head only under 8 letters: no tails (planQuery).
+		kind := longerMatch
+		if u.kind == shorterKey {
+			kind = shorterMatch
+		}
+
+		bound(all, nearPoints(t, kind, u.dist), true)
 	case len(exp.Groups) > 1:
 		// Documents with the query's tail rank by it; the others, stems, by
 		// their first position.
-		bound(exp.Group(t.Token.Tail), exact)
-		bound(all, exact-StemPenalty)
+		bound(exp.Group(t.Token.Tail), exact, true)
+		bound(all, stem, true)
 	case len(all.Entries) > 0 && all.Entries[0].Postings[0].Tail == t.Token.Tail:
-		bound(all, exact)
+		bound(all, exact, true)
 	default:
-		bound(all, exact-StemPenalty)
+		bound(all, stem, true)
 	}
 
 	return out

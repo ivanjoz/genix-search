@@ -63,10 +63,10 @@ type Request struct {
 	Fuzzy  bool
 }
 
-// Hit is one result: the document, its group and its ID in it, which the
+// Hit is one result: the document, its origin and its ID in it, which the
 // caller resolves in its own database, and how it ranked.
 type Hit struct {
-	Group    uint8
+	OriginID uint8
 	ID       uint32
 	Coverage uint32
 	Score    uint32
@@ -406,7 +406,7 @@ func (e *Engine) answer(ctx context.Context, q Parsed, req Request, p *readPlan,
 			resp.Hits = make([]Hit, 0, to-from)
 
 			for _, r := range results[from:to] {
-				resp.Hits = append(resp.Hits, Hit{Group: r.id.Group(), ID: r.id.ID(), Coverage: r.score.coverage, Score: r.score.score})
+				resp.Hits = append(resp.Hits, Hit{OriginID: r.id.Origin(), ID: r.id.ID(), Coverage: r.score.coverage, Score: r.score.score})
 			}
 
 			return nil
@@ -834,7 +834,7 @@ func (e *Engine) searchLog(q Parsed, req Request, log *plog.Log, resp *Response)
 	resp.Hits = make([]Hit, 0, to-from)
 
 	for _, r := range results[from:to] {
-		resp.Hits = append(resp.Hits, Hit{Group: r.id.Group(), ID: r.id.ID(), Coverage: r.score.coverage, Score: r.score.score})
+		resp.Hits = append(resp.Hits, Hit{OriginID: r.id.Origin(), ID: r.id.ID(), Coverage: r.score.coverage, Score: r.score.score})
 	}
 
 	resp.Stats.LogOnly = true
@@ -868,7 +868,7 @@ func dictMatch(terms []Term, docs [][]key5.Token, fuzzy bool) ([]bool, []int) {
 		t := &terms[i]
 
 		for k, n := range dfByKey {
-			if kind, _ := t.classifyKey(k, false, scratch[:]); kind != noKey {
+			if kind, _ := t.classifyKey(k, false, scratch[:]); kind != noKey && kind != groupKey {
 				df[i] += n
 			}
 		}
@@ -880,7 +880,7 @@ func dictMatch(terms []Term, docs [][]key5.Token, fuzzy bool) ([]bool, []int) {
 		enabled[i] = true
 
 		for k, n := range dfByKey {
-			if kind, _ := t.classifyKey(k, true, scratch[:]); kind != noKey {
+			if kind, _ := t.classifyKey(k, true, scratch[:]); kind != noKey && kind != groupKey {
 				df[i] += n
 			}
 		}

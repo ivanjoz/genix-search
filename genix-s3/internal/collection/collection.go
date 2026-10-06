@@ -122,29 +122,40 @@ func New(store blob.Blob, col layout.Collection, norm *normalize.Normalizer, opt
 // Doc is a document as the caller sends it. The text is normalized on
 // arrival; only its 5-bit tokens are stored.
 type Doc struct {
-	// Group and ID are the document: an ID is unique within its group, and
-	// a document never changes group. The group is returned with every hit
-	// and takes no part in the score.
-	Group uint8
-	ID    uint32
-	Text  string
+	// OriginID and ID are the document: an ID is unique within its origin
+	// (the table it comes from), and a document never changes origin. The
+	// origin is returned with every hit and takes no part in the score.
+	OriginID uint8
+	ID       uint32
+	Text     string
+	// Group is the text of the document's group, if it has one: a parent
+	// many documents share ("Juan Carlos" lives in "centro civico"). It only
+	// adds to the score of a search that names it, below the text
+	// (PLAN_BUCKETS.md §17).
+	Group string
 }
 
-// Ref names a document: its group and its ID in it.
+// Ref names a document: its origin and its ID in it.
 type Ref struct {
-	Group uint8
-	ID    uint32
+	OriginID uint8
+	ID       uint32
 }
 
 // Key is the index key of the document.
-func (d Doc) Key() docid.Key { return docid.New(d.Group, d.ID) }
+func (d Doc) Key() docid.Key { return docid.New(d.OriginID, d.ID) }
 
 // Key is the index key of the document.
-func (r Ref) Key() docid.Key { return docid.New(r.Group, r.ID) }
+func (r Ref) Key() docid.Key { return docid.New(r.OriginID, r.ID) }
 
-// Tokens is the key5 token stream of a text.
-func (c *Collection) Tokens(text string) []byte {
-	return key5.AppendTokens(nil, key5.FromTokens(c.norm.Tokens(text)))
+// Tokens is the key5 token stream of a document: the tokens of its text,
+// then those of its group (PLAN_BUCKETS.md §17.1).
+func (c *Collection) Tokens(doc Doc) []byte {
+	tokens := key5.FromTokens(c.norm.Tokens(doc.Text))
+	if doc.Group != "" {
+		tokens = append(tokens, key5.GroupTokens(c.norm.Tokens(doc.Group))...)
+	}
+
+	return key5.AppendTokens(nil, tokens)
 }
 
 // ErrExists is returned by Init for a collection that already has a p.log.
@@ -156,7 +167,7 @@ var ErrExists = errors.New("collection: already exists")
 func (c *Collection) Init(ctx context.Context, docs []Doc) (CompactResult, error) {
 	byID := make(map[docid.Key][]byte, len(docs))
 	for _, doc := range docs {
-		byID[doc.Key()] = c.Tokens(doc.Text) // a repeated document keeps its last version
+		byID[doc.Key()] = c.Tokens(doc) // a repeated document keeps its last version
 	}
 
 	data, err := c.logOnlyLog(plog.Base{NormID: c.norm.ID(), UnixMs: c.opts.Now().UnixMilli()}, byID)
@@ -197,7 +208,7 @@ func (c *Collection) Apply(ctx context.Context, puts []Doc, dels []Ref) (plog.Ap
 	changes := make([]plog.Change, 0, len(puts)+len(dels))
 
 	for _, doc := range puts {
-		changes = append(changes, plog.Change{ID: doc.Key(), Tokens: c.Tokens(doc.Text)})
+		changes = append(changes, plog.Change{ID: doc.Key(), Tokens: c.Tokens(doc)})
 	}
 
 	for _, ref := range dels {

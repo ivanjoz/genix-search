@@ -112,7 +112,7 @@ func (c *Collection) rebuild(ctx context.Context, source Source, drop bool) (res
 	byID := make(map[docid.Key][]byte)
 
 	err = source(ctx, func(doc Doc) error {
-		byID[doc.Key()] = c.Tokens(doc.Text) // a repeated document keeps its last version
+		byID[doc.Key()] = c.Tokens(doc) // a repeated document keeps its last version
 
 		return nil
 	})

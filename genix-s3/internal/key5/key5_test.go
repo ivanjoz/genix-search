@@ -135,7 +135,7 @@ func TestSlotStreamRoundTrip(t *testing.T) {
 			t.Fatalf("slot %d: %d restarts, want %d", slot, len(restarts), want)
 		}
 
-		got, err := ReadSlot(bits.NewReader(w.Bytes(), 0), slot, len(keys))
+		got, err := ReadSlot(bits.NewReader(w.Bytes(), 0), slot, SpaceWord, len(keys))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -148,7 +148,7 @@ func TestSlotStreamRoundTrip(t *testing.T) {
 		for i, off := range restarts {
 			from := (i + 1) * RestartEvery
 
-			got, err := ReadSlot(bits.NewReader(w.Bytes(), 5*uint64(off)), slot, len(keys)-from)
+			got, err := ReadSlot(bits.NewReader(w.Bytes(), 5*uint64(off)), slot, SpaceWord, len(keys)-from)
 			if err != nil || !slices.Equal(got, keys[from:]) {
 				t.Fatalf("slot %d: restart %d does not decode", slot, i)
 			}
@@ -311,7 +311,7 @@ func TestContinuations(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if got, err := ReadSlot(bits.NewReader(w.Bytes(), 0), talla.Slot(), len(keys)); err != nil || !slices.Equal(got, keys) {
+	if got, err := ReadSlot(bits.NewReader(w.Bytes(), 0), talla.Slot(), SpaceWord, len(keys)); err != nil || !slices.Equal(got, keys) {
 		t.Fatalf("slot stream: %v %v", got, err)
 	}
 
@@ -322,5 +322,124 @@ func TestContinuations(t *testing.T) {
 
 	if got, err := ReadKeys(bits.NewReader(w.Bytes(), 0), len(keys)); err != nil || !slices.Equal(got, keys) {
 		t.Fatalf("key stream: %v %v", got, err)
+	}
+}
+
+// TestSignature: a segment of 2 units per word, the first in the slot of the
+// first word, and the key in its own space.
+func TestSignature(t *testing.T) {
+	cases := map[string]struct {
+		sig      string
+		segments int
+	}{
+		"centro civico":          {"s:cecv", 2},
+		"centro civico norte":    {"s:cecvnr", 3},
+		"condes vuelan alto":     {"s:coveat", 3},
+		"los condes vuelan alto": {"s:locnveat", 4}, // the first word gives its 1st and 2nd letters
+		"rio de la plata x":      {"s:ridelapa", 4}, // 4 words at most; 2 letters as they are
+		"villa a":                {"s:vi_a", 2},     // a letter after a 0 unit
+		"condes":                 {"s:condes", 1},   // one word is the word itself
+		"providencia":            {"s:providen", 1}, // its first 8 letters
+		"a villa":                {"s:villa", 1},    // a letter first does not count
+	}
+
+	for in, want := range cases {
+		k, n := Signature(strings.Fields(in))
+		if got := k.String(); got != want.sig || n != want.segments {
+			t.Errorf("%q: %q (%d segments), want %q (%d)", in, got, n, want.sig, want.segments)
+		}
+
+		if k.Space() != SpaceSignature || k.IsNumber() || k.IsHost() || k.IsContinuation() {
+			t.Errorf("%q: predicates of a signature", in)
+		}
+	}
+
+	if k, n := Signature(nil); n != 0 || k != Key(0).In(SpaceSignature) {
+		t.Fatal("no words")
+	}
+
+	// A group of one word shares the slot of its word but no other word of
+	// that slot matches it: "producto" is not the group "providencia".
+	prov, _ := Signature([]string{"providencia"})
+	if prod, _ := Signature([]string{"producto"}); prod == prov || prod.Slot() != prov.Slot() {
+		t.Fatal("one-word signatures")
+	}
+
+	if n, _ := Signature([]string{"2024"}); n != Number(2024).In(SpaceSignature) {
+		t.Fatalf("one number: %v", n)
+	}
+
+	// A number segment, and the signature still sorts and slots by its units.
+	sector, _ := Signature([]string{"sector", "5"})
+	if sector.Slot() != Word("sector").Key.Slot() || sector.Unit(2) != Num1 || sector.Unit(3) != 5 {
+		t.Fatalf("number segment: %v", sector)
+	}
+
+	// The spaces sort after the words, and a prefix range of a word holds none
+	// of them.
+	ce := Word("cecv").Key
+	if lo, hi := Word("ce").Key.PrefixRange(2); !(ce >= lo && ce <= hi) || (ce.In(SpaceGroupWord) <= hi) || ce.In(SpaceSignature) <= ce.In(SpaceGroupWord) {
+		t.Fatal("space order")
+	}
+}
+
+// TestGroupTokens: the group's words and its signature go after the text in
+// the token stream, each in its space, and every key stream keeps the space.
+func TestGroupTokens(t *testing.T) {
+	text := FromTokens(strings.Fields("juan carlos m maximiliano"))
+	group := GroupTokens(strings.Fields("centro civico 5 a"))
+
+	var names []string
+	for _, tok := range group {
+		names = append(names, tok.Key.String())
+	}
+
+	if got := strings.Join(names, " "); got != "g:centro g:civico g:#5 s:cecv#e_a" {
+		t.Fatalf("group tokens: %q", got)
+	}
+
+	tokens := append(text, group...)
+	back, err := ReadTokens(AppendTokens(nil, tokens))
+
+	if err != nil || !slices.Equal(back, tokens) {
+		t.Fatalf("stream: %v\n%v\n%v", err, back, tokens)
+	}
+
+	// A word of the text and the same units as a group word and a signature
+	// are three keys.
+	ce := Word("cecv").Key
+	keys := []Key{ce, Word("cecvs").Key, ce.In(SpaceGroupWord), Word("centro").Key.In(SpaceGroupWord), ce.In(SpaceSignature), Word("cecvnr").Key.In(SpaceSignature)}
+	slices.Sort(keys)
+
+	w := bits.NewWriter(nil)
+	if err := AppendKeys(w, keys); err != nil {
+		t.Fatal(err)
+	}
+
+	if got, err := ReadKeys(bits.NewReader(w.Bytes(), 0), len(keys)); err != nil || !slices.Equal(got, keys) {
+		t.Fatalf("key stream: %v %v", got, err)
+	}
+
+	for _, space := range []Space{SpaceWord, SpaceGroupWord, SpaceSignature} {
+		var in []Key
+		for _, k := range keys {
+			if k.Space() == space {
+				in = append(in, k)
+			}
+		}
+
+		w := bits.NewWriter(nil)
+		if err := AppendBucket(w, in); err != nil {
+			t.Fatal(err)
+		}
+
+		if got, err := ReadSlot(bits.NewReader(w.Bytes(), 0), ce.Slot(), space, len(in)); err != nil || !slices.Equal(got, in) {
+			t.Fatalf("slot stream of space %d: %v %v", space, got, err)
+		}
+	}
+
+	// Mixing spaces in one slot stream is an error.
+	if err := AppendBucket(bits.NewWriter(nil), []Key{ce, ce.In(SpaceGroupWord)}); err == nil {
+		t.Fatal("a slot stream took two spaces")
 	}
 }

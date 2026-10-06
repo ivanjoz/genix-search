@@ -1,0 +1,226 @@
+id	categoria	consulta	objetivo	bases
+q001	exacta	ginebra larios cl	869	AB
+q002	exacta	crema cacao carrefour	7321	AB
+q003	exacta	negro digestive fontaneda	4552	AB
+q004	exacta	extra loncheado revilla	2053	AB
+q005	exacta	cerveza shandy sabor	9395	AB
+q006	exacta	ensure max protein	3749	AB
+q007	exacta	himalaya mascarilla facial	3669	AB
+q008	exacta	serum antiencrespamiento	3376	AB
+q009	exacta	flocados talla	5672	AB
+q010	exacta	fusión queso	6273	AB
+q011	exacta	filetes panga ultracongelados	8212	AB
+q012	exacta	chocolate nata danone	6411	AB
+q013	exacta	polvorones selectos estepeña	3924	AB
+q014	exacta	zumo pomelo ecológico	9987	AB
+q015	exacta	solución única renu	9060	AB
+q016	exacta	carne almeja hacendado	8155	AB
+q017	exacta	transpirante dove	5082	AB
+q018	exacta	facial anti edad	3607	AB
+q019	exacta	bálsamo hidratante nivea	103	AB
+q020	exacta	energético cafeína enervit	3758	AB
+q021	exacta	pilas especiales litio	707	AB
+q022	exacta	perfumada fresa nata	5543	AB
+q023	exacta	fresh uplift syoss	3284	AB
+q024	exacta	ecológica eudermin	2846	AB
+q025	exacta	protein coco cacao	4610	AB
+q026	exacta	cerveza cruzcampo gran	9311	AB
+q027	exacta	fresco cabra	6587	AB
+q028	exacta	manos concentrada sin	2837	AB
+q029	exacta	touch malla	1292	AB
+q030	exacta	queso edam holland	6558	AB
+q031	exacta	sensible spray	115	AB
+q032	exacta	ojos roche posay	3655	AB
+q033	exacta	gel fijador extreme	3385	AB
+q034	exacta	tinto garnatxa fosca	9642	AB
+q035	exacta	disney mickey	8090	AB
+q036	parcial	mineral font deporte	248	AB
+q037	parcial	champú tendencia pantene	3266	AB
+q038	parcial	leche gusto unidades	1335	AB
+q039	parcial	gel quita deliplus	3133	AB
+q040	parcial	batata sin gluten	3825	AB
+q041	parcial	adobado gr	1814	AB
+q042	parcial	tinto valdepeñas negra	9799	AB
+q043	parcial	estropajo resistente	5721	AB
+q044	parcial	azúcar ecológico gluten	610	AB
+q045	parcial	ojos eyeliner deliplus	7004	AB
+q046	parcial	estuche after milano	8062	AB
+q047	parcial	frasco gr cebolla	3990	AB
+q048	parcial	cereales dia leche	4437	AB
+q049	parcial	sin huevo flan	6283	AB
+q050	parcial	carrefour pieles secas	2830	AB
+q051	parcial	chocolate miguelitos	7397	AB
+q052	parcial	capitain neceser lote	8098	AB
+q053	parcial	sin pinchos	1659	AB
+q054	parcial	aceite tortas	3937	AB
+q055	parcial	kg largo categoría	7788	AB
+q056	escribiendo	caldo natu	2430	AB
+q057	escribiendo	macarrones pas	7887	AB
+q058	escribiendo	pavo esp	1550	AB
+q059	escribiendo	pienso pollo per	7176	AB
+q060	escribiendo	bolsa craf	7606	AB
+q061	escribiendo	canelones atún coci	8428	AB
+q062	escribiendo	mantequilla pep	4635	AB
+q063	escribiendo	zanahoria ecológico deliz	9992	AB
+q064	escribiendo	delicious miel romer	3813	AB
+q065	escribiendo	biscottes integrales ecol	7279	AB
+q066	escribiendo	queso azul hoj	6476	AB
+q067	escribiendo	azafran hebr	3961	AB
+q068	escribiendo	crepes rellenos cho	7312	AB
+q069	escribiendo	paint rac	737	AB
+q070	escribiendo	alimenticio chocolate pedia	282	AB
+q071	escribiendo	vital coo	4447	AB
+q072	escribiendo	frigo comtessa tar	4687	AB
+q073	escribiendo	ahumado coci	1698	AB
+q074	escribiendo	as alimento perr	7066	AB
+q075	escribiendo	crayon caramel rebe	6883	AB
+q076	escribiendo	sport sabo	1063	AB
+q077	escribiendo	vino dulce crea	9741	AB
+q078	escribiendo	estuche dinamique perte	8058	AB
+q079	escribiendo	corporal tact	2797	AB
+q080	escribiendo	integrales sin azú	363	AB
+q081	typo	corazón lhche	2208	AB
+q082	typo	cappuccino aiku ml	6150	AB
+q083	typo	amaranto decologico smileat	381	AB
+q084	typo	ntaure gato	7219	AB
+q085	typo	tkopical envase lt	9875	AB
+q086	typo	madura ivea	3722	AB
+q087	typo	blanoc semidulce do	9428	AB
+q088	typo	ahvumado lonchas	1700	AB
+q089	typo	pauelos crema	5303	AB
+q090	typo	láctea natuarl actimel	6124	AB
+q091	typo	fritas light bolra	599	AB
+q092	typo	pavo adobada seyrrano	1984	AB
+q093	typo	magdalenas cuadradas enavsadas	7330	AB
+q094	typo	queos rallado proteína	6682	AB
+q095	typo	blanca sopa polplo	2459	AB
+q096	typo	panecillos perritos bimnbo	7504	AB
+q097	typo	gekco sabor caramelo	965	AB
+q098	typo	gel fijadjr absolut	3391	AB
+q099	typo	medio quso	6291	AB
+q100	typo	alimentarois vahiné ud	8797	AB
+q101	typo	brillo labios galactfic	6912	AB
+q102	typo	hermético cuajdrado	780	AB
+q103	typo	blanco superiro almirante	924	AB
+q104	typo	almendra alpo central	6073	AB
+q105	typo	cuadadas casado ud	7383	AB
+q106	tildes	firmeza orquidea ecologico	3728	AB
+q107	tildes	infantiles meses nestle	4553	AB
+q108	tildes	cortado campofrio envase	2005	AB
+q109	tildes	iberico carrefour aprox	1588	AB
+q110	tildes	liquido concentrado jabon	2980	AB
+q111	tildes	limpiador vitroceramicas spray	5683	AB
+q112	tildes	MANZANILLA ANIS HACENDADO	1472	AB
+q113	tildes	BOTON DURACELL	730	AB
+q114	tildes	VACUNO ANOJO CONGELADOS	1634	AB
+q115	tildes	CEREZOS JAPON CARREFOUR	2959	AB
+q116	tildes	sál barqueta gr	89	AB
+q117	tildes	quesó vaca ríe	6186	AB
+q118	tildes	vino tinto almá	9771	AB
+q119	tildes	dó cigales	9845	AB
+q120	tildes	pollo bólsa kg	7089	AB
+q121	marca	carrefour croisants		AB
+q122	marca	dia guantes		AB
+q123	marca	font vella agua mineral		AB
+q124	marca	danone danet natillas		AB
+q125	marca	delizum zumo		AB
+q126	marca	hacendado carne		AB
+q127	marca	aneto caldo		AB
+q128	marca	dove desodorante		AB
+q129	marca	nivea men after shave		AB
+q130	marca	the fruit company ambientador		AB
+q131	marca	eudermin crema		AB
+q132	marca	hacendado queso		AB
+q133	marca	neutrogena crema manos		AB
+q134	marca	pantene champu		AB
+q135	marca	gallo macarones		AB
+q136	numeros	queso puro 350 g	6659	AB
+q137	numeros	crema suavizante 500ml	3353	AB
+q138	numeros	patatas baby 400g	4223	AB
+q139	numeros	salchichas ahumadas 150g	2022	AB
+q140	numeros	legendario ron 70 cl	889	AB
+q141	numeros	chupete tetina 1 ud	1277	AB
+q142	numeros	yogur bífidus 125 g	6755	AB
+q143	numeros	dr schar 300 gr	7353	AB
+q144	numeros	colgate total 75 ml	4803	AB
+q145	numeros	masa obleas 290 g	8591	AB
+q146	numeros	aceite motor 5 l	649	AB
+q147	numeros	font vella 1,25	1115	AB
+q148	numeros	vaso café 8,7	9191	AB
+q149	numeros	bebida isotónica 1,5	1052	AB
+q150	numeros	aquarius sabor 1,5	1029	AB
+q151	nombre+grupo	bosque bolsas de basura	5584	AB
+q152	nombre+grupo	cream papel y pañuelos	5173	AB
+q153	nombre+grupo	naranja infusiones y té	1523	AB
+q154	nombre+grupo	suave cuidado de la barba	2943	AB
+q155	nombre+grupo	gel bote higiene íntima	5407	AB
+q156	nombre+grupo	baby geles y jabones	5240	AB
+q157	nombre+grupo	carrefour extra quesos	6181	AB
+q158	nombre+grupo	especial utiles y consumibles	5965	AB
+q159	nombre+grupo	madera bazar y accesorios	716	AB
+q160	nombre+grupo	crema hacendado conservas	2438	AB
+q161	nombre+grupo	creme cuidado corporal	2923	AB
+q162	nombre+grupo	crema gluten chocolates dulces y desayunos	3796	AB
+q163	nombre+grupo	bandeja pastelería y tartas	7558	AB
+q164	nombre+grupo	ecológica cervezas	9294	AB
+q165	nombre+grupo	leche chocolates tortitas y otros	4629	AB
+q166	nombre+grupo	suave cuidado de las uñas	3129	AB
+q167	nombre+grupo	relleno salado y otros	7537	AB
+q168	nombre+grupo	negra especias y condimentos	4018	AB
+q169	nombre+grupo	carrefour perfumería	8007	AB
+q170	nombre+grupo	porciones congelados	8313	AB
+q171	nombre+grupo	comida dieta y nutrición	3741	AB
+q172	nombre+grupo	blanco conservas de pescado	2492	AB
+q173	nombre+grupo	home bazar y accesorios hogar	722	AB
+q174	nombre+grupo	zero yogures	6847	AB
+q175	nombre+grupo	carrefour ibérico carnicería	1603	AB
+q176	grupo	platos preparados preparados y ahumados		B
+q177	grupo	postres repostería		B
+q178	grupo	salud higiene bucal		B
+q179	grupo	repostería y harinas dulces		B
+q180	grupo	perfumería higiene infantil		B
+q181	grupo	vajilla y cubiertos bazar		B
+q182	grupo	salud cuidado corporal		B
+q183	grupo	navideños dulces y desayunos		B
+q184	grupo	ensaladas		B
+q185	grupo	accesorios higiene bucal		B
+q186	grupo	café molido y en grano		B
+q187	grupo	whisky ron y ginebra		B
+q188	grupo	platos preparados		B
+q189	grupo	limpieza facial		B
+q190	grupo	salud e higiene		B
+q191	negativa	smartphone		AB
+q192	negativa	zapatillas running		AB
+q193	negativa	cuaderno universitario		AB
+q194	negativa	quirofano		AB
+q195	negativa	xilofono		AB
+q196	negativa	lazkcte		AB
+q197	negativa	baqwzar		AB
+q198	negativa	paxqsta		AB
+q199	negativa	emvxbut		AB
+q200	negativa	jaqwmon		AB
+q201	plural	masa empanadas	8584	AB
+q202	plural	microfibras rozenbal colores	5484	AB
+q203	plural	crudo medianos	8183	AB
+q204	plural	dulces aguja sangue	9808	AB
+q205	plural	cerdo trufas	1718	AB
+q206	plural	integrales lacer oros	4818	AB
+q207	plural	nueces pelada ecológicas	4323	AB
+q208	plural	soluble originales cola	1328	AB
+q209	plural	cerveza clásicas steinburg	9307	AB
+q210	plural	taco pota	8367	AB
+q211	plural	troceada natural	2725	AB
+q212	plural	menta fresca grageas	2126	AB
+q213	plural	floral rosa frescas	7943	AB
+q214	plural	cottonlike normales	5375	AB
+q215	plural	manzana rojas	4191	AB
+q216	plural	variadas bolsa	4124	AB
+q217	plural	salmón empanado pescanova	8311	AB
+q218	plural	doradas azúcar caja	4338	AB
+q219	plural	pie calzado funsol	5335	AB
+q220	plural	especial baño	5606	AB
+q221	plural	chinchetas color	7587	AB
+q222	plural	energética pack lata	1158	AB
+q223	plural	paratodo colhogar rollo	5887	AB
+q224	plural	manzanilla anís bolsita	1483	AB
+q225	plural	anti mancha hidratante	3649	AB

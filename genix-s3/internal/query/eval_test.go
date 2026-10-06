@@ -31,9 +31,11 @@ import (
 // general case, nothing assumed), or dense 1..N (an auto-increment key, and
 // what the previous genix-s3 evaluation used). The rankings, typos and
 // writes are measured with random IDs only. GXS_EVAL_GROUPING=es100 builds
-// the index grouped. GXS_EVAL_GROUPS=n spreads the documents at random over n
-// document groups (n tables in one index), each with its own IDs: dense 1..N
-// per group, or random.
+// the index grouped. GXS_EVAL_ORIGINS=n spreads the documents at random over n
+// origins (n tables in one index), each with its own IDs: dense 1..N per
+// origin, or random. GXS_EVAL_TEXTGROUPS=n gives 2 of every 3 documents one
+// of n synthetic groups (PLAN_BUCKETS.md §17), and measures the queries that
+// name it.
 func TestEval(t *testing.T) {
 	path := os.Getenv("GXS_EVAL_CSV")
 	if path == "" {
@@ -43,11 +45,11 @@ func TestEval(t *testing.T) {
 	names := readLines(t, path)
 	queries := sampleQueries(names, 3000)
 
-	groups := 1
-	if n := os.Getenv("GXS_EVAL_GROUPS"); n != "" {
+	origins := 1
+	if n := os.Getenv("GXS_EVAL_ORIGINS"); n != "" {
 		var err error
-		if groups, err = strconv.Atoi(n); err != nil || groups < 1 || groups > 256 {
-			t.Fatalf("GXS_EVAL_GROUPS=%q: 1 to 256", n)
+		if origins, err = strconv.Atoi(n); err != nil || origins < 1 || origins > 256 {
+			t.Fatalf("GXS_EVAL_ORIGINS=%q: 1 to 256", n)
 		}
 	}
 
@@ -61,26 +63,36 @@ func TestEval(t *testing.T) {
 			t.Run(fmt.Sprintf("x%d/%s", scale, mode), func(t *testing.T) {
 				r := rand.New(rand.NewPCG(uint64(scale), 99))
 				used := map[docid.Key]bool{}
-				next := make([]uint32, groups) // the last dense ID of each group
+				next := make([]uint32, origins) // the last dense ID of each origin
 
 				var docs []collection.Doc
 
 				for range scale {
 					for _, name := range names {
-						group := uint8(0)
-						if groups > 1 {
-							group = uint8(r.IntN(groups))
+						origin := uint8(0)
+						if origins > 1 {
+							origin = uint8(r.IntN(origins))
 						}
 
-						next[group]++
-						k := docid.New(group, next[group])
+						next[origin]++
+						k := docid.New(origin, next[origin])
 
-						for !dense && (k.ID() == next[group] || used[k]) {
-							k = docid.New(group, r.Uint32())
+						for !dense && (k.ID() == next[origin] || used[k]) {
+							k = docid.New(origin, r.Uint32())
 						}
 
 						used[k] = true
-						docs = append(docs, collection.Doc{Group: group, ID: k.ID(), Text: name})
+						docs = append(docs, collection.Doc{OriginID: origin, ID: k.ID(), Text: name})
+					}
+				}
+
+				if n := evalTextGroups(t); n > 0 {
+					groups := syntheticGroups(n)
+					for i := range docs {
+						if r.IntN(3) > 0 {
+							// A few groups take most documents.
+							docs[i].Group = groups[int(float64(n)*r.Float64()*r.Float64()*r.Float64())]
+						}
 					}
 				}
 
@@ -88,6 +100,110 @@ func TestEval(t *testing.T) {
 			})
 		}
 	}
+}
+
+// evalTextGroups is GXS_EVAL_TEXTGROUPS, 0 without it.
+func evalTextGroups(t *testing.T) int {
+	v := os.Getenv("GXS_EVAL_TEXTGROUPS")
+	if v == "" {
+		return 0
+	}
+
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		t.Fatalf("GXS_EVAL_TEXTGROUPS=%q", v)
+	}
+
+	return n
+}
+
+// syntheticGroups are n group names: Chilean places, then the same with a
+// sector after them.
+func syntheticGroups(n int) []string {
+	places := []string{"Santiago Centro", "Providencia", "Las Condes", "Ñuñoa", "La Florida", "Maipú", "Puente Alto",
+		"Vitacura", "Lo Barnechea", "La Reina", "Peñalolén", "Macul", "San Miguel", "Estación Central", "Quinta Normal",
+		"Recoleta", "Independencia", "Conchalí", "Huechuraba", "Quilicura", "Renca", "Cerro Navia", "Lo Prado",
+		"Pudahuel", "Cerrillos", "Lo Espejo", "Pedro Aguirre Cerda", "San Joaquín", "La Granja", "La Pintana",
+		"San Ramón", "La Cisterna", "El Bosque", "San Bernardo", "Colina", "Lampa", "Buin", "Paine", "Talagante",
+		"Peñaflor", "Valparaíso", "Viña del Mar", "Concepción", "Temuco", "Antofagasta", "Iquique", "Arica",
+		"La Serena", "Coquimbo", "Rancagua", "Talca", "Chillán", "Valdivia", "Osorno", "Puerto Montt",
+		"Punta Arenas", "Calama", "Copiapó", "Curicó", "Los Ángeles"}
+	sectors := []string{"", " Norte", " Sur", " Oriente", " Poniente", " Centro Cívico", " Villa Los Aromos", " Alto"}
+
+	var out []string
+
+	for _, sector := range sectors {
+		for _, place := range places {
+			if len(out) == n {
+				return out
+			}
+
+			out = append(out, place+sector)
+		}
+	}
+
+	for len(out) < n {
+		out = append(out, fmt.Sprintf("%s %d", places[len(out)%len(places)], len(out)))
+	}
+
+	return out
+}
+
+// evalGroupQueries measures queries that name a document's group after the
+// first words of its text, against the same words alone: what they read
+// cold, and where the document ranks.
+func evalGroupQueries(t *testing.T, f *fixture, docs []collection.Doc) {
+	ctx := context.Background()
+
+	var requests, bytes, withRank, withoutRank []int
+	var top1With, top1Without, n int
+
+	rank := func(resp Response, d collection.Doc) int {
+		for i, h := range resp.Hits {
+			if h.OriginID == d.OriginID && h.ID == d.ID {
+				return i + 1
+			}
+		}
+
+		return len(resp.Hits) + 1
+	}
+
+	for i, d := range docs {
+		if d.Group == "" || i%7 != 0 || n == 1500 {
+			continue
+		}
+
+		words := strings.Fields(d.Text)
+		name := strings.Join(words[:min(2, len(words))], " ")
+		n++
+
+		resp, err := f.engine(DefaultOptions()).Search(ctx, Request{Query: name + " " + d.Group, Limit: 100})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		requests = append(requests, resp.Stats.Requests)
+		bytes = append(bytes, int(resp.Stats.Bytes))
+		withRank = append(withRank, rank(resp, d))
+
+		if withRank[len(withRank)-1] == 1 {
+			top1With++
+		}
+
+		alone, err := f.engine(DefaultOptions()).Search(ctx, Request{Query: name, Limit: 100})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		withoutRank = append(withoutRank, rank(alone, d))
+
+		if withoutRank[len(withoutRank)-1] == 1 {
+			top1Without++
+		}
+	}
+
+	t.Logf("group queries (%d, cold): requests %.2f (max %d) · bytes %s · rank of the document %.1f with the group, %.1f without · first %d with, %d without",
+		n, avgOf(requests), slices.Max(requests), dist(bytes), avgOf(withRank), avgOf(withoutRank), top1With, top1Without)
 }
 
 type dist []int
@@ -216,16 +332,23 @@ func evalScale(t *testing.T, docs []collection.Doc, queries []string, r *rand.Ra
 		}
 	}
 
+	if slices.ContainsFunc(docs, func(d collection.Doc) bool { return d.Group != "" }) {
+		evalGroupQueries(t, f, docs)
+	}
+
 	if !all {
 		return
 	}
 
 	state := map[docid.Key]string{}
+	whole := map[docid.Key]collection.Doc{}
+
 	for _, d := range docs {
 		state[d.Key()] = d.Text
+		whole[d.Key()] = d
 	}
 
-	ref := newReference(normalize.Default, state, state)
+	ref := newReference(normalize.Default, whole, whole, nil, 0)
 	full := newFullText(normalize.Default, state)
 
 	// Ranking: against the same rules over every document, and against the
@@ -336,7 +459,7 @@ func evalFuzzy(t *testing.T, f *fixture, docs []collection.Doc, textOf map[docid
 			t.Fatal(err)
 		}
 
-		if slices.ContainsFunc(resp.Hits, func(h Hit) bool { return textOf[docid.New(h.Group, h.ID)] == doc.Text }) {
+		if slices.ContainsFunc(resp.Hits, func(h Hit) bool { return textOf[docid.New(h.OriginID, h.ID)] == doc.Text }) {
 			found++
 		}
 
@@ -353,7 +476,7 @@ func evalFuzzy(t *testing.T, f *fixture, docs []collection.Doc, textOf map[docid
 			t.Fatal(err)
 		}
 
-		if slices.ContainsFunc(whole.Hits, func(h Hit) bool { return textOf[docid.New(h.Group, h.ID)] == doc.Text }) {
+		if slices.ContainsFunc(whole.Hits, func(h Hit) bool { return textOf[docid.New(h.OriginID, h.ID)] == doc.Text }) {
 			foundAll++
 		}
 
@@ -403,7 +526,7 @@ func evalWrites(t *testing.T, f *fixture, docs []collection.Doc, r *rand.Rand, q
 	appends := 1
 	for !res.CompactRequested {
 		doc := docs[r.IntN(len(docs))]
-		if res, err = f.w.Put(ctx, []collection.Doc{{Group: doc.Group, ID: doc.ID, Text: doc.Text + " nuevo"}}); err != nil {
+		if res, err = f.w.Put(ctx, []collection.Doc{{OriginID: doc.OriginID, ID: doc.ID, Text: doc.Text + " nuevo"}}); err != nil {
 			t.Fatal(err)
 		}
 
@@ -469,18 +592,33 @@ func newFullText(norm *normalize.Normalizer, docs map[docid.Key]string) *fullTex
 	return f
 }
 
-func (f *fullText) matches(t *Term, tok string) matchKind {
+func (f *fullText) matches(t *Term, tok string) (matchKind, uint8) {
 	if !t.Explicit && tok == t.Text {
-		return exactMatch
+		return exactMatch, 0
 	}
 
 	if t.Auto || t.Explicit {
 		if tok == t.Text || (t.prefixable() && strings.HasPrefix(tok, t.Text)) {
-			return prefixMatch
+			return prefixMatch, 0
 		}
 	}
 
-	return noMatch
+	// A near word (§19), with every letter.
+	if t.Explicit || t.Number || normalize.IsNumber(tok) || t.letter() || t.virtual() {
+		return noMatch, 0
+	}
+
+	short, long, kind := tok, t.Text, shorterMatch
+	if len(tok) > len(t.Text) {
+		short, long, kind = t.Text, tok, longerMatch
+	}
+
+	d := len(long) - len(short)
+	if d > 0 && d <= NearExtra && len(short) >= NearMinLetters && strings.HasPrefix(long, short) && (d == 1 || strings.HasSuffix(long, "es")) {
+		return kind, uint8(d)
+	}
+
+	return noMatch, 0
 }
 
 func (f *fullText) top(q Parsed, limit, docs int) []docid.Key {
@@ -488,7 +626,7 @@ func (f *fullText) top(q Parsed, limit, docs int) []docid.Key {
 
 	for word, list := range f.byWord {
 		for i := range q.Terms {
-			if f.matches(&q.Terms[i], word) != noMatch {
+			if kind, _ := f.matches(&q.Terms[i], word); kind != noMatch {
 				for _, d := range list {
 					cand[d] = true
 				}
@@ -506,7 +644,8 @@ func (f *fullText) top(q Parsed, limit, docs int) []docid.Key {
 
 		for pos, tok := range f.tokens[d] {
 			for i := range q.Terms {
-				matches[i].add(f.matches(&q.Terms[i], tok), 0, uint8(min(pos, 255)))
+				kind, dist := f.matches(&q.Terms[i], tok)
+				matches[i].add(kind, dist, uint8(min(pos, 255)))
 			}
 		}
 

@@ -37,9 +37,34 @@ const MaxNumber = 1<<15 - 1
 const Slots = 1024
 
 // Key is a key of up to 8 units, unit 0 in the highest 5 of 40 bits and the
-// unused units at 0. Comparing two Keys as integers compares them unit by
-// unit, a shorter word first: the order of the index.
+// unused units at 0, and its space in bits 40–41. Comparing two Keys as
+// integers compares their space, then unit by unit, a shorter word first: the
+// order of the index.
 type Key uint64
+
+// Space is the kind of a key (PLAN_BUCKETS.md §17.2). The space is outside
+// the 8 units: in the token stream it is a header unit, in a .idx the slot
+// directory, in a key stream a count; a Key carries it in bits 40–41.
+type Space uint8
+
+const (
+	// SpaceWord is a word or a number of the text.
+	SpaceWord Space = iota
+	// SpaceGroupWord is a word or a number of the document's group.
+	SpaceGroupWord
+	// SpaceSignature is the signature of the document's group.
+	SpaceSignature
+	// Spaces is the number of spaces.
+	Spaces
+)
+
+const spaceShift = 40
+
+// Space is the space of the key.
+func (k Key) Space() Space { return Space(k >> spaceShift) }
+
+// In is the key with the same units in space s.
+func (k Key) In(s Space) Key { return k&(1<<spaceShift-1) | Key(s)<<spaceShift }
 
 // Token is a key and the tail of the word it came from (§3.4).
 type Token struct {
@@ -97,15 +122,17 @@ func (k Key) Slot() uint16 {
 	return uint16(k>>30) & (Slots - 1)
 }
 
-// IsNumber reports a NUM_n key.
+// IsNumber reports a NUM_n key. A signature is never one, even when it starts
+// with the segment of a number.
 func (k Key) IsNumber() bool {
 	u := k.Unit(0)
 
-	return u >= Num1 && u <= Num3
+	return u >= Num1 && u <= Num3 && k.Space() != SpaceSignature
 }
 
-// Len is the number of units: n+1 for a number, the letters for a word,
-// and for a continuation its host's, the mark and the letter.
+// Len is the number of units: n+1 for a number, the letters for a word, for
+// a continuation its host's, the mark and the letter, and for a signature up
+// to its last unit other than 0.
 func (k Key) Len() int {
 	if k.IsNumber() {
 		return int(k.Unit(0)-Num1) + 2
@@ -135,13 +162,13 @@ func Continuation(host Key, letter uint8) Key {
 func (k Key) IsContinuation() bool {
 	n := k.Len()
 
-	return !k.IsNumber() && n >= 4 && k.Unit(n-2) == End
+	return k.Space() == SpaceWord && !k.IsNumber() && n >= 4 && k.Unit(n-2) == End
 }
 
-// IsHost reports a key a one-letter word continues: a word of two letters
-// or more.
+// IsHost reports a key a one-letter word continues: a word of the text of
+// two letters or more.
 func (k Key) IsHost() bool {
-	return !k.IsNumber() && !k.IsContinuation() && k.Len() >= 2
+	return k.Space() == SpaceWord && !k.IsNumber() && !k.IsContinuation() && k.Len() >= 2
 }
 
 // Units appends the key's units to dst.
@@ -163,13 +190,34 @@ func (k Key) Value() uint32 {
 	return v
 }
 
-// String is the word, or "#" and the value of a number.
+// String is the word, or "#" and the value of a number; "g:" before a group
+// word, "s:" before a signature, whose 0 units are "_".
 func (k Key) String() string {
-	if k.IsNumber() {
-		return "#" + strconv.Itoa(int(k.Value()))
+	var b strings.Builder
+
+	switch k.Space() {
+	case SpaceGroupWord:
+		b.WriteString("g:")
+	case SpaceSignature:
+		b.WriteString("s:")
+
+		for i := range k.Len() {
+			if u := k.Unit(i); u == End {
+				b.WriteByte('_')
+			} else if u >= Num1 && u <= Num3 {
+				b.WriteByte('#')
+			} else {
+				b.WriteByte(Letter(u))
+			}
+		}
+
+		return b.String()
 	}
 
-	var b strings.Builder
+	if k.IsNumber() {
+		return b.String() + "#" + strconv.Itoa(int(k.Value()))
+	}
+
 	for i := range k.Len() {
 		if u := k.Unit(i); u == End {
 			b.WriteString("›")
@@ -316,4 +364,70 @@ func NumberPrefixRanges(digits string) [][2]uint32 {
 	}
 
 	return ranges
+}
+
+// Segments is the most words a signature holds: 2 units each.
+const Segments = MaxUnits / 2
+
+// Signature is the key of a group's words (PLAN_BUCKETS.md §17.1): a segment
+// of 2 units per word, up to Segments words. The first word gives its 1st and
+// 2nd letters, so the signature lives in that word's slot; the others their
+// 1st and 3rd. A word of 2 letters gives both, one of 1 letter a 0 unit and
+// the letter, a number the first 2 units of its key. Words of 1 letter at the
+// start do not count. segments is 0 for no words.
+//
+// A group of one word is that word's key instead, its first 8 letters: 2
+// letters would match every word of the query that starts with them, and
+// a signature of one segment is only matched exactly anyway.
+func Signature(words []string) (k Key, segments int) {
+	for len(words) > 0 && IsLetter(words[0]) {
+		words = words[1:]
+	}
+
+	if len(words) == 1 {
+		return FromToken(words[0]).Key.In(SpaceSignature), 1
+	}
+
+	units := make([]uint8, 0, MaxUnits)
+
+	for i, w := range words[:min(len(words), Segments)] {
+		a, b := segment(w, i == 0)
+		units = append(units, a, b)
+	}
+
+	return FromUnits(units).In(SpaceSignature), len(units) / 2
+}
+
+func segment(w string, first bool) (uint8, uint8) {
+	switch {
+	case normalize.IsNumber(w):
+		k := Number(NumberValue(w))
+
+		return k.Unit(0), k.Unit(1)
+	case len(w) == 1:
+		return End, Unit(w[0])
+	case len(w) == 2 || first:
+		return Unit(w[0]), Unit(w[1])
+	}
+
+	return Unit(w[0]), Unit(w[2])
+}
+
+// GroupTokens are the tokens of a document's group, after those of its text
+// (PLAN_BUCKETS.md §17.1): every word of 2 letters or more and every number
+// as a group word, in order, then the signature. Group words have no tail.
+func GroupTokens(words []string) []Token {
+	var out []Token
+
+	for _, w := range words {
+		if !IsLetter(w) {
+			out = append(out, Token{Key: FromToken(w).Key.In(SpaceGroupWord)})
+		}
+	}
+
+	if sig, n := Signature(words); n > 0 {
+		out = append(out, Token{Key: sig})
+	}
+
+	return out
 }

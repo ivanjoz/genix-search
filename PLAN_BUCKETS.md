@@ -1,8 +1,8 @@
 # Plan: índice por buckets (`.idx` + `.db`) sobre S3 Express
 
 > Estado: **implementado** (2026-10-03) en `genix-s3`. Reemplaza las secciones 5 a 8 de `PLAN_5BIT.md` (formatos, ruta de consulta, escritura): el diccionario global `k.<gen>`, los postings `p.<gen>`, el snapshot, el manifest y las generaciones desaparecen. **Siguen vigentes** las secciones 2 a 4 de `PLAN_5BIT.md`: el alfabeto de 5 bits, la clave de 8 letras con su cola de 2 bits, los números `NUM_n`, el normalizador y `NormID`.
-> **Qué se optimiza**, en orden: los requests a S3 por consulta, después los bytes leídos por consulta. El tamaño de los archivos no es el objetivo. No se supone nada del corpus ni de los IDs (`uint32` arbitrarios dentro de cada grupo de documentos, 15).
-> Lo que la implementación decidió por su cuenta, y lo que quedó para después (cabezas de prefijo, combinaciones de 3 palabras), está en 12. Las mediciones están en 13. La agrupación de buckets en menos objetos (flag `Grouping`; `es100` por defecto) está en 14. El grupo del documento (`uint8`, varias tablas en un índice) está en 15. Las palabras de una letra (continuaciones) y el flag de stopwords están en 16.
+> **Qué se optimiza**, en orden: los requests a S3 por consulta, después los bytes leídos por consulta. El tamaño de los archivos no es el objetivo. No se supone nada del corpus ni de los IDs (`uint32` arbitrarios dentro de cada origen, 15).
+> Lo que la implementación decidió por su cuenta, y lo que quedó para después (cabezas de prefijo, combinaciones de 3 palabras), está en 12. Las mediciones están en 13. La agrupación de buckets en menos objetos (flag `Grouping`; `es100` por defecto) está en 14. El origen del documento (`uint8`, varias tablas en un índice; antes "grupo del documento") está en 15. Las palabras de una letra (continuaciones) y el flag de stopwords están en 16. El grupo de texto del documento ("Juan Carlos" en "centro civico": firma y palabras de grupo) y el ranking por puntos están en 17. El benchmark estándar (corpus fijo, juicios de relevancia, BM25 de referencia) está en 18 y en `PLAN_BENCH.md`. Singular y plural (palabras cercanas, "bolsas" encuentra "Bolsa") están en 19.
 
 ## 0. Resumen
 
@@ -19,7 +19,7 @@
 | Colección chica (sin índice) | 2 (el `.idx` da 404) | 1 |
 | En caliente (`.idx` en caché) | 1 + rangos del `.db` | 1 |
 
-Semántica de resultados: la de `PLAN_5BIT.md` 13.3, **O con niveles estrictos**: primero cuántas palabras de la consulta tiene el producto (cobertura), después el puntaje, después la clave del documento (grupo, después ID; 15).
+Semántica de resultados: la de `PLAN_5BIT.md` 13.3, **O con niveles estrictos**: primero cuántas palabras de la consulta tiene el producto (cobertura), después el puntaje, después la clave del documento (origen, después ID; 15).
 
 ---
 
@@ -47,10 +47,10 @@ Reglas de `PLAN_5BIT.md` 5.0: solo bytes, little‑endian, streams de bits LSB�
 
 ### 2.1 Lista de una palabra
 
-Es el formato de `PLAN_5BIT.md` 5.2: n postings ordenados por `(clave, pos)`, con la clave del documento `grupo << 32 | ID` (15). Un producto con la palabra en dos posiciones tiene dos postings.
+Es el formato de `PLAN_5BIT.md` 5.2: n postings ordenados por `(clave, pos)`, con la clave del documento `origen << 32 | ID` (15). Un producto con la palabra en dos posiciones tiene dos postings.
 
 ```
-diferencias de clave n − 1 valores: W bits fijos (Codec 0, con o sin escapes de grupo, 15.2) o varint de nibbles (Codec 1: 3 bits de valor + 1 de continuación)
+diferencias de clave n − 1 valores: W bits fijos (Codec 0, con o sin escapes de origen, 15.2) o varint de nibbles (Codec 1: 3 bits de valor + 1 de continuación)
 posiciones          n × 4 bits (saturadas en 15)
 colas               n × 2 bits, solo si Tail = 1
 ```
@@ -98,8 +98,8 @@ Header (64 B)
 ETag     [ETagLen]B   ETag que S3 devolvió al escribir el .db
 Keys     n u16 | por bucket del grupo que tiene claves: bucket u16 | claves u32
          y, por bucket en ese orden, sus claves ordenadas (2.3)
-Fields   wCount u8 | wDup u8 | wFirst u8 | wX u8 | wGroup u8 | grupo base u8 | 0 u16 | ID base u32, y por clave, en bits:
-           count[wCount] | dup[wDup] | grupo−base[wGroup] | ID−base[wFirst] | V[2+wX] | loc[2]
+Fields   wCount u8 | wDup u8 | wFirst u8 | wX u8 | wOrigin u8 | origen base u8 | 0 u16 | ID base u32, y por clave, en bits:
+           count[wCount] | dup[wDup] | origen−base[wOrigin] | ID−base[wFirst] | V[2+wX] | loc[2]
 Heads    reservada para las cabezas de prefijo (3.2): hoy siempre vacía
 Exp      expansiones (3.3), una por palabra expandida, en orden de clave
 Inline   las listas en línea, pegadas en bits en orden de clave
@@ -143,8 +143,8 @@ n × largo[wLen] bits                    bytes de cada bloque de combinaciones e
 ### 3.4 Grupo de cabeza
 
 ```
-tail u8 | flags u8 (bit 0 = hay colas) | wID u8 | grupo base u8 | m u16 | wGroup u8 | 0 u8 | total u32 | ID base u32 | size u32     (20 B)
-m entradas, en bits (size bytes): grupo−base[wGroup] | ID−base[wID] | postings−1 (nibbles) | pos[4] por posting | cola[2] por posting (con el flag)
+tail u8 | flags u8 (bit 0 = hay colas) | wID u8 | origen base u8 | m u16 | wOrigin u8 | 0 u8 | total u32 | ID base u32 | size u32     (20 B)
+m entradas, en bits (size bytes): origen−base[wOrigin] | ID−base[wID] | postings−1 (nibbles) | pos[4] por posting | cola[2] por posting (con el flag)
 ```
 
 - **Orden:** por `min(primera posición, 2)` (primera palabra, segunda, resto: el bonus de posición de `PLAN_5BIT.md` 13.3) y después por clave ascendente. Es el orden del puntaje de una consulta de ese término solo, así que las m primeras entradas son el top exacto de la palabra.
@@ -165,7 +165,7 @@ Zona de combinaciones   desde DBCombos: los bloques, en orden de palabra expandi
 Bloque de combinaciones (se lee entero):
 
 ```
-n u16 | grupo de la base u8 | 0 u8 | ID de la base u32
+n u16 | origen de la base u8 | 0 u8 | ID de la base u32
 n co‑claves (2.3), alineadas a byte
 por co‑clave, en su orden: las columnas (2.2) de la palabra expandida y de la co‑clave
 ```
@@ -242,7 +242,7 @@ Un prefijo o un typo que tiene que leer muchas listas sigue limitado por `Prefix
 172 CRC32C         uint32
 ```
 
-Los frames (`Batch`, `Compact`, `Docs`) son los de `PLAN_5BIT.md`, salvo que cada documento se nombra con su clave de 5 bytes (`ID u32 | grupo u8`, 15).
+Los frames (`Batch`, `Compact`, `Docs`) son los de `PLAN_5BIT.md`, salvo que cada documento se nombra con su clave de 5 bytes (`ID u32 | origen u8`, 15).
 
 **Reglas del lector**, para cada `.idx` de la ronda 1 (el header alcanza para decidir):
 
@@ -619,38 +619,38 @@ Qué dicen:
 
 ---
 
-## 15. Grupo del documento
+## 15. Origen del documento
 
-> Agregado el 2026-10-05. Un documento es un **grupo** (`uint8`) y un **ID** (`uint32`) único dentro del grupo: el mismo ID en dos grupos son dos documentos. Sirve para tener varias tablas en un índice, para que un agente busque un nombre sin saber qué es. Un documento nunca cambia de grupo, la búsqueda no filtra por grupo y el grupo no entra en el puntaje: cada resultado trae su grupo y su ID.
+> Agregado el 2026-10-05. Un documento es un **origen** (`uint8`) y un **ID** (`uint32`) único dentro del origen: el mismo ID en dos orígenes son dos documentos. Sirve para tener varias tablas en un índice, para que un agente busque un nombre sin saber qué es. Un documento nunca cambia de origen, la búsqueda no filtra por origen y el origen no entra en el puntaje: cada resultado trae su origen y su ID.
 >
-> No confundir con los grupos de buckets de 14 ni con los grupos de cabeza de 3.4.
+> Hasta el 2026-10-05 se llamaba "grupo del documento" (`Group`); se renombró porque "grupo" pasa a ser el grupo de texto del documento. No confundir con los grupos de buckets de 14 ni con los grupos de cabeza de 3.4.
 
 ### 15.1 La clave
 
-- Todo el índice trabaja con la **clave del documento**, `grupo << 32 | ID` (40 bits, paquete `docid`). Las listas, las cabezas y las combinaciones están ordenadas por clave: por grupo y, dentro del grupo, por ID.
-- **Desempate:** con la misma cobertura y el mismo puntaje, va primero la clave menor (grupo menor, después ID menor). Es el mismo orden de las cabezas, que tiene que coincidir con el del ranking para que la cabeza dé el top exacto (6.1).
-- **En `p.log` y `tokens`** la clave ocupa 5 bytes: `ID u32 | grupo u8`. El directorio de chunks de `tokens` guarda la primera clave en un u64 (20 B por chunk).
-- **API:** `Doc{Group, ID, Text}`, `Ref{Group, ID}` para borrar, `Hit{Group, ID, …}`, `QueryHit.Group` (`cb:"4"`). En el CLI, un documento es `ID` (grupo 0) o `GRUPO:ID`.
+- Todo el índice trabaja con la **clave del documento**, `origen << 32 | ID` (40 bits, paquete `docid`). Las listas, las cabezas y las combinaciones están ordenadas por clave: por origen y, dentro del origen, por ID.
+- **Desempate:** con la misma cobertura y el mismo puntaje, va primero la clave menor (origen menor, después ID menor). Es el mismo orden de las cabezas, que tiene que coincidir con el del ranking para que la cabeza dé el top exacto (6.1).
+- **En `p.log` y `tokens`** la clave ocupa 5 bytes: `ID u32 | origen u8`. El directorio de chunks de `tokens` guarda la primera clave en un u64 (20 B por chunk).
+- **API:** `Doc{OriginID, ID, Text}`, `Ref{OriginID, ID}` para borrar, `Hit{OriginID, ID, …}`, `QueryHit.OriginID` (`cb:"4"`). En el CLI, un documento es `ID` (origen 0) o `ORIGEN:ID`.
 - Formatos: `p.log`, `.idx`, `.db` y `tokens` pasan a `Format = 3`. Los índices de antes se reconstruyen (`Rebuild`).
 
-### 15.2 Cómo se codifica sin pagar el grupo en cada documento
+### 15.2 Cómo se codifica sin pagar el origen en cada documento
 
-Una lista es una corrida por grupo. Dentro de una corrida, la diferencia de claves es la de los IDs. **El salto a la corrida siguiente es enorme** (≈ Δgrupo · 2³²): con los formatos de antes, ensanchaba `W` a 33 bits o más para todas las diferencias de la lista. Por eso:
+Una lista es una corrida por origen. Dentro de una corrida, la diferencia de claves es la de los IDs. **El salto a la corrida siguiente es enorme** (≈ Δorigen · 2³²): con los formatos de antes, ensanchaba `W` a 33 bits o más para todas las diferencias de la lista. Por eso:
 
 - **Listas (2.1) y combinaciones (2.2):** hay tres formas, y se elige la más chica:
   - **Codec 0 simple:** `W` es el de la mayor diferencia. Es el de siempre.
-  - **Codec 0 con escapes:** `W` es el de la mayor diferencia dentro de una corrida, más uno. El valor de `W` bits todo en unos es un **escape**: le siguen los grupos salteados (`Δgrupo − 1`) y el ID en el grupo nuevo, los dos en varint de nibbles. Para que el largo de la lista se pueda calcular desde el diccionario, `X = W | nibbles de escape << 6`. En las combinaciones, un bit dice si hay escapes.
+  - **Codec 0 con escapes:** `W` es el de la mayor diferencia dentro de una corrida, más uno. El valor de `W` bits todo en unos es un **escape**: le siguen los orígenes salteados (`Δorigen − 1`) y el ID en el origen nuevo, los dos en varint de nibbles. Para que el largo de la lista se pueda calcular desde el diccionario, `X = W | nibbles de escape << 6`. En las combinaciones, un bit dice si hay escapes.
   - **Codec 1:** la diferencia de claves en varint de nibbles.
-- **Claves sin orden** (la primera clave de cada palabra en `Fields` y las entradas de una cabeza): se escriben como `grupo − grupo base` en `wGroup` bits e `ID − ID base` en `wID` bits. El ID base es el menor de todos los grupos, así que los IDs de todas las tablas comparten un rango.
-- **Con un solo grupo** no hay escapes y `wGroup = 0`: cuesta exactamente lo mismo que antes (medido: mismos bytes).
+- **Claves sin orden** (la primera clave de cada palabra en `Fields` y las entradas de una cabeza): se escriben como `origen − origen base` en `wOrigin` bits e `ID − ID base` en `wID` bits. El ID base es el menor de todos los orígenes, así que los IDs de todas las tablas comparten un rango.
+- **Con un solo origen** no hay escapes y `wOrigin = 0`: cuesta exactamente lo mismo que antes (medido: mismos bytes).
 
 ### 15.3 Medición
 
-Mismo eval que 13 (`GroupingNone`), con `GXS_EVAL_GROUPS=n`: cada documento cae al azar en uno de n grupos, y cada grupo tiene sus propios IDs. Con IDs densos, cada grupo va de 1 a N/n (un autoincremental por tabla); con IDs aleatorios, `uint32` al azar. Es el caso pesimista: en tablas reales una palabra suele aparecer en pocas.
+Mismo eval que 13 (`GroupingNone`), con `GXS_EVAL_ORIGINS=n`: cada documento cae al azar en uno de n orígenes, y cada origen tiene sus propios IDs. Con IDs densos, cada origen va de 1 a N/n (un autoincremental por tabla); con IDs aleatorios, `uint32` al azar. Es el caso pesimista: en tablas reales una palabra suele aparecer en pocas.
 
 Bytes promedio por consulta en frío, 1 · 2 · 3 palabras:
 
-| | 1 grupo | 8 grupos | 50 grupos |
+| | 1 origen | 8 orígenes | 50 orígenes |
 |---|---|---|---|
 | 10k, densos | 1,7 · 3,0 · 4,5 KB | 2,0 · 3,5 · 5,3 KB | 2,1 · 3,8 · 5,7 KB |
 | 10k, aleatorios | 2,7 · 5,0 · 7,8 KB | 2,8 · 5,3 · 8,2 KB | 2,9 · 5,4 · 8,5 KB |
@@ -659,14 +659,14 @@ Bytes promedio por consulta en frío, 1 · 2 · 3 palabras:
 
 | 100k | `.idx` total | `.db` total |
 |---|---|---|
-| densos, 1 · 8 · 50 grupos | 430 · 462 · 481 KB | 3,91 · 4,93 · 5,73 MB |
-| aleatorios, 1 · 8 · 50 grupos | 560 · 582 · 591 KB | 9,90 · 10,82 · 11,58 MB |
+| densos, 1 · 8 · 50 orígenes | 430 · 462 · 481 KB | 3,91 · 4,93 · 5,73 MB |
+| aleatorios, 1 · 8 · 50 orígenes | 560 · 582 · 591 KB | 9,90 · 10,82 · 11,58 MB |
 
 Qué dicen:
 - **Las rondas y los requests no cambian.** Solo crecen los bytes.
-- **Con IDs aleatorios**, 8 grupos cuestan un 5 % más y 50 grupos un 9 %. Ahí el escape no ayuda: un ID al azar ocupa 32 bits igual, y gana el codec 0 simple o el 1.
-- **Con IDs densos por grupo** (el caso de varias tablas con autoincremental), sin escapes ni claves partidas costaba un 14 % y un 26 % más a 100k, y un 38 % y un 60 % a 10k. Con 15.2 queda en un 7 % y un 15 % a 100k, y en un 18 % y un 27 % a 10k.
-- **El ranking es el de la fuerza bruta** en 3 000/3 000 con cualquier cantidad de grupos, y `TestMatchesBruteForce` mezcla 5 grupos con IDs repetidos entre grupos.
+- **Con IDs aleatorios**, 8 orígenes cuestan un 5 % más y 50 orígenes un 9 %. Ahí el escape no ayuda: un ID al azar ocupa 32 bits igual, y gana el codec 0 simple o el 1.
+- **Con IDs densos por origen** (el caso de varias tablas con autoincremental), sin escapes ni claves partidas costaba un 14 % y un 26 % más a 100k, y un 38 % y un 60 % a 10k. Con 15.2 queda en un 7 % y un 15 % a 100k, y en un 18 % y un 27 % a 10k.
+- **El ranking es el de la fuerza bruta** en 3 000/3 000 con cualquier cantidad de orígenes, y `TestMatchesBruteForce` mezcla 5 orígenes con IDs repetidos entre orígenes.
 
 ---
 
@@ -705,3 +705,165 @@ Bytes promedio en frío, 1 · 2 · 3 palabras, y `.db` total:
 - El ranking es el de la fuerza bruta en 3 000/3 000.
 - **Con todas las anfitrionas** la consulta en frío lee un 16 % más a 100k (un 30 % con 1 palabra): las continuaciones engordan el `.idx` de las palabras comunes. **Con solo la más cercana** cuesta lo mismo que antes, pero "Polo rojo M" ya no se encuentra con `polo m` por la letra (sí por `rojo m`).
 - **Se eligió las 2 más cercanas** (2026-10-05): un 4–5 % más que antes en frío a 100k, y la letra sigue a las dos palabras que suelen describirla ("polo rojo M", "vitamina C 500 mg"). Una palabra más lejana encuentra el documento por sí misma, no por la letra.
+
+---
+
+## 17. Grupo de texto y ranking por puntos
+
+> Agregado el 2026-10-05. Un documento puede tener **un grupo**: un texto padre que comparten muchos documentos ("Juan Carlos" vive en "centro civico"; "Pedro Ignacio" también). El grupo agrega especificidad, pero el nombre importa más: "centro civico" como nombre de un documento pesa más que "centro civico" como grupo. El ranking pasa a ser **solo por puntos** (17.5): ya no hay niveles de cobertura.
+>
+> No confundir con el origen del documento (15), que hasta el 2026-10-05 se llamaba grupo.
+
+### 17.1 Qué se indexa
+
+`Doc{OriginID, ID, Text, Group}`. Del grupo, normalizado igual que el texto (sin stopwords, salvo `KeepStopwords`), salen dos cosas:
+
+- **La firma:** una clave con **4 segmentos de 2 letras** como máximo (las 8 unidades de una clave), un segmento por palabra:
+  - primera palabra: su 1.ª y 2.ª letra, así la firma queda en el bucket de esa palabra, que la consulta ya lee;
+  - las otras: su 1.ª y 3.ª letra;
+  - una palabra de 2 letras da sus 2 letras; una de 1 letra, la unidad 0 y la letra; un número, las 2 primeras unidades de su clave;
+  - las palabras de 1 letra al comienzo no cuentan (la firma nunca empieza con 0);
+  - **un grupo de una sola palabra usa la palabra misma** (sus 8 primeras letras, o la clave del número): "providencia" → `providen`, no `pr`. Con 2 letras chocaría con cualquier palabra de la consulta que empiece igual ("producto" leería la lista de todos los miembros de "providencia"). Sigue en el bucket de la palabra y en el espacio de firmas, así que el índice sabe que es un grupo y no un nombre: "producto" busca `producto` en ese espacio, que no es `providen`.
+
+  "centro civico" → `cecv`; "condes vuelan alto" → `coveat`; "centro civico norte" → `cecvnr`; "Las Condes" (sin stopwords) → `condes`. Todos los miembros del grupo tienen la firma: es una palabra más del documento, con su lista.
+- **Las palabras de grupo:** cada palabra del grupo de 2 letras o más (o número), con su clave de 8 letras, pero **solo para los 100 miembros de clave menor de cada grupo** (`Params.GroupWordDocs`). Son el camino para encontrar el grupo por una sola de sus palabras o por prefijo ("juan civ…"), sin repetir "centro" en la lista de cada miembro.
+
+### 17.2 Espacios de claves
+
+Una firma o una palabra de grupo no pueden confundirse con una palabra: `cecv` podría ser una palabra, y el prefijo "ce" de una consulta la tocaría. Las claves tienen 3 espacios, y **la marca está fuera de las 8 unidades**:
+
+| Espacio | Qué | En memoria (`key5.Key`) | En el stream de tokens | En el `.idx` |
+|---|---|---|---|---|
+| 0 | palabras (lo de siempre) | bits 40–41 = 0 | header de siempre | entradas del directorio con espacio 0 |
+| 1 | palabras de grupo | bits 40–41 = 1 | unidad 30 antes del token | espacio 1 |
+| 2 | firmas | bits 40–41 = 2 | unidad 31, el largo y las unidades | espacio 2 |
+
+- **En memoria** es un bit alto de la clave de 64 bits, dentro de una invocación: se reconstruye en cada lectura desde lo que está en S3 (la Lambda no guarda estado). El orden de las claves queda: palabras, después palabras de grupo, después firmas. Por eso un rango de prefijo de palabras nunca incluye las otras.
+- **`.idx`:** cada entrada del directorio de `Keys` (`slot u16 | claves u32`) lleva el espacio en los 2 bits altos del slot (un slot ocupa 10 bits). Las entradas van en el orden de las claves: espacio, después slot.
+- **Streams de claves de cualquier bucket** (directorio de combinaciones y bloques, 2.3): un bit inicial; con 1, siguen las claves de espacio 1 y 2 que hay al final (varint de nibbles cada una).
+- Formatos: `.idx` y `.db` pasan a `Format = 4`. El stream de tokens de `p.log` y `tokens` agrega los headers 30 y 31; uno sin grupos se lee igual que antes.
+
+Lo demás no cambia: listas, cabezas, combinaciones, expansión y T tratan a una firma y a una palabra de grupo como a cualquier clave. Un grupo de 5 000 miembros tiene una firma con una lista grande, que se expande y tiene cabeza y combinaciones (`juan·cecv`) como cualquier palabra frecuente. **La cabeza de una firma o de una palabra de grupo se ordena solo por clave**, porque su puntaje no depende de la posición (17.5).
+
+### 17.3 Consulta
+
+La consulta no sabe qué palabras son el grupo. Por cada tramo de 1 a 4 palabras seguidas (que no empiece con una palabra de 1 letra) arma la firma y la busca en el bucket de la primera palabra del tramo, **que ya lee**: **0 requests de más**.
+- Un tramo de 2 segmentos o más también encuentra las firmas más largas que empiezan igual (`cecv` → `cecvnr`), con menos puntos (17.5). Un tramo de 1 palabra es la palabra misma y solo encuentra la firma igual: "condes" encuentra el grupo "Las Condes" y nada más. Por prefijo ("provi…") se encuentra el grupo por sus palabras de grupo.
+- La palabra abierta (la última) entra en un tramo de varias palabras solo con 3 letras o más (su segmento tiene que estar completo), y sola con 2 o más.
+- Cada palabra de la consulta busca además su palabra de grupo (exacta y, si es la abierta, por prefijo), en el mismo bucket.
+- Las firmas de los tramos son **términos virtuales**: no suman cobertura propia, no tienen IDF ni bonus de posición ni de par.
+
+Las ops de `p.log` aplican sus palabras de grupo aunque el documento no esté entre los 100, y una colección sin índice (`PLAN_5BIT.md` 5.8) no tiene tope: el tope lo decide la compactación cuando construye los buckets.
+
+### 17.4 Escritura
+
+`Apply` y `Rebuild` agregan los tokens del grupo al final de los del texto: las palabras de grupo (header 30) y la firma (header 31). La compactación decide el tope: recorre los documentos en orden de clave y, por cada grupo (la secuencia de sus claves de grupo y su firma), conserva las palabras de grupo de los primeros 100. Un miembro nuevo con clave mayor no cambia ese conjunto, así que no obliga a reescribir el bucket.
+
+### 17.5 Ranking por puntos
+
+Los resultados se ordenan **por puntaje** y después por clave. La cobertura se sigue informando (`Hit.Coverage`: términos cubiertos por el nombre o por el grupo), pero no ordena. Constantes en `query/score.go`:
+
+| Constante | Valor | Qué |
+|---|---|---|
+| `LetterFirst` | 5 | la primera letra coincide |
+| `LetterNext` | 3 | cada letra siguiente que coincide, hasta la 8.ª (un número cuenta dígitos) |
+| `WordFull` | 7 | palabra completa: misma clave y misma cola |
+| `LetterExtra` | 3 (= `LetterNext`) | cada letra de diferencia con una palabra cercana, "bolsa" para "bolsas" (19) |
+| `GroupSegment` | 4 | cada segmento de la firma que coincide |
+| `GroupFull` | 2 | la firma entera coincide |
+| `GroupWord` | 4 | cada término que coincide solo por una palabra de grupo |
+| `PairAdjacent` · `PairAdjacentReversed` · `PairNear` | 6 · 3 · 2 | dos términos del nombre juntos y en orden · juntos al revés · a una palabra |
+| `DocFirstWord` · `DocSecondWord` | 2 · 1 | la palabra es la primera · la segunda del documento (la primera valía 3 hasta el 2026-10-05) |
+| `QueryFirstWord` | 2 | la palabra es la primera que escribió el usuario, que suele guiar la intención ("cafe organico" busca café). Se suma a la de arriba: la primera de la consulta que también es la primera del documento gana 4 |
+| `IDFWeight` · `IDFMax` | 2 · 8 | rareza: `round(2 · ln(N/df))`, solo términos del nombre. El tope era 15; el benchmark (`PLAN_BENCH.md` 11) mide mejor con 8: toda palabra en menos del 1,8 % de los documentos ya es rara |
+
+- **Nombre:** exacta = 5 + 3·(n − 1) + 7 con n letras (máximo 8): "juan" 21, "carlos" 27, "maximiliano" 33. Raíz (misma clave, otra cola): sin el +7. Prefijo: las letras escritas, sin el +7 ("carl" = 14). Typo: las letras menos la distancia, sin el +7 ("carlso" = 17). Una letra suelta (continuación) = 5 + 7.
+- **Grupo:** `max(firma, palabras de grupo)`. La firma da 4 por segmento de la consulta y +2 si la firma del documento es exactamente esa ("centro civico" completo = 10; contra "centro civico norte" = 8; un grupo de una palabra, como "condes", = 6). Las palabras de grupo dan 4 por término que solo coincide por ellas. Un término que coincide por el nombre no suma por palabra de grupo.
+- **Nombre y grupo a la vez (2026-10-05):** si la consulta tiene palabras fuera de la corrida de la mejor firma del documento, es un nombre más un grupo, y las palabras de la corrida cuentan **una vez**: el puntaje es `max(nombre solo, nombre fuera de la corrida + grupo)`. Para "hidratante cuidado corporal", "Crema corporal @ cuidado corporal" ya no gana "corporal" por el nombre y por el grupo, y "Crema hidratante @ cuidado corporal" le gana (antes empataban). Si la firma cubre toda la consulta ("limpieza facial"), nombre y grupo suman los dos: así un miembro cuyo nombre también lo dice va primero, que es lo que piden las consultas de grupo. El grupo nunca baja un puntaje. Contar una vez también en ese caso costaba 0,07 de nDCG en `grupo` (`PLAN_BENCH.md` 15).
+- **Palabras repetidas:** una palabra escrita dos veces es un solo término ("platos preparados preparados"); las corridas de las firmas conservan las dos.
+- **Se eliminaron:** el nivel de cobertura, el puntaje base por palabra, los puntos fijos de prefijo, raíz y typo, el bonus de posición en la consulta (volvió el 2026-10-05, solo para la primera palabra: `QueryFirstWord`), el de frase y la mitad del par con typo.
+
+"juan carlos centro civico":
+
+| Doc | Nombre | Grupo | Par | Posición | Total |
+|---|---|---|---|---|---|
+| Juan Carlos @ centro civico | 21 + 27 | 10 | 6 | 2 + 1 + 2 | **69** |
+| edificio "Centro Civico" | 27 + 27 | — | 6 | 2 + 1 | **63** |
+| Juan Carlos @ los condes | 21 + 27 | — | 6 | 2 + 1 + 2 | **59** |
+| Juan @ centro civico norte | 21 | 8 | — | 2 + 2 | **33** |
+| Pedro @ centro civico | — | 10 | — | — | **10** |
+
+(sin IDF, que depende del corpus. Posición: primera y segunda del documento, y +2 de "juan", la primera palabra escrita.)
+
+**Exactitud:** la cabeza de una palabra sigue siendo el top exacto de esa palabra sola, porque su puntaje solo depende de la clase de coincidencia y de la primera posición (3.4); el bonus de primera palabra de la consulta es el mismo para toda la lista del término. La de una firma o de una palabra de grupo tiene un puntaje fijo, y por eso va ordenada por clave. La verificación de 6.1 (paso 7) usa esas mismas cuentas.
+
+### 17.6 Medición
+
+Eval de 13 con `GXS_EVAL_TEXTGROUPS=300`: 2 de cada 3 documentos tienen uno de 300 grupos sintéticos (comunas de Chile, solas o con un sector: "Providencia", "Las Condes Norte", "Maipú Centro Cívico"), con pocos grupos que se llevan casi todos los documentos. Las "consultas de grupo" son una consulta de 2 palabras del nombre más el grupo; se mide en qué lugar queda el documento con y sin el grupo en la consulta.
+
+Consultas de 1 · 2 · 3 palabras que no nombran grupos, en frío, 100k IDs aleatorios:
+
+| | requests | bytes |
+|---|---|---|
+| sin grupos | 2.95 · 4.99 · 7.55 | 5.5 · 11.3 · 18.9 KB |
+| grupo de 1 palabra con firma de 2 letras | 3.36 · 5.96 · 9.38 | 7.0 · 14.0 · 24.0 KB |
+| **grupo de 1 palabra con firma = la palabra** | **2.95 · 5.04 · 7.64** | **5.6 · 11.6 · 19.9 KB** |
+
+Con la firma de 2 letras, "producto" leía la lista de todos los miembros de "Providencia". Con la palabra, el costo queda casi como sin grupos.
+
+Consultas de grupo (firma = la palabra), lugar medio del documento y veces que queda primero:
+
+| Corpus | Con el grupo | Sin el grupo | Requests en frío · bytes |
+|---|---|---|---|
+| 10k densos | 1.2 · 869/950 primero | 7.2 · 447 | 4.55 · 7.3 KB |
+| 10k aleatorios | 1.3 · 817/914 | 8.8 · 411 | 6.45 · 11.8 KB |
+| 100k densos | 3.1 · 1302/1500 | 11.9 · 453 | 8.22 · 18.1 KB |
+| 100k aleatorios | 4.1 · 1055/1500 | 33.3 · 68 | 10.31 · 24.6 KB |
+
+Con la firma de 2 letras el lugar medio a 100k aleatorios era 4.8 (954 primero), y sin firma para los grupos de una palabra 20.4 (593).
+
+## 18. Benchmark estándar
+
+> Agregado el 2026-10-05. El detalle, las decisiones y el uso están en `PLAN_BENCH.md`. Es la medida principal de efectividad; el eval de 13 sigue para el costo a 100k.
+
+10 010 productos de un catálogo real, 315 categorías como grupos, 200 consultas fijas (exactas, parciales, escribiendo, typos, tildes, marcas, números, nombre+grupo, grupo y negativas) con juicios de relevancia de una regla sobre el texto completo, y dos referencias: BM25 (SQLite FTS5) y BM25 de trigramas. `GXS_BENCH=1 go test ./internal/query -run 'TestBench$' -v` (5 s) escribe `testdata/bench/report.md` y falla si algo empeora respecto de `baseline.json`.
+
+Resultado (IDs de fila, `es100`; B = con la categoría como grupo):
+
+| | S@1 | MRR | nDCG@10 | falsos | GET en frío (prom.) | KB en frío (prom.) |
+|---|---|---|---|---|---|---|
+| A: nombres, genix-s3 | 0,72 | 0,78 | 0,90 | 0,03 | 3,8 | 6,7 |
+| A: BM25 | 0,63 | 0,72 | 0,86 | 0,03 | | |
+| B: nombres + grupos, genix-s3 | 0,78 | 0,85 | 0,92 | 0,03 | 3,9 | 7,8 |
+| B: BM25 | 0,72 | 0,81 | 0,91 | 0,02 | | |
+
+- Igualamos o superamos a BM25 salvo en las consultas que son solo el nombre de una categoría (`grupo`: nDCG 0,60 contra 0,80), porque el nombre pesa más que el grupo (17).
+- Los typos en las 2 primeras letras no se corrigen (6 de 25: S@1 0,17; los otros 19, 0,89).
+- El grupo lleva el S@1 de las consultas `nombre+grupo` de 0,16 a 0,52 y cuesta +1,1 KB (p50) en las consultas que no lo nombran.
+- Con IDs aleatorios el `.db` pasa de 4 KB a 395 KB y el frío de 3,8 a 4,6 GET.
+- Decisiones de la fase 5: `IDFMax` 15 → 8 (17.5), que mejora sin costo; firma de 1.ª+3.ª letra y presupuesto de prefijos (32 KB) se quedan.
+
+## 19. Palabras cercanas: singular y plural
+
+> Agregado el 2026-10-05. Antes "bolsas" no encontraba "Bolsa": la clave son las 8 primeras letras, la raíz (misma clave, otra cola) solo existe pasadas las 8, el prefijo solo vale para la última palabra y solo hacia adelante ("bols" → "bolsas"), y los typos solo se buscan si la palabra no existe en el diccionario.
+
+**Regla.** Una palabra del documento es **cercana** a un término cuando tiene sus mismas letras con **una letra más o menos al final**, o con **"es" más o menos** ("bolsa"/"bolsas", "galleta"/"galletas", "pan"/"panes", "color"/"colores"). La más corta tiene 3 letras o más. Dos letras que no son "es" no cuentan: "sal"/"salsa", "bot"/"boton", "uni"/"unica", "smile"/"smileat" eran falsos en el benchmark.
+
+- Vale para **toda palabra de la consulta**, sea la última o no, exista o no en el diccionario, con o sin `Fuzzy`. No vale para números, `foo*`, palabras de grupo ni firmas.
+- Una palabra del documento de 8 letras con cola (sigue después de la 8.ª) no es cercana de un término de 6 o 7: la diferencia es de 2 letras o más y no se sabe cuáles.
+- **Puntaje:** las letras que comparten, menos `LetterExtra` (= `LetterNext`, 3) por letra de diferencia, sin el +7 de palabra completa. "bolsas" contra "Bolsa" = 17 − 3 = 14, igual que el prefijo "bols"; la palabra exacta, 27. Con `LetterExtra` 1, 2, 3 o 5 el benchmark da lo mismo.
+- **Costo:** la palabra cercana está en el bucket del término, cuyo `.idx` la consulta ya lee: **0 requests más**. Su lista se lee dentro del presupuesto de prefijos, la más cercana primero; una palabra expandida de menos de 8 letras se lee por su cabeza, porque todos sus postings coinciden igual (sin cola). La CPU de recorrer el `.idx` no importa.
+- Cuando el término no tiene palabra exacta, las cercanas cuentan como encontradas: ya no se buscan typos.
+
+Código: `Term.nearKey` y `nearPoints` (`query/score.go`), `readPlan.addNear` (`query/plan.go`), `headBounds` (`query/assemble.go`). Test: `TestNearWords`.
+
+**Medición** (benchmark con la categoría `plural` y el juez que acepta singular y plural, `PLAN_BENCH.md` 14; IDs de fila):
+
+| | S@1 A · B | nDCG@10 A · B | falsos A · B | `plural` S@1 · nDCG (B) | GET · KB en frío (B, prom.) |
+|---|---|---|---|---|---|
+| sin palabras cercanas | 0,70 · 0,75 | 0,897 · 0,912 | 0,018 · 0,022 | 0,56 · 0,85 | 3,83 · 7,8 |
+| **1 letra, o "es"** | **0,75 · 0,78** | **0,926 · 0,929** | 0,018 · 0,024 | **0,80 · 0,98** | 3,84 · 7,8 |
+| 1 o 2 letras cualesquiera | 0,74 · 0,77 | 0,925 · 0,928 | 0,023 · 0,029 | 0,80 · 0,98 | 3,84 · 7,8 |
+| solo 1 letra | 0,74 · 0,77 | 0,920 · 0,927 | 0,018 · 0,024 | 0,76 · 0,96 | 3,84 · 7,8 |
+
+Con IDs aleatorios: nDCG 0,900 → 0,928 (A) y 0,915 → 0,930 (B), GET 4,95 → 4,97 (B). BM25 en `plural`: nDCG 0,81.

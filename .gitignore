@@ -11,3 +11,7 @@ data/perf-store/*
 data/perf-logs/*
 __pycache__/
 *.pyc
+
+# PLAN_BENCH.md: the local databases of the benchmark (built by TestBench and reference.py)
+genix-s3/bench/db/
+genix-s3/testdata/bench/*.random-ids.*

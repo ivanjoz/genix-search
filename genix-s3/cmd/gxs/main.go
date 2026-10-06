@@ -29,12 +29,14 @@ const usage = `usage: gxs <command> [flags] [args]
 
 commands:
   build   -csv FILE               create the collection from FILE: one name per
-                                  line (ID = line number, group 0), or
-                                  "ref<TAB>text" lines
+                                  line (ID = line number, origin 0), or
+                                  "ref<TAB>text" or "ref<TAB>text<TAB>group" lines
   query   [-limit N] [-fuzzy] [-csv FILE] TERMS...
                                   print the ranked IDs; -csv looks the names up in
                                   FILE, the way the application uses its database
-  put     REF TEXT...             write one document through p.log
+  put     REF TEXT... [@ GROUP...]
+                                  write one document through p.log; the words
+                                  after @ are its group ("Juan Carlos @ centro civico")
   del     REF                     delete one document through p.log
   compact                         fold p.log into the buckets of the index
   log                             print p.log
@@ -49,7 +51,7 @@ common flags: -root DIR (default data/gxs) -collection NAME -partition NAME -ext
               -keep-stopwords: index and match the stopwords too ("Salón A");
               the same for every command on a collection
 
-a REF is ID (group 0) or GROUP:ID: the same ID in two groups is two documents`
+a REF is ID (origin 0) or ORIGIN:ID: the same ID in two origins is two documents`
 
 type env struct {
 	store    blob.Blob
@@ -187,22 +189,23 @@ func readDocs(path string) ([]collection.Doc, error) {
 			text = after
 		}
 
-		docs = append(docs, collection.Doc{Group: ref.Group, ID: ref.ID, Text: text})
+		text, group, _ := strings.Cut(text, "\t")
+		docs = append(docs, collection.Doc{OriginID: ref.OriginID, ID: ref.ID, Text: text, Group: group})
 	}
 
 	return docs, scanner.Err()
 }
 
-// parseRef reads a document reference: ID, of group 0, or GROUP:ID.
+// parseRef reads a document reference: ID, of origin 0, or ORIGIN:ID.
 func parseRef(s string) (collection.Ref, error) {
-	group, id, ok := strings.Cut(s, ":")
+	origin, id, ok := strings.Cut(s, ":")
 	if !ok {
-		group, id = "0", s
+		origin, id = "0", s
 	}
 
-	g, err := strconv.ParseUint(group, 10, 8)
+	g, err := strconv.ParseUint(origin, 10, 8)
 	if err != nil {
-		return collection.Ref{}, fmt.Errorf("group %q", group)
+		return collection.Ref{}, fmt.Errorf("origin %q", origin)
 	}
 
 	n, err := strconv.ParseUint(id, 10, 32)
@@ -210,7 +213,7 @@ func parseRef(s string) (collection.Ref, error) {
 		return collection.Ref{}, fmt.Errorf("id %q", id)
 	}
 
-	return collection.Ref{Group: uint8(g), ID: uint32(n)}, nil
+	return collection.Ref{OriginID: uint8(g), ID: uint32(n)}, nil
 }
 
 func cmdBuild(ctx context.Context, e env, path string) error {
@@ -264,7 +267,7 @@ func cmdQuery(ctx context.Context, e env, csv string, limit int, fuzzy bool, ter
 	}
 
 	for i, h := range resp.Hits {
-		k := docid.New(h.Group, h.ID)
+		k := docid.New(h.OriginID, h.ID)
 		fmt.Printf("%2d. %14v  cov %d  score %3d  %s\n", i+1, k, h.Coverage, h.Score, names[k])
 	}
 
@@ -281,7 +284,7 @@ func cmdQuery(ctx context.Context, e env, csv string, limit int, fuzzy bool, ter
 
 func cmdPut(ctx context.Context, e env, args []string) error {
 	if len(args) < 2 {
-		return fmt.Errorf("put REF TEXT...")
+		return fmt.Errorf("put REF TEXT... [@ GROUP...]")
 	}
 
 	ref, err := parseRef(args[0])
@@ -289,7 +292,8 @@ func cmdPut(ctx context.Context, e env, args []string) error {
 		return err
 	}
 
-	res, err := e.writer().Put(ctx, []collection.Doc{{Group: ref.Group, ID: ref.ID, Text: strings.Join(args[1:], " ")}})
+	text, group, _ := strings.Cut(strings.Join(args[1:], " "), " @ ")
+	res, err := e.writer().Put(ctx, []collection.Doc{{OriginID: ref.OriginID, ID: ref.ID, Text: text, Group: group}})
 
 	return report(res, err)
 }

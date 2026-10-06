@@ -21,7 +21,11 @@ import (
 )
 
 // Format is the layout version of .idx and .db. A reader rejects any other.
-const Format uint16 = 3
+const Format uint16 = 4
+
+// spaceShift places the space of a run of keys above its slot in the slot
+// directory (PLAN_BUCKETS.md §17.2): a slot takes 10 bits.
+const spaceShift = 14
 
 const (
 	idxMagic = "GXI1"
@@ -332,9 +336,10 @@ func Decode(data []byte, normID uint32) (*Index, error) {
 	return x, nil
 }
 
-// readKeys reads the Keys section: n u16 | per slot, slot u16 | keys u32,
-// in ascending slot order; then the keys of each slot (key5.AppendBucket).
-// Every slot must belong to the group.
+// readKeys reads the Keys section: n u16 | per run, space << 14 | slot u16 |
+// keys u32, in ascending order (the order of the keys: by space, then slot);
+// then the keys of each run (key5.AppendBucket). Every slot must belong to
+// the group.
 func readKeys(b []byte, g *layout.Grouping, group uint16, keys int) ([]key5.Key, error) {
 	if len(b) < 2 {
 		return nil, ErrCorrupt
@@ -352,19 +357,20 @@ func readKeys(b []byte, g *layout.Grouping, group uint16, keys int) ([]key5.Key,
 
 	for i := range n {
 		e := b[2+6*i:]
-		slot, count := binary.LittleEndian.Uint16(e), int(binary.LittleEndian.Uint32(e[2:]))
+		run, count := binary.LittleEndian.Uint16(e), int(binary.LittleEndian.Uint32(e[2:]))
+		space, slot := key5.Space(run>>spaceShift), run&(1<<spaceShift-1)
 
-		if int(slot) <= prev || slot < lo || slot > hi || count == 0 || count > keys-len(out) {
+		if int(run) <= prev || space >= key5.Spaces || slot < lo || slot > hi || count == 0 || count > keys-len(out) {
 			return nil, fmt.Errorf("%w: slot directory", ErrCorrupt)
 		}
 
-		got, err := key5.ReadSlot(r, slot, count)
+		got, err := key5.ReadSlot(r, slot, space, count)
 		if err != nil {
 			return nil, err
 		}
 
 		out = append(out, got...)
-		prev = int(slot)
+		prev = int(run)
 	}
 
 	if len(out) != keys {
@@ -380,7 +386,7 @@ func (x *Index) decodeFields(b []byte) error {
 	}
 
 	wCount, wDup, wX := uint(b[0]), uint(b[1]), uint(b[3])
-	first := postings.Split{WID: uint(b[2]), WG: uint(b[4]), Group: b[5], ID: binary.LittleEndian.Uint32(b[8:])}
+	first := postings.Split{WID: uint(b[2]), WO: uint(b[4]), Origin: b[5], ID: binary.LittleEndian.Uint32(b[8:])}
 
 	if wCount > 32 || wDup > 32 || !first.Valid() || wX < postings.MinX || wX > 32 {
 		return fmt.Errorf("%w: field widths", ErrCorrupt)
@@ -470,7 +476,7 @@ func decodeExpansion(b []byte) (*Expansion, error) {
 		tail := b[1]&1 != 0
 		m := int(binary.LittleEndian.Uint16(b[4:]))
 		g.Total = binary.LittleEndian.Uint32(b[8:])
-		keys := postings.Split{WID: uint(b[2]), Group: b[3], WG: uint(b[6]), ID: binary.LittleEndian.Uint32(b[12:])}
+		keys := postings.Split{WID: uint(b[2]), Origin: b[3], WO: uint(b[6]), ID: binary.LittleEndian.Uint32(b[12:])}
 		size := int(binary.LittleEndian.Uint32(b[16:]))
 
 		if !keys.Valid() || m > int(g.Total) || size > len(b)-groupHeader {
@@ -506,14 +512,14 @@ func decodeExpansion(b []byte) (*Expansion, error) {
 	return e, nil
 }
 
-// groupHeader is tail u8 | flags u8 | wID u8 | base group u8 | m u16 | wGroup
+// groupHeader is tail u8 | flags u8 | wID u8 | base origin u8 | m u16 | wOrigin
 // u8 | 0 u8 | total u32 | base ID u32 | size u32 (bytes of the entries). The
-// keys of the entries are a postings.Split: the smallest group and the
+// keys of the entries are a postings.Split: the smallest origin and the
 // smallest ID, and the widths above them.
 const groupHeader = 20
 
-// fieldsHeader is wCount u8 | wDup u8 | wFirst u8 | wX u8 | wGroup u8 | base
-// group u8 | 0 u16 | base ID u32: the first keys are a postings.Split.
+// fieldsHeader is wCount u8 | wDup u8 | wFirst u8 | wX u8 | wOrigin u8 | base
+// origin u8 | 0 u16 | base ID u32: the first keys are a postings.Split.
 const fieldsHeader = 12
 
 // Block is a decoded combination block: per co-key, the lists of the

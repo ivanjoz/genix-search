@@ -30,11 +30,18 @@ type Params struct {
 	// ComboDictBudget is the size of a combinations directory over which
 	// co-keys share blocks by prefix.
 	ComboDictBudget int
+	// GroupWordDocs is the documents of each group whose group words are
+	// indexed: those of the smallest keys (PLAN_BUCKETS.md §17.1). 0 means
+	// the default.
+	GroupWordDocs int
 }
+
+// DefaultGroupWordDocs is the default of Params.GroupWordDocs.
+const DefaultGroupWordDocs = 100
 
 // DefaultParams are the defaults.
 func DefaultParams() Params {
-	return Params{MinSplit: 2048, ExpandCost: 2048, HeadSize: 64, InlineBudget: 2048, ComboDictBudget: 2048}
+	return Params{MinSplit: 2048, ExpandCost: 2048, HeadSize: 64, InlineBudget: 2048, ComboDictBudget: 2048, GroupWordDocs: DefaultGroupWordDocs}
 }
 
 // Threshold is T for a bucket whose lists take d bytes.
@@ -160,13 +167,16 @@ func (w *word) bytes() float64 { return float64(w.shape.Bits()) / 8 }
 // list falls below T/2. T and the inline lists are decided per slot, so a
 // group holds what its slots would hold apart.
 func Build(docs []Doc, prev map[key5.Key]bool, p Params, g *layout.Grouping) (*Result, error) {
-	words := map[key5.Key]*word{}
-
 	for i, d := range docs {
 		if i > 0 && d.ID <= docs[i-1].ID {
 			return nil, errors.New("bucket: documents not sorted by key")
 		}
+	}
 
+	docs = CapGroupWords(docs, p.GroupWordDocs)
+	words := map[key5.Key]*word{}
+
+	for _, d := range docs {
 		for pos, t := range d.Tokens {
 			w := words[t.Key]
 			if w == nil {
@@ -193,44 +203,32 @@ func Build(docs []Doc, prev map[key5.Key]bool, p Params, g *layout.Grouping) (*R
 		w.df = uint32(len(docIDs(w.list)))
 	}
 
-	slices.Sort(keys)
+	// By group, and within a group in the order of the keys: by space, then
+	// slot (PLAN_BUCKETS.md §17.2).
+	slices.SortFunc(keys, func(a, b key5.Key) int {
+		return cmp.Or(cmp.Compare(g.Of(a.Slot()), g.Of(b.Slot())), cmp.Compare(a, b))
+	})
 
 	res := &Result{Docs: len(docs)}
-	type span struct{ from, to int }
 
-	var slots []span
-
-	for from := 0; from < len(keys); {
-		to := from + 1
-		for to < len(keys) && keys[to].Slot() == keys[from].Slot() {
-			to++
-		}
-
-		slots = append(slots, span{from, to})
-		from = to
+	// Which words expand depends only on their slot, over every space; where
+	// a pair is kept depends on both words, so every bucket is decided before
+	// any is built.
+	ds := map[uint16]float64{}
+	for _, k := range keys {
+		ds[k.Slot()] += words[k].bytes()
 	}
 
-	// Which words expand depends only on their bucket; where a pair is kept
-	// depends on both words, so every bucket is decided before any is built.
-	thresholds := make([]float64, len(slots))
-	ds := make([]float64, len(slots))
+	for _, k := range keys {
+		w, t := words[k], p.Threshold(ds[k.Slot()])
+		w.expand = w.bytes() > t || (prev[k] && w.bytes() > t/2)
 
-	for i, s := range slots {
-		for _, k := range keys[s.from:s.to] {
-			ds[i] += words[k].bytes()
-		}
-
-		thresholds[i] = p.Threshold(ds[i])
-
-		for _, k := range keys[s.from:s.to] {
-			w := words[k]
-			w.expand = w.bytes() > thresholds[i] || (prev[k] && w.bytes() > thresholds[i]/2)
-
-			if w.expand {
-				res.Expanded = append(res.Expanded, k)
-			}
+		if w.expand {
+			res.Expanded = append(res.Expanded, k)
 		}
 	}
+
+	slices.Sort(res.Expanded)
 
 	byID := make(map[docid.Key]int, len(docs))
 	for i, d := range docs {
@@ -239,30 +237,78 @@ func Build(docs []Doc, prev map[key5.Key]bool, p Params, g *layout.Grouping) (*R
 
 	b := &builder{p: p, words: words, docs: docs, byID: byID}
 
-	// The slots of a group are consecutive, and so are their keys.
-	for i := 0; i < len(slots); {
-		group := g.Of(keys[slots[i].from].Slot())
-		j := i + 1
+	for from := 0; from < len(keys); {
+		group := g.Of(keys[from].Slot())
+		to := from + 1
 
-		for j < len(slots) && g.Of(keys[slots[j].from].Slot()) == group {
-			j++
+		for to < len(keys) && g.Of(keys[to].Slot()) == group {
+			to++
 		}
 
-		built, err := b.bucket(group, keys[slots[i].from:slots[j-1].to])
+		built, err := b.bucket(group, keys[from:to])
 		if err != nil {
 			return nil, err
 		}
 
-		for k := i; k < j; k++ {
-			built.D += ds[k]
-			built.T = max(built.T, thresholds[k])
+		slots := map[uint16]bool{}
+		for _, k := range keys[from:to] {
+			if !slots[k.Slot()] {
+				slots[k.Slot()] = true
+				built.D += ds[k.Slot()]
+				built.T = max(built.T, p.Threshold(ds[k.Slot()]))
+			}
 		}
 
 		res.Buckets = append(res.Buckets, built)
-		i = j
+		from = to
 	}
 
 	return res, nil
+}
+
+// CapGroupWords keeps the group words of the first n documents of each group,
+// in key order, and drops those of the rest (PLAN_BUCKETS.md §17.4): a group
+// is the sequence of its group words and its signature. n ≤ 0 means the
+// default. docs is not modified.
+func CapGroupWords(docs []Doc, n int) []Doc {
+	if n <= 0 {
+		n = DefaultGroupWordDocs
+	}
+
+	var out []Doc
+	members := map[string]int{}
+	var scratch []byte
+
+	for i, d := range docs {
+		scratch = scratch[:0]
+
+		for _, t := range d.Tokens {
+			if t.Key.Space() != key5.SpaceWord {
+				scratch = binary.LittleEndian.AppendUint64(scratch, uint64(t.Key))
+			}
+		}
+
+		if len(scratch) == 0 {
+			continue
+		}
+
+		members[string(scratch)]++
+		if members[string(scratch)] <= n {
+			continue
+		}
+
+		if out == nil {
+			out = slices.Clone(docs)
+		}
+
+		out[i].Tokens = slices.DeleteFunc(slices.Clone(d.Tokens), func(t key5.Token) bool { return t.Key.Space() == key5.SpaceGroupWord })
+	}
+
+	if out == nil {
+		return docs
+	}
+
+	return out
 }
 
 type builder struct {
@@ -318,17 +364,18 @@ func (b *builder) bucket(group uint16, keys []key5.Key) (*Built, error) {
 		}
 	}
 
-	// Keys: the slot directory, then the keys of each slot.
+	// Keys: the directory of runs of one space and one slot, then the keys of
+	// each run.
 	var counts []int
 	var dir []byte
 
 	for from := 0; from < len(keys); {
 		to := from + 1
-		for to < len(keys) && keys[to].Slot() == keys[from].Slot() {
+		for to < len(keys) && keys[to].Slot() == keys[from].Slot() && keys[to].Space() == keys[from].Space() {
 			to++
 		}
 
-		dir = binary.LittleEndian.AppendUint16(dir, keys[from].Slot())
+		dir = binary.LittleEndian.AppendUint16(dir, uint16(keys[from].Space())<<spaceShift|keys[from].Slot())
 		dir = binary.LittleEndian.AppendUint32(dir, uint32(to-from))
 		counts = append(counts, to-from)
 		from = to
@@ -431,7 +478,7 @@ func encodeFields(ws []*word) []byte {
 	wX := max(bits.Len(uint64(maxX)), postings.MinX)
 	first := postings.SplitOf(firsts...)
 
-	out := []byte{byte(wCount), byte(wDup), byte(first.WID), byte(wX), byte(first.WG), first.Group, 0, 0}
+	out := []byte{byte(wCount), byte(wDup), byte(first.WID), byte(wX), byte(first.WO), first.Origin, 0, 0}
 	out = binary.LittleEndian.AppendUint32(out, first.ID)
 	w := bits.NewWriter(out)
 
@@ -570,7 +617,7 @@ func (b *builder) comboUnits(coKeys []key5.Key) int {
 }
 
 // encodeBlock writes the combinations of one block:
-// n u16 | base group u8 | 0 u8 | base ID u32 | keys | per key, the columns of
+// n u16 | base origin u8 | 0 u8 | base ID u32 | keys | per key, the columns of
 // the word and of the co-key.
 func encodeBlock(keys []key5.Key, pairs map[key5.Key]*pair) ([]byte, error) {
 	base := docid.Max
@@ -583,7 +630,7 @@ func encodeBlock(keys []key5.Key, pairs map[key5.Key]*pair) ([]byte, error) {
 	}
 
 	out := binary.LittleEndian.AppendUint16(nil, uint16(len(keys)))
-	out = append(out, base.Group(), 0)
+	out = append(out, base.Origin(), 0)
 	out = binary.LittleEndian.AppendUint32(out, base.ID())
 
 	w := bits.NewWriter(out)
@@ -621,8 +668,15 @@ func groupByDoc(list []postings.Posting) []postings.Entry {
 
 // rank is the order of a head: documents where the word comes first, then
 // second, then the rest — the position bonus of a query of that word alone
-// — and by key within each.
-func rank(pos uint8) uint8 { return min(pos, 2) }
+// — and by key within each. A group word or a signature scores the same
+// wherever it is (PLAN_BUCKETS.md §17.5): its head goes by key alone.
+func rank(k key5.Key, pos uint8) uint8 {
+	if k.Space() != key5.SpaceWord {
+		return 0
+	}
+
+	return min(pos, 2)
+}
 
 // FirstPos is the first position of an entry's postings with tail t, or of
 // any for AllTails; ok is false when it has none.
@@ -668,7 +722,7 @@ func (b *builder) heads(w *word, entries []postings.Entry) []Group {
 
 		for _, e := range entries {
 			if pos, ok := FirstPos(&e, t); ok {
-				in = append(in, ranked{e, rank(pos)})
+				in = append(in, ranked{e, rank(w.key, pos)})
 			}
 		}
 
@@ -687,8 +741,8 @@ func (b *builder) heads(w *word, entries []postings.Entry) []Group {
 	return groups
 }
 
-// appendGroup writes a head: tail u8 | flags u8 | wID u8 | base group u8 |
-// m u16 | wGroup u8 | 0 u8 | total u32 | base ID u32 | size u32 | entries.
+// appendGroup writes a head: tail u8 | flags u8 | wID u8 | base origin u8 |
+// m u16 | wOrigin u8 | 0 u8 | total u32 | base ID u32 | size u32 | entries.
 func appendGroup(dst []byte, g Group) []byte {
 	keys := make([]docid.Key, len(g.Entries))
 	tail := false
@@ -706,9 +760,9 @@ func appendGroup(dst []byte, g Group) []byte {
 	postings.WriteEntries(w, s, tail, g.Entries)
 	body := w.Bytes()
 
-	dst = append(dst, g.Tail, byte(b2i(tail)), byte(s.WID), s.Group)
+	dst = append(dst, g.Tail, byte(b2i(tail)), byte(s.WID), s.Origin)
 	dst = binary.LittleEndian.AppendUint16(dst, uint16(len(g.Entries)))
-	dst = append(dst, byte(s.WG), 0)
+	dst = append(dst, byte(s.WO), 0)
 	dst = binary.LittleEndian.AppendUint32(dst, g.Total)
 	dst = binary.LittleEndian.AppendUint32(dst, s.ID)
 	dst = binary.LittleEndian.AppendUint32(dst, uint32(len(body)))

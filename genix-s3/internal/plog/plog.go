@@ -1,6 +1,6 @@
 // Package plog is p.log, the change log every query reads (PLAN_5BIT.md §5.4,
 // PLAN_BUCKETS.md §7). It is plain bytes: a fixed Base, then one frame per
-// append. It holds no text: each op carries the document's key (its group and
+// append. It holds no text: each op carries the document's key (its origin and
 // ID, docid) and its 5-bit tokens.
 //
 // A collection under the index threshold (PLAN_5BIT.md §5.8) has no index:
@@ -30,7 +30,7 @@ const (
 	BaseSize   = 176
 	baseCRC    = BaseSize - 4
 	frameHead  = 9              // tag u8 | len u32 | crc32c u32
-	opHead     = docid.Size + 3 // key (ID u32 | group u8) | flags u8 | tokLen u16
+	opHead     = docid.Size + 3 // key (ID u32 | origin u8) | flags u8 | tokLen u16
 	flagDel    = 1
 	tagBatch   = 1
 	tagCompact = 2
@@ -179,7 +179,7 @@ func AppendBatch(dst []byte, ops []Op) ([]byte, error) {
 }
 
 // AppendDocs appends the Docs frame of a LogOnly base: n u32, then per
-// document key (ID u32 | group u8) | tokLen u16 | tokens. docs must be sorted
+// document key (ID u32 | origin u8) | tokLen u16 | tokens. docs must be sorted
 // by key.
 func AppendDocs(dst []byte, docs []Doc) ([]byte, error) {
 	body := binary.LittleEndian.AppendUint32(nil, uint32(len(docs)))

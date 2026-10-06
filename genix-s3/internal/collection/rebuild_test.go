@@ -133,12 +133,12 @@ func TestRebuildReplaces(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// The source has 10..30 of group 0; while it is read, a writer adds
-		// 500 of group 3 and deletes 12, and 13 of group 1, which is not 13.
+		// The source has 10..30 of origin 0; while it is read, a writer adds
+		// 500 of origin 3 and deletes 12, and 13 of origin 1, which is not 13.
 		source := func(ctx context.Context, yield func(Doc) error) error {
 			for i, d := range numbered(10, 30) {
 				if i == 5 {
-					if _, err := c.Apply(ctx, []Doc{{Group: 3, ID: 500, Text: "durante"}}, []Ref{{ID: 12}, {Group: 1, ID: 13}}); err != nil {
+					if _, err := c.Apply(ctx, []Doc{{OriginID: 3, ID: 500, Text: "durante"}}, []Ref{{ID: 12}, {OriginID: 1, ID: 13}}); err != nil {
 						return err
 					}
 				}

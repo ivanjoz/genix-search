@@ -111,6 +111,14 @@ func planQuery(terms []Term, source indexSource, budget int64, fuzzy bool) *read
 		t := &terms[i]
 		found := false
 
+		if t.virtual() {
+			p.addSignature(t, i, source, budget)
+
+			continue
+		}
+
+		p.addGroupWords(t, i, source, budget)
+
 		if !t.Explicit {
 			for _, k := range t.exactKeys() {
 				if x := source(k.Slot()); x != nil {
@@ -166,6 +174,10 @@ func planQuery(terms []Term, source indexSource, budget int64, fuzzy bool) *read
 			found = true
 		}
 
+		if p.addNear(t, i, source, budget, !found) {
+			found = true
+		}
+
 		if found || !fuzzy || t.Explicit || t.Number || fuzzyBudget(len(t.Text)) == 0 {
 			continue
 		}
@@ -196,13 +208,127 @@ func planQuery(terms []Term, source indexSource, budget int64, fuzzy bool) *read
 
 	// A head stands for an expanded word only for one term, matched exactly
 	// or as a prefix: its order is the score of that term alone.
+	// So does it for a near word of under 8 letters: its postings all match
+	// alike, as an exact word's do (§19).
 	for _, pk := range p.picks {
-		pk.full = !pk.expanded() || len(pk.uses) > 1 || pk.uses[0].kind == fuzzyKey
+		u := pk.uses[0]
+		pk.full = !pk.expanded() || len(pk.uses) > 1 || u.kind == fuzzyKey || (u.kind.near() && pk.w.Key.Len() >= key5.MaxUnits)
 	}
 
 	p.planPairs()
 
 	return p
+}
+
+// addSignature adds the signatures of a virtual term: its own, and with 2
+// segments or more the longer ones that start with it, within the budget
+// (PLAN_BUCKETS.md §17.3). They are in the slot of the run's first word.
+func (p *readPlan) addSignature(t *Term, term int, source indexSource, budget int64) {
+	x := source(t.Sig.Key.Slot())
+	if x == nil {
+		return
+	}
+
+	if w, ok := x.Find(t.Sig.Key); ok {
+		p.add(candidate{x: x, w: w}, use{term: term, kind: exactKey})
+	}
+
+	var longer []candidate
+
+	for _, r := range t.prefixRanges() {
+		in := x.Range(r.lo, r.hi)
+		for j := range in {
+			if w := &in[j]; w.Key != t.Sig.Key {
+				longer = append(longer, candidate{x: x, w: w})
+			}
+		}
+	}
+
+	if p.within(longer, budget, term, prefixKey, false, false) {
+		p.approx = true
+	}
+}
+
+// addNear adds the near words of a term (PLAN_BUCKETS.md §19), those its
+// exact key and its prefix ranges do not already match, within the budget,
+// closest first. They are in the term's own bucket, read anyway: they cost
+// no request. It reports whether there was any.
+func (p *readPlan) addNear(t *Term, term int, source indexSource, budget int64, force bool) bool {
+	if t.virtual() || t.letter() {
+		return false
+	}
+
+	x := source(t.Token.Key.Slot())
+	if x == nil {
+		return false
+	}
+
+	var longer, shorter []candidate
+	var scratch [key5.MaxUnits]uint8
+
+	for j := range x.Words {
+		w := &x.Words[j]
+
+		switch kind, d := t.classifyKey(w.Key, false, scratch[:]); kind {
+		case longerKey:
+			longer = append(longer, candidate{x: x, w: w, dist: d})
+		case shorterKey:
+			shorter = append(shorter, candidate{x: x, w: w, dist: d})
+		default:
+			continue
+		}
+
+		p.df[term] += int(w.DF)
+	}
+
+	if len(longer) > 0 && p.within(longer, budget, term, longerKey, true, force) {
+		p.approx = true
+	}
+
+	if len(shorter) > 0 && p.within(shorter, budget, term, shorterKey, true, force) {
+		p.approx = true
+	}
+
+	return len(longer)+len(shorter) > 0
+}
+
+// addGroupWords adds the group words a term matches: its own, and as a
+// prefix those of its prefix ranges, within the budget. They do not count
+// in its df: a group word is not a word of the text.
+func (p *readPlan) addGroupWords(t *Term, term int, source indexSource, budget int64) {
+	if k, ok := t.groupKey(); ok {
+		if x := source(k.Slot()); x != nil {
+			if w, ok := x.Find(k); ok {
+				p.add(candidate{x: x, w: w}, use{term: term, kind: groupKey})
+			}
+		}
+	}
+
+	var prefix []candidate
+
+	for _, r := range t.groupRanges() {
+		var seen []*bucket.Index
+
+		for slot := r.lo.Slot(); slot <= r.hi.Slot(); slot++ {
+			x := source(slot)
+			if x == nil || slices.Contains(seen, x) {
+				continue
+			}
+
+			seen = append(seen, x)
+
+			in := x.Range(r.lo, r.hi)
+			for j := range in {
+				if w := &in[j]; t.Explicit || w.Key != t.Token.Key.In(key5.SpaceGroupWord) {
+					prefix = append(prefix, candidate{x: x, w: w})
+				}
+			}
+		}
+	}
+
+	if p.within(prefix, budget, term, groupKey, false, false) {
+		p.approx = true
+	}
 }
 
 // within adds the words of an expansion while the bytes to read fit the

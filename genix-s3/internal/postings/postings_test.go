@@ -10,7 +10,7 @@ import (
 )
 
 // randomList is a list sorted by (key, Pos): sparse or dense IDs, now and
-// then a jump to a later group, some documents with the word twice, tails or
+// then a jump to a later origin, some documents with the word twice, tails or
 // not. n × spread must stay under 2³² − 2²⁰.
 func randomList(r *rand.Rand, n int, spread uint32, tails bool) []Posting {
 	var list []Posting
@@ -21,7 +21,7 @@ func randomList(r *rand.Rand, n int, spread uint32, tails bool) []Posting {
 		id += docid.Key(1 + r.Uint32N(spread))
 
 		if r.IntN(16) == 0 {
-			id = docid.New(id.Group()+uint8(1+r.IntN(4)), r.Uint32N(1<<20))
+			id = docid.New(id.Origin()+uint8(1+r.IntN(4)), r.Uint32N(1<<20))
 		}
 
 		repeats := 1
@@ -158,10 +158,10 @@ func TestEntriesRoundTrip(t *testing.T) {
 	}
 }
 
-// TestGroupJumps: a list of dense IDs over several groups stays in narrow
-// fixed gaps, the changes of group escaped, and a list of one group writes
+// TestOriginJumps: a list of dense IDs over several origins stays in narrow
+// fixed gaps, the changes of origin escaped, and a list of one origin writes
 // no escape.
-func TestGroupJumps(t *testing.T) {
+func TestOriginJumps(t *testing.T) {
 	var list []Posting
 
 	for _, g := range []uint8{0, 3, 4, 255} {
@@ -194,7 +194,7 @@ func TestGroupJumps(t *testing.T) {
 	// in a list without any.
 	one := []Posting{{ID: docid.New(9, 1)}, {ID: docid.New(9, 4)}, {ID: docid.New(9, 7)}}
 	if sh, _ := ShapeOf(one); sh.gaps().esc || sh.gaps().w != 2 {
-		t.Fatalf("one group: %+v", sh.gaps())
+		t.Fatalf("one origin: %+v", sh.gaps())
 	}
 
 	cols := Columns{list, list}
