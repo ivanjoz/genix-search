@@ -20,6 +20,7 @@ import (
 	"github.com/ivanjoz/genix-search/genix-s3/internal/parallel"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/plog"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/postings"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/pricing"
 )
 
 // Options are the query tunables.
@@ -28,7 +29,9 @@ type Options struct {
 	// read; the most frequent words go first.
 	PrefixBudget int64
 	// CoalesceGap is the largest hole merged into one range read: S3 has no
-	// multi-range GET, so two lists close together cost one request.
+	// multi-range GET, so two lists close together cost one request. The
+	// default is the bytes that cost as much as a GET: a smaller hole is
+	// cheaper to read than to skip.
 	CoalesceGap int64
 	// MaxRequest is the largest merged range read.
 	MaxRequest int64
@@ -46,7 +49,7 @@ type Options struct {
 func DefaultOptions() Options {
 	return Options{
 		PrefixBudget: 32 << 10,
-		CoalesceGap:  4 << 10,
+		CoalesceGap:  pricing.S3Express.BytesPerGET(),
 		MaxRequest:   1 << 20,
 		Concurrency:  16,
 		CacheBytes:   64 << 20,

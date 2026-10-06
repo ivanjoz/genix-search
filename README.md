@@ -41,13 +41,12 @@ heap. On object storage the costs are different:
 * there is no lock service, no multi-range GET and no transaction across
   objects. All you get is conditional writes on single objects.
 
-Genix S3 is built around that cost model, in this order:
-
-1. **S3 requests**: GETs per query, PUTs per write;
-2. **bytes read** per query.
-
-File size and CPU are not goals. Any CPU work that saves a request or a byte
-is worth spending.
+Genix S3 is built to minimize the **S3 bill of a cold search**, then of the
+writes. On S3 Express One Zone (us-east-1) a GET costs $0.00003 per 1000 and
+every byte read $0.0006 per GB, so one GET costs as much as reading 52 KiB.
+A search reads a few KB, so its bill is mostly GETs: reading tens of KB more
+to save one GET pays. Every trade between requests and bytes is decided in
+dollars (`internal/pricing`). File size and CPU are not goals.
 
 It also keeps three constraints that rule out the usual shortcuts:
 
@@ -64,8 +63,7 @@ What that buys, measured on a 10 000-document collection
 
 | Operation | Cost |
 |---|---|
-| Cold search | about 4 GETs and 8 KB, in 1 round trip most of the time |
-| Warm search (bucket index cached) | 1 GET |
+| Cold search | about 3.7 GETs and 7 KB, in 1 round trip: $0.11 per million |
 | Collection under 100 documents | 1 GET, no index at all |
 | Write, any batch size | 1 GET + 1 PUT |
 
@@ -168,8 +166,11 @@ and per compaction. One bucket per slot is also available (`GroupingNone`).
 
 The `.idx` holds the bucket's keys and, for each key, its posting count, its
 first document and the shape of its list. Lists of one posting live entirely
-in those fields, and the smallest lists of each slot go inline up to 2 KB. The
-`.idx` is read whole, decoded once, and **cached** across queries.
+in those fields. A slot whose other lists fit in 52 KiB (what one GET costs
+in bytes) keeps them all **inline**, so its searches never need the `.db`; a
+bigger slot keeps none, because its searches mostly ask for its big lists and
+every search of the slot would pay the bytes. The `.idx` is read whole, and a
+long-lived process can cache it (a Lambda starts cold every time).
 
 Everything larger goes to the `.db`, which is never read whole. **List
 offsets are not stored**: each list's size is computable from its fields, so
@@ -196,7 +197,7 @@ two-word query reads one combination block instead of two long lists.
 **When to expand** is a cost balance. An expansion makes the `.idx` larger,
 and every query of the bucket pays that. Only queries of that word save. With
 `D` the bytes of all lists of a slot, a word expands when its list exceeds
-`T = max(2 KB, √(2 KB · D))`, with hysteresis so it doesn't flip on every
+`T = max(32 KB, √(32 KB · D))`, with hysteresis so it doesn't flip on every
 write. At most `D/T` words expand, so the `.idx` grows by about `T`, and the
 largest list a query still reads from the `.db` is also about `T`.
 
@@ -277,8 +278,8 @@ stays a single request.
    words go through their heads. Pairs of terms go through combination
    blocks.
 4. **Round 2**, in parallel: the `.db` byte ranges, sorted and merged when
-   less than 4 KB apart (S3 has no multi-range GET). Often there is nothing
-   to read.
+   less than 52 KiB apart (S3 has no multi-range GET, and a smaller hole
+   costs less to read than a GET). Often there is nothing to read.
 5. **Assemble, overlay, rank.** Collect postings per document, apply the
    pending operations from `p.log`, score, keep the top `offset + limit`.
 6. **Verify.** Check every head bound. In the rare case a bound fails, a
@@ -427,16 +428,21 @@ reference is BM25 on SQLite FTS5.
 * **Where it loses.** Queries that are only a group name (nDCG 0.59 against
   0.80): a group is worth less than a word of the name, so documents that
   mention the words outrank the group's members.
-* **Cost.** Cold: 3.8 GETs and 7 to 8 KB per query on average, p95 5 GETs
-  and 12 KB. Warm: about 1.1 GETs.
-* **Random ids cost more.** With random `uint32` ids instead of row numbers,
-  the gaps are wider: the `.db` grows from 4 KB to 395 KB and a cold query
-  goes from 3.8 to 4.6 GETs and from 6.7 to 11.5 KB. The quality does not
-  change.
+* **Cost.** Every search is cold (as in a fresh Lambda): 3.7 GETs, 7 KB and
+  1 round on average, $0.11 per million searches; p95 5 GETs and 12 KB.
+* **Random ids cost a little more.** With random `uint32` ids instead of row
+  numbers a posting takes about 30 bits instead of 9, so the `.idx` holds
+  more bytes (15.7 KB read per search instead of 7.1), but the GETs do not
+  change: $0.12 per million. The quality does not change.
+* **At scale** (the catalogue copied under new random ids): $0.13 per million
+  searches at 100k documents, $0.17 at 400k and $0.19 at 1M. Taking the
+  lists out of the `.idx` to read fewer bytes costs 30–58 % more at 10k–100k:
+  each GET saved is worth 52 KiB.
 
 The benchmark doubles as a regression gate. A change that lowers global nDCG
-or MRR by more than 0.01, or raises the cold GETs or KB by more than 5 %,
-fails (`GXS_BENCH=1 go test ./internal/query -run 'TestBench$'`).
+or MRR by more than 0.01, or raises the average dollars per search by more
+than 5 %, fails (`GXS_BENCH=1 go test ./internal/query -run 'TestBench$'`).
+`TestCostSweep` measures the shapes of the index against each other.
 
 ## Limitations
 

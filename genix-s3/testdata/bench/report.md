@@ -6,7 +6,7 @@ Efectividad contra los juicios de relevancia (qrels): S@1, S@10 y MRR sobre las 
 
 ## Base A: nombres
 
-Índice (es100): .idx 160 KB · .db 4 KB · tokens 379.4 KB · p.log 0 KB · 103 objetos · build 43 ms, 107 PUTs, 921 KB escritos.
+Índice (es100): .idx 164 KB · .db 0 KB · tokens 134.4 KB · p.log 0 KB · 99 objetos · build 61 ms, 102 PUTs, 676 KB escritos, $0.000117.
 
 ### Efectividad
 
@@ -34,27 +34,29 @@ Efectividad contra los juicios de relevancia (qrels): S@1, S@10 y MRR sobre las 
 | R3 nuestras reglas sin índice | 0.75 | 0.94 | 0.82 | 0.93 | 0.21 | 0.02 |
 | R3 con palabras completas (sin el corte de 8 letras) | 0.71 | 0.92 | 0.79 | 0.91 | 0.21 | 0.01 |
 
-### Costo (solo genix-s3)
+### Costo (solo genix-s3, en frío)
 
-| Categoría | GET frío p50 · p95 · máx | KB frío p50 · p95 · máx | GET caliente | KB caliente | Rondas frío |
-|---|---|---|---|---|---|
-| exacta | 4 · 4 · 5 | 6.5 · 10.3 · 10.6 | 1.06 | 0.2 | 1.06 |
-| parcial | 4 · 4 · 5 | 7.6 · 10.2 · 10.7 | 1.05 | 0.2 | 1.05 |
-| escribiendo | 4 · 4 · 5 | 6.2 · 9.3 · 9.5 | 1.08 | 0.2 | 1.08 |
-| typo | 4 · 4 · 5 | 7.2 · 10.5 · 11.4 | 1.04 | 0.2 | 1.04 |
-| tildes | 4 · 5 · 5 | 7.4 · 11.0 · 11.0 | 1.20 | 0.4 | 1.20 |
-| marca | 3 · 5 · 5 | 7.0 · 11.1 · 11.1 | 1.07 | 0.3 | 1.07 |
-| numeros | 5 · 8 · 8 | 7.9 · 9.8 · 9.8 | 1.07 | 0.2 | 1.07 |
-| plural | 4 · 5 · 5 | 6.7 · 11.0 · 11.3 | 1.08 | 0.2 | 1.08 |
-| nombre+grupo | 4 · 5 · 6 | 7.0 · 11.8 · 14.3 | 1.16 | 0.3 | 1.16 |
-| negativa | 2 · 3 · 3 | 2.7 · 4.2 · 4.2 | 1.00 | 0.2 | 1.00 |
-| todas | 4 · 5 · 8 | 6.7 · 10.5 · 14.3 | 1.08 | 0.2 | 1.08 |
+S3 Express One Zone us-east-1: GET $0.00003 por 1000, lectura $0.0006 por GB.
 
-En frío, promedio por consulta: GET .idx 2.68 · .db 0.08 · p.log 1.00 · otros 0.00; KB .idx 6.5 · .db 0.1 · p.log 0.2 · otros 0.0.
+| Categoría | $ por 1M búsquedas prom. · p95 | GET prom. · p50 · p95 · máx | KB prom. · p50 · p95 · máx | Rondas |
+|---|---|---|---|---|
+| exacta | 0.1146 · 0.1264 | 3.69 · 4 · 4 · 4 | 7.0 · 6.7 · 11.2 · 13.3 | 1.00 |
+| parcial | 0.1170 · 0.1269 | 3.75 · 4 · 4 · 4 | 7.8 · 7.6 · 12.0 · 12.8 | 1.00 |
+| escribiendo | 0.1107 · 0.1267 | 3.56 · 4 · 4 · 4 | 6.9 · 6.2 · 11.7 · 12.3 | 1.00 |
+| typo | 0.1146 · 0.1273 | 3.68 · 4 · 4 · 4 | 7.4 · 7.5 · 12.7 · 13.8 | 1.00 |
+| tildes | 0.1205 · 0.1273 | 3.87 · 4 · 4 · 4 | 7.8 · 7.6 · 12.8 · 12.8 | 1.00 |
+| marca | 0.1080 · 0.1565 | 3.47 · 3 · 5 · 5 | 7.0 · 7.8 · 11.3 · 11.3 | 1.00 |
+| numeros | 0.1465 · 0.2454 | 4.73 · 5 · 8 · 8 | 7.9 · 8.5 · 10.1 · 10.1 | 1.00 |
+| plural | 0.1109 · 0.1268 | 3.56 · 4 · 4 · 4 | 7.2 · 6.7 · 11.8 · 13.9 | 1.00 |
+| nombre+grupo | 0.1196 · 0.1570 | 3.84 · 4 · 5 · 6 | 7.7 · 7.2 · 12.3 · 14.3 | 1.00 |
+| negativa | 0.0675 · 0.0924 | 2.20 · 2 · 3 · 3 | 2.6 · 2.7 · 4.5 · 4.5 | 1.00 |
+| todas | 0.1145 · 0.1548 | 3.68 · 4 · 5 · 8 | 7.1 · 7.0 · 12.0 · 14.3 | 1.00 |
+
+En frío, promedio por consulta: GET .idx 2.68 · .db 0.00 · p.log 1.00 · otros 0.00; KB .idx 7.0 · .db 0.0 · p.log 0.2 · otros 0.0.
 
 ## Base B: nombres + grupos (categoría)
 
-Índice (es100): .idx 183 KB · .db 9 KB · tokens 515.9 KB · p.log 0 KB · 105 objetos · build 53 ms, 109 PUTs, 1223 KB escritos.
+Índice (es100): .idx 192 KB · .db 0 KB · tokens 145.1 KB · p.log 0 KB · 99 objetos · build 75 ms, 102 PUTs, 852 KB escritos, $0.000118.
 
 ### Efectividad
 
@@ -82,31 +84,33 @@ En frío, promedio por consulta: GET .idx 2.68 · .db 0.08 · p.log 1.00 · otro
 | R2 BM25 trigramas | 0.71 | 0.97 | 0.81 | 0.87 | 0.22 | 0.16 |
 | R3 nuestras reglas sin índice | 0.78 | 0.98 | 0.86 | 0.93 | 0.23 | 0.03 |
 
-### Costo (solo genix-s3)
+### Costo (solo genix-s3, en frío)
 
-| Categoría | GET frío p50 · p95 · máx | KB frío p50 · p95 · máx | GET caliente | KB caliente | Rondas frío |
-|---|---|---|---|---|---|
-| exacta | 4 · 5 · 6 | 7.5 · 11.4 · 11.6 | 1.11 | 0.3 | 1.09 |
-| parcial | 4 · 5 · 5 | 8.6 · 11.6 · 11.6 | 1.15 | 0.3 | 1.15 |
-| escribiendo | 4 · 5 · 5 | 7.6 · 10.2 · 11.0 | 1.24 | 0.3 | 1.24 |
-| typo | 4 · 4 · 5 | 8.2 · 11.7 · 15.7 | 1.04 | 0.3 | 1.04 |
-| tildes | 4 · 5 · 5 | 8.5 · 12.9 · 12.9 | 1.27 | 0.5 | 1.27 |
-| marca | 3 · 5 · 5 | 7.8 · 12.2 · 12.2 | 1.13 | 0.3 | 1.13 |
-| numeros | 5 · 8 · 8 | 9.1 · 10.6 · 10.6 | 1.07 | 0.4 | 1.07 |
-| plural | 4 · 5 · 5 | 8.4 · 12.0 · 12.4 | 1.20 | 0.2 | 1.20 |
-| nombre+grupo | 4 · 5 · 6 | 8.8 · 14.8 · 17.1 | 1.36 | 0.5 | 1.36 |
-| grupo | 4 · 5 · 5 | 7.5 · 12.3 · 12.3 | 1.13 | 0.4 | 1.13 |
-| negativa | 2 · 3 · 3 | 3.0 · 5.1 · 5.1 | 1.00 | 0.2 | 1.00 |
-| todas | 4 · 5 · 8 | 7.9 · 11.6 · 17.1 | 1.16 | 0.3 | 1.16 |
+S3 Express One Zone us-east-1: GET $0.00003 por 1000, lectura $0.0006 por GB.
 
-En frío, promedio por consulta: GET .idx 2.68 · .db 0.16 · p.log 1.00 · otros 0.00; KB .idx 7.5 · .db 0.1 · p.log 0.2 · otros 0.0.
+| Categoría | $ por 1M búsquedas prom. · p95 | GET prom. · p50 · p95 · máx | KB prom. · p50 · p95 · máx | Rondas |
+|---|---|---|---|---|
+| exacta | 0.1153 · 0.1280 | 3.69 · 4 · 4 · 4 | 8.2 · 8.0 · 13.9 · 17.0 | 1.00 |
+| parcial | 0.1176 · 0.1278 | 3.75 · 4 · 4 · 4 | 9.0 · 8.6 · 13.7 · 14.4 | 1.00 |
+| escribiendo | 0.1117 · 0.1274 | 3.56 · 4 · 4 · 4 | 8.5 · 8.1 · 13.0 · 15.6 | 1.00 |
+| typo | 0.1155 · 0.1281 | 3.68 · 4 · 4 · 4 | 8.8 · 9.2 · 14.2 · 16.8 | 1.00 |
+| tildes | 0.1214 · 0.1294 | 3.87 · 4 · 4 · 4 | 9.5 · 9.1 · 16.3 · 16.3 | 1.00 |
+| marca | 0.1086 · 0.1582 | 3.47 · 3 · 5 · 5 | 8.1 · 9.4 · 14.4 · 14.4 | 1.00 |
+| numeros | 0.1472 · 0.2459 | 4.73 · 5 · 8 · 8 | 9.1 · 9.3 · 12.7 · 12.7 | 1.00 |
+| plural | 0.1119 · 0.1288 | 3.56 · 4 · 4 · 4 | 8.8 · 8.5 · 15.3 · 15.8 | 1.00 |
+| nombre+grupo | 0.1209 · 0.1587 | 3.84 · 4 · 5 · 6 | 9.9 · 9.8 · 15.3 · 17.4 | 1.00 |
+| grupo | 0.1123 · 0.1274 | 3.60 · 4 · 4 · 4 | 7.5 · 7.5 · 12.9 · 12.9 | 1.00 |
+| negativa | 0.0679 · 0.0929 | 2.20 · 2 · 3 · 3 | 3.3 · 3.0 · 5.9 · 5.9 | 1.00 |
+| todas | 0.1151 · 0.1552 | 3.68 · 4 · 5 · 8 | 8.5 · 8.5 · 14.4 · 17.4 | 1.00 |
+
+En frío, promedio por consulta: GET .idx 2.68 · .db 0.00 · p.log 1.00 · otros 0.00; KB .idx 8.3 · .db 0.0 · p.log 0.2 · otros 0.0.
 
 ## A → B: qué cambian los grupos
 
-| Consultas | N | Δ S@1 | Δ MRR | Δ nDCG@10 | Δ falsos | Δ GET frío (p50) | Δ KB frío (p50) | Δ KB frío (prom.) |
+| Consultas | N | Δ S@1 | Δ MRR | Δ nDCG@10 | Δ falsos | Δ $ por 1M (prom.) | Δ GET frío (prom.) | Δ KB frío (prom.) |
 |---|---|---|---|---|---|---|---|---|
-| consultas de nombre (sin grupo) | 185 | +0.00 | +0.00 | +0.00 | +0.00 | +0 | +1.2 | +1.0 |
-| nombre+grupo: sin grupo (A) → con grupo (B) | 25 | +0.24 | +0.32 | +0.23 | -0.01 | +0 | +1.8 | +1.6 |
+| consultas de nombre (sin grupo) | 185 | +0.00 | +0.00 | +0.00 | +0.00 | +0.0008 | +0.00 | +1.4 |
+| nombre+grupo: sin grupo (A) → con grupo (B) | 25 | +0.24 | +0.32 | +0.23 | -0.01 | +0.0013 | +0.00 | +2.2 |
 
 ## Consultas donde perdemos contra R1 por más de 0,2 de nDCG (11)
 

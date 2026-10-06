@@ -174,7 +174,7 @@ func TestSearchBasics(t *testing.T) {
 // listsInDB keeps every list of two postings or more in the .db.
 func listsInDB() collection.Options {
 	opts := testOptions()
-	opts.Params.InlineBudget = 0
+	opts.Params.InlineSlot, opts.Params.InlineBudget = 0, 0
 
 	return opts
 }

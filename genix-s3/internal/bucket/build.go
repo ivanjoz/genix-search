@@ -15,6 +15,7 @@ import (
 	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/layout"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/postings"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/pricing"
 )
 
 // Params tune how specific the index gets. A
@@ -25,7 +26,17 @@ type Params struct {
 	MinSplit, ExpandCost float64
 	// HeadSize is the documents of a head.
 	HeadSize int
-	// InlineBudget is the bytes of lists held in the .idx.
+	// InlineSlot: a slot whose lists, but the expanded and the one-posting,
+	// take at most these bytes keeps them all in the .idx, so its searches
+	// end in round 1. The default is the bytes that cost as much as a GET:
+	// every search of the slot reads them, and a list held saves the
+	// searches of its word a GET to the .db. A bigger slot would pay this for
+	// nothing on most searches (they ask for its big lists), so it only
+	// keeps InlineBudget.
+	InlineSlot int
+	// InlineBudget is the bytes of lists held in the .idx by a slot over
+	// InlineSlot: the smallest first. 0 by default: those lists are of rare
+	// words, so few searches use them, and every search pays their bytes.
 	InlineBudget int
 	// ComboDictBudget is the size of a combinations directory over which
 	// co-keys share blocks by prefix.
@@ -39,9 +50,13 @@ type Params struct {
 // DefaultGroupWordDocs is the default of Params.GroupWordDocs.
 const DefaultGroupWordDocs = 100
 
-// DefaultParams are the defaults.
+// DefaultParams are the defaults, chosen by dollars per cold search on S3
+// Express (TestCostSweep, 10k to 1M documents).
 func DefaultParams() Params {
-	return Params{MinSplit: 2048, ExpandCost: 2048, HeadSize: 64, InlineBudget: 2048, ComboDictBudget: 2048, GroupWordDocs: DefaultGroupWordDocs}
+	return Params{
+		MinSplit: 32 << 10, ExpandCost: 32 << 10, HeadSize: 64,
+		InlineSlot: int(pricing.S3Express.BytesPerGET()), InlineBudget: 0, ComboDictBudget: 2048, GroupWordDocs: DefaultGroupWordDocs,
+	}
 }
 
 // Threshold is T for a bucket whose lists take d bytes.
@@ -332,8 +347,8 @@ func (b *builder) bucket(group uint16, keys []key5.Key) (*Built, error) {
 		ws[i] = b.words[k]
 	}
 
-	// Lists in the .idx: per slot, the smallest first, while they fit the
-	// budget.
+	// Lists in the .idx: per slot, all of them if they fit InlineSlot;
+	// otherwise the smallest first, while they fit InlineBudget.
 	small := map[uint16][]*word{}
 
 	for _, w := range ws {
@@ -352,10 +367,20 @@ func (b *builder) bucket(group uint16, keys []key5.Key) (*Built, error) {
 	for _, list := range small {
 		slices.SortStableFunc(list, func(x, y *word) int { return cmp.Compare(x.shape.Bits(), y.shape.Bits()) })
 
+		var all uint64
+		for _, w := range list {
+			all += w.shape.Bits()
+		}
+
+		budget := uint64(b.p.InlineBudget)
+		if (all+7)/8 <= uint64(b.p.InlineSlot) {
+			budget = uint64(b.p.InlineSlot)
+		}
+
 		var inlineBits uint64
 
 		for _, w := range list {
-			if (inlineBits+w.shape.Bits()+7)/8 > uint64(b.p.InlineBudget) {
+			if (inlineBits+w.shape.Bits()+7)/8 > budget {
 				break
 			}
 

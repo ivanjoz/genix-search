@@ -13,6 +13,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -25,11 +26,14 @@ import (
 	"github.com/ivanjoz/genix-search/genix-s3/internal/docid"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/layout"
 	"github.com/ivanjoz/genix-search/genix-s3/internal/normalize"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/parallel"
+	"github.com/ivanjoz/genix-search/genix-s3/internal/pricing"
 )
 
 // TestBench is the standard benchmark: how well the engine
-// finds (against relevance judgments and against BM25) and what it reads from
-// S3 (requests, bytes and rounds, cold and warm), on a fixed corpus of 10 010
+// finds (against relevance judgments and against BM25) and what it costs on
+// S3 (requests, bytes, rounds and dollars; always cold: every query runs in a
+// fresh Lambda), on a fixed corpus of 10 010
 // products and 200 fixed queries. It writes testdata/bench/report.md and
 // results.json, and fails when the result is worse than baseline.json.
 //
@@ -188,7 +192,7 @@ func (d *benchData) docs(ids benchIDs, grouped bool) []collection.Doc {
 
 // benchDB is one of the two local databases of the benchmark.
 type benchDB struct {
-	store  *kindCounter
+	fsys   blob.Blob
 	col    layout.Collection
 	docs   []collection.Doc
 	Build  benchBuild
@@ -201,6 +205,8 @@ type benchBuild struct {
 	Docs    int   `json:"docs"`
 	Puts    int64 `json:"puts"`
 	KBWrote int64 `json:"kb_written"`
+	// USD is what the build costs on S3 Express: its PUTs and bytes.
+	USD float64 `json:"usd"`
 }
 
 // benchStampFile is what stays next to a database: what it was built from
@@ -303,7 +309,8 @@ func openBenchDB(t *testing.T, name string, docs []collection.Doc, random bool) 
 			t.Fatal(err)
 		}
 
-		db.Build = benchBuild{Docs: len(docs), Puts: counting.Writes.Load(), KBWrote: counting.BytesWritten.Load() >> 10}
+		db.Build = benchBuild{Docs: len(docs), Puts: counting.Writes.Load(), KBWrote: counting.BytesWritten.Load() >> 10,
+			USD: pricing.S3Express.Write(int(counting.Writes.Load()), counting.BytesWritten.Load())}
 		db.Millis = time.Since(start).Milliseconds()
 
 		stamp, err := json.Marshal(benchStampFile{Hash: hash, Millis: db.Millis, Build: db.Build})
@@ -316,7 +323,7 @@ func openBenchDB(t *testing.T, name string, docs []collection.Doc, random bool) 
 		}
 	}
 
-	db.store = &kindCounter{Blob: fsys}
+	db.fsys = fsys
 
 	err = filepath.WalkDir(dir, func(path string, e fs.DirEntry, err error) error {
 		if err != nil || e.IsDir() {
@@ -410,17 +417,19 @@ func (k *kindCounter) take() benchCost {
 
 // benchCost is what one search read.
 type benchCost struct {
-	Requests   int   `json:"get"`
-	Rounds     int   `json:"rounds"`
-	Bytes      int64 `json:"bytes"`
-	IdxReq     int   `json:"idx_get"`
-	DBReq      int   `json:"db_get"`
-	LogReq     int   `json:"log_get"`
-	OtherReq   int   `json:"other_get"`
-	IdxBytes   int64 `json:"idx_bytes"`
-	DBBytes    int64 `json:"db_bytes"`
-	LogBytes   int64 `json:"log_bytes"`
-	OtherBytes int64 `json:"other_bytes"`
+	// USD1M is the S3 Express cost of a million searches like this one.
+	USD1M      float64 `json:"usd_1m"`
+	Requests   int     `json:"get"`
+	Rounds     int     `json:"rounds"`
+	Bytes      int64   `json:"bytes"`
+	IdxReq     int     `json:"idx_get"`
+	DBReq      int     `json:"db_get"`
+	LogReq     int     `json:"log_get"`
+	OtherReq   int     `json:"other_get"`
+	IdxBytes   int64   `json:"idx_bytes"`
+	DBBytes    int64   `json:"db_bytes"`
+	LogBytes   int64   `json:"log_bytes"`
+	OtherBytes int64   `json:"other_bytes"`
 }
 
 // metrics of one ranking of one query.
@@ -531,7 +540,6 @@ type benchResult struct {
 	R3     benchMetrics  `json:"r3"`
 	R3Full *benchMetrics `json:"r3_full_words,omitempty"` // base A only: no 8-letter cut
 	Cold   benchCost     `json:"cold"`
-	Warm   benchCost     `json:"warm"`
 }
 
 // benchRow is the average of a set of results.
@@ -545,8 +553,9 @@ type benchRow struct {
 
 	R1, R2, R3 benchSystem
 
+	// USD1M is dollars per million cold searches.
+	USD1M           benchDist
 	ColdGet, ColdKB benchDist
-	WarmGet, WarmKB float64
 	Rounds          float64
 	// By kind of object, cold average.
 	IdxGet, DBGet, LogGet, OtherGet float64
@@ -605,7 +614,7 @@ func summarize(rs []benchResult) benchRow {
 	row := benchRow{N: len(rs)}
 
 	var ours, r1, r2, r3 []benchMetrics
-	var overlap, coldGet, coldKB, warmGet, warmKB, rounds []float64
+	var overlap, usd, coldGet, coldKB, rounds []float64
 	var kinds [8][]float64
 
 	for _, r := range rs {
@@ -615,8 +624,8 @@ func summarize(rs []benchResult) benchRow {
 
 		ours, r1, r2, r3 = append(ours, r.Ours), append(r1, r.R1), append(r2, r.R2), append(r3, r.R3)
 		overlap = append(overlap, r.Ours.Overlap)
+		usd = append(usd, r.Cold.USD1M)
 		coldGet, coldKB = append(coldGet, float64(r.Cold.Requests)), append(coldKB, float64(r.Cold.Bytes)/1024)
-		warmGet, warmKB = append(warmGet, float64(r.Warm.Requests)), append(warmKB, float64(r.Warm.Bytes)/1024)
 		rounds = append(rounds, float64(r.Cold.Rounds))
 
 		for i, v := range []float64{float64(r.Cold.IdxReq), float64(r.Cold.DBReq), float64(r.Cold.LogReq), float64(r.Cold.OtherReq),
@@ -629,8 +638,8 @@ func summarize(rs []benchResult) benchRow {
 	row.S1, row.S10, row.MRR, row.NDCG, row.P10, row.False = s.S1, s.S10, s.MRR, s.NDCG, s.P10, s.False
 	row.Overlap = round4(mean(overlap))
 	row.R1, row.R2, row.R3 = systemRow(r1), systemRow(r2), systemRow(r3)
-	row.ColdGet, row.ColdKB = dist4(coldGet), dist4(coldKB)
-	row.WarmGet, row.WarmKB, row.Rounds = round4(mean(warmGet)), round4(mean(warmKB)), round4(mean(rounds))
+	row.USD1M, row.ColdGet, row.ColdKB = dist4(usd), dist4(coldGet), dist4(coldKB)
+	row.Rounds = round4(mean(rounds))
 	row.IdxGet, row.DBGet, row.LogGet, row.OtherGet = round4(mean(kinds[0])), round4(mean(kinds[1])), round4(mean(kinds[2])), round4(mean(kinds[3]))
 	row.IdxKB, row.DBKB, row.LogKB, row.OtherKB = round4(mean(kinds[4])), round4(mean(kinds[5])), round4(mean(kinds[6])), round4(mean(kinds[7]))
 
@@ -746,39 +755,32 @@ func TestBench(t *testing.T) {
 		ref := newReference(normalize.Default, whole, whole, nil, 0)
 		full := newFullText(normalize.Default, text)
 
+		var queries []benchQuery
+
 		for _, q := range d.queries {
-			if !strings.Contains(q.Bases, base) {
-				continue
+			if strings.Contains(q.Bases, base) {
+				queries = append(queries, q)
 			}
+		}
 
-			req := Request{Query: q.Text, Limit: 10, Fuzzy: q.fuzzy()}
+		// Every query cold, on its own engine and counter, on every core.
+		done := make([]benchResult, len(queries))
 
-			db.store.take()
+		err := parallel.Run(ctx, len(queries), runtime.GOMAXPROCS(0), func(ctx context.Context, i int) error {
+			q := queries[i]
+			store := &kindCounter{Blob: db.fsys}
 
-			e := New(db.store, db.col, normalize.Default, DefaultOptions())
-
-			cold, err := e.Search(ctx, req)
+			cold, err := New(store, db.col, normalize.Default, DefaultOptions()).Search(ctx, Request{Query: q.Text, Limit: 10, Fuzzy: q.fuzzy()})
 			if err != nil {
-				t.Fatalf("%s %q: %v", q.ID, q.Text, err)
+				return fmt.Errorf("%s %q: %w", q.ID, q.Text, err)
 			}
 
-			coldCost := db.store.take()
+			coldCost := store.take()
 			coldCost.Rounds = cold.Stats.Rounds
+			coldCost.USD1M = round4(1e6 * pricing.S3Express.Read(coldCost.Requests, coldCost.Bytes))
 
 			if coldCost.Requests != cold.Stats.Requests || coldCost.Bytes != cold.Stats.Bytes {
 				t.Errorf("%s: the engine says %d requests, %d bytes; the store saw %d, %d", q.ID, cold.Stats.Requests, cold.Stats.Bytes, coldCost.Requests, coldCost.Bytes)
-			}
-
-			warm, err := e.Search(ctx, req)
-			if err != nil {
-				t.Fatalf("%s %q (warm): %v", q.ID, q.Text, err)
-			}
-
-			warmCost := db.store.take()
-			warmCost.Rounds = warm.Stats.Rounds
-
-			if !slices.Equal(rows(cold.Hits), rows(warm.Hits)) {
-				t.Errorf("%s %q: the warm ranking differs from the cold", q.ID, q.Text)
 			}
 
 			grades := d.qrels[q.ID]
@@ -793,7 +795,7 @@ func TestBench(t *testing.T) {
 				R1:   scoreRanking(q, grades, r1, r1),
 				R2:   scoreRanking(q, grades, d.ref["R2/"+base][q.ID], r1),
 				R3:   scoreRanking(q, grades, r3, r1),
-				Cold: coldCost, Warm: warmCost,
+				Cold: coldCost,
 			}
 
 			if base == "A" {
@@ -806,8 +808,15 @@ func TestBench(t *testing.T) {
 				r.R3Full = &m
 			}
 
-			results = append(results, r)
+			done[i] = r
+
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
 		}
+
+		results = append(results, done...)
 	}
 
 	out := benchOutput{
@@ -859,7 +868,9 @@ func TestBench(t *testing.T) {
 
 // checkBaseline fails when the result is worse than the accepted one:
 // the global nDCG@10 or MRR down by more than 0.01, a
-// category by more than 0.03, or the cold GETs or KB (p50) up by more than 5 %.
+// category by more than 0.03, or the average dollars per search up by more
+// than 5 % (GETs and bytes are not gated apart: trading one for the other is
+// fine when the bill goes down).
 func checkBaseline(t *testing.T, out benchOutput, path string) {
 	t.Helper()
 
@@ -901,12 +912,8 @@ func checkBaseline(t *testing.T, out benchOutput, path string) {
 				continue
 			}
 
-			if now.ColdGet.P50 > was.ColdGet.P50*1.05+eps {
-				t.Errorf("base %s: cold GET p50 %.2f → %.2f (more than 5%% up)", b, was.ColdGet.P50, now.ColdGet.P50)
-			}
-
-			if now.ColdKB.P50 > was.ColdKB.P50*1.05+eps {
-				t.Errorf("base %s: cold KB p50 %.2f → %.2f (more than 5%% up)", b, was.ColdKB.P50, now.ColdKB.P50)
+			if was.USD1M.Avg > 0 && now.USD1M.Avg > was.USD1M.Avg*1.05+eps {
+				t.Errorf("base %s: $ per 1M searches %.4f → %.4f (more than 5%% up)", b, was.USD1M.Avg, now.USD1M.Avg)
 			}
 		}
 	}
@@ -954,8 +961,8 @@ func benchReport(out benchOutput, dbs map[string]*benchDB) string {
 		fmt.Fprintf(&b, "## Base %s\n\n", names[base])
 		bd := out.Build[base]
 		sz := out.Sizes[base]
-		fmt.Fprintf(&b, "Índice (es100): .idx %.0f KB · .db %.0f KB · tokens %.1f KB · p.log %.0f KB · %d objetos · build %d ms, %d PUTs, %d KB escritos.\n\n",
-			float64(sz.Idx)/1024, float64(sz.DB)/1024, float64(sz.Tokens)/1024, float64(sz.Log)/1024, sz.Files, dbs[base].Millis, bd.Puts, bd.KBWrote)
+		fmt.Fprintf(&b, "Índice (es100): .idx %.0f KB · .db %.0f KB · tokens %.1f KB · p.log %.0f KB · %d objetos · build %d ms, %d PUTs, %d KB escritos, $%.6f.\n\n",
+			float64(sz.Idx)/1024, float64(sz.DB)/1024, float64(sz.Tokens)/1024, float64(sz.Log)/1024, sz.Files, dbs[base].Millis, bd.Puts, bd.KBWrote, bd.USD)
 
 		b.WriteString("### Efectividad\n\n| Categoría | N | S@1 · S@10 · MRR | nDCG@10 · P@10 · falsos | R1 nDCG | R2 nDCG | R3 nDCG | Solapamiento R1 |\n|---|---|---|---|---|---|---|---|\n")
 
@@ -1008,7 +1015,8 @@ func benchReport(out benchOutput, dbs map[string]*benchDB) string {
 			fmt.Fprintf(&b, "| R3 con palabras completas (sin el corte de 8 letras) | %s | %s | %s | %s | %s | %s |\n", pct(s.S1), pct(s.S10), pct(s.MRR), pct(s.NDCG), pct(s.P10), pct(s.False))
 		}
 
-		b.WriteString("\n### Costo (solo genix-s3)\n\n| Categoría | GET frío p50 · p95 · máx | KB frío p50 · p95 · máx | GET caliente | KB caliente | Rondas frío |\n|---|---|---|---|---|---|\n")
+		b.WriteString("\n### Costo (solo genix-s3, en frío)\n\nS3 Express One Zone us-east-1: GET $0.00003 por 1000, lectura $0.0006 por GB.\n\n" +
+			"| Categoría | $ por 1M búsquedas prom. · p95 | GET prom. · p50 · p95 · máx | KB prom. · p50 · p95 · máx | Rondas |\n|---|---|---|---|---|\n")
 
 		for _, cat := range order {
 			r, ok := out.Summary[base][cat]
@@ -1016,7 +1024,7 @@ func benchReport(out benchOutput, dbs map[string]*benchDB) string {
 				continue
 			}
 
-			fmt.Fprintf(&b, "| %s | %s | %s | %.2f | %.1f | %.2f |\n", cat, r.ColdGet, kbDist(r.ColdKB), r.WarmGet, r.WarmKB, r.Rounds)
+			fmt.Fprintf(&b, "| %s | %.4f · %.4f | %.2f · %s | %.1f · %s | %.2f |\n", cat, r.USD1M.Avg, r.USD1M.P95, r.ColdGet.Avg, r.ColdGet, r.ColdKB.Avg, kbDist(r.ColdKB), r.Rounds)
 		}
 
 		all = out.Summary[base][benchAll]
@@ -1043,7 +1051,7 @@ func distinctQueries(rs []benchResult) map[string]bool {
 func abReport(out benchOutput) string {
 	var b strings.Builder
 
-	b.WriteString("## A → B: qué cambian los grupos\n\n| Consultas | N | Δ S@1 | Δ MRR | Δ nDCG@10 | Δ falsos | Δ GET frío (p50) | Δ KB frío (p50) | Δ KB frío (prom.) |\n|---|---|---|---|---|---|---|---|---|\n")
+	b.WriteString("## A → B: qué cambian los grupos\n\n| Consultas | N | Δ S@1 | Δ MRR | Δ nDCG@10 | Δ falsos | Δ $ por 1M (prom.) | Δ GET frío (prom.) | Δ KB frío (prom.) |\n|---|---|---|---|---|---|---|---|---|\n")
 
 	pick := func(base string, keep func(benchResult) bool) benchRow {
 		var rs []benchResult
@@ -1065,8 +1073,8 @@ func abReport(out benchOutput) string {
 		keep  func(benchResult) bool
 	}{{"consultas de nombre (sin grupo)", names}, {"nombre+grupo: sin grupo (A) → con grupo (B)", named}} {
 		a, bb := pick("A", s.keep), pick("B", s.keep)
-		fmt.Fprintf(&b, "| %s | %d | %+.2f | %+.2f | %+.2f | %+.2f | %+.0f | %+.1f | %+.1f |\n", s.label, a.N,
-			bb.S1-a.S1, bb.MRR-a.MRR, bb.NDCG-a.NDCG, bb.False-a.False, bb.ColdGet.P50-a.ColdGet.P50, bb.ColdKB.P50-a.ColdKB.P50, bb.ColdKB.Avg-a.ColdKB.Avg)
+		fmt.Fprintf(&b, "| %s | %d | %+.2f | %+.2f | %+.2f | %+.2f | %+.4f | %+.2f | %+.1f |\n", s.label, a.N,
+			bb.S1-a.S1, bb.MRR-a.MRR, bb.NDCG-a.NDCG, bb.False-a.False, bb.USD1M.Avg-a.USD1M.Avg, bb.ColdGet.Avg-a.ColdGet.Avg, bb.ColdKB.Avg-a.ColdKB.Avg)
 	}
 
 	return b.String() + "\n"

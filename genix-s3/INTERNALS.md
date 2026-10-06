@@ -40,13 +40,28 @@ genix-s3 is a search index kept in an S3 Express One Zone directory bucket. It
 answers a text query with a ranked list of document keys; the caller looks
 the rows up in its own database.
 
-**What it optimizes, in order:**
+**What it optimizes:** the S3 bill of a cold search, and then of the writes.
+Searches run in Lambdas, so every search is cold: nothing is cached between
+them, and warm figures are not a design target. File size and CPU are not
+goals: any CPU work that saves dollars is worth it.
 
-1. S3 requests: GETs per query, PUTs and POSTs per write;
-2. bytes read per query.
+**Cost model** (`internal/pricing`): S3 Express One Zone in us-east-1, from
+the AWS Price List API (offer AmazonS3, published 2026-09-28):
 
-File size and CPU are not goals: any CPU work that saves a request or bytes
-is worth it.
+| | Price | Per unit |
+|---|---|---|
+| GET (and every request but the writes) | $0.00003 per 1000 | 3 × 10⁻⁸ |
+| PUT, COPY, POST, LIST | $0.00113 per 1000 | 1.13 × 10⁻⁶ |
+| Bytes read | $0.0006 per GB (every byte) | 5.6 × 10⁻¹³ |
+| Bytes uploaded | $0.0032 per GB | 3.0 × 10⁻¹² |
+| Storage | $0.11 per GB-month | |
+| DELETE | free | |
+
+One GET costs as much as reading 52 KiB (`BytesPerGET`), and one PUT as
+uploading 370 KiB (`BytesPerPUT`). A search reads a few KB, so its bill is
+almost all GETs (about 97 % at 10k documents): saving a GET is worth tens of
+KB more read. Trading GETs for bytes is decided in dollars, never by GETs or
+KB alone.
 
 **What it never assumes:** anything about the corpus. Document IDs are
 arbitrary `uint32` values within each origin (never assumed dense), no table
@@ -65,7 +80,6 @@ collection from its source system.
 | Cold, 1 word whose list or head is in the `.idx` | 2 (`p.log`, `.idx`) | 1 |
 | Cold, 1 word whose list is in the `.db` | 3 | 2 |
 | Cold, N words | 1 + distinct `.idx` + `.db` ranges | 2 |
-| Warm (`.idx` cached) | 1 + `.db` ranges | 1 |
 | Collection under 100 documents | 1 (`p.log`) | 1 |
 
 ---
@@ -292,7 +306,7 @@ keys and signature. Documents still in `p.log` keep all their group words.
 | `p.log` | `GXL1` | 3 |
 | `.idx` | `GXI1` | 4 |
 | `.db` | `GXD1` | 4 |
-| `tokens` | `GXT1` | 3 |
+| `tokens` | `GXT1` | 4 |
 | `compact.lease` | `GXC1` | — |
 
 A document key on disk outside bit streams is 5 bytes: `ID u32 | origin u8`.
@@ -605,8 +619,20 @@ after round 1, having read both `.idx`.
 
 ### 10.6 Inline section
 
-The lists with `loc = 1`, packed in key order. Per slot, the smallest
-non-expanded lists go inline while they fit `InlineBudget` (2 KB).
+The lists with `loc = 1`, packed in key order. Per slot, with D the bytes of
+its lists that are neither expanded nor of one posting:
+
+- if D ≤ `InlineSlot` (52 KiB, the bytes that cost as much as a GET), all of
+  them go inline, and the searches of the slot end in round 1;
+- otherwise the smallest go inline while they fit `InlineBudget` (2 KB).
+
+Why: every search of the slot reads the inline lists, and a list held there
+saves the searches of its word a GET to the `.db`. If searches ask for a word
+in proportion to its documents, holding a list pays when D minus that list is
+under `BytesPerGET`: a small slot keeps everything, a big one keeps nearly
+nothing (its searches mostly ask for its big lists, which the smallest-first
+inline does not hold). Measured in §25: a fixed 52 KiB budget is the best at
+100k documents and costs 14 % more than 2 KB at 1M.
 
 ---
 
@@ -648,24 +674,37 @@ The state the index was built from. Only the compaction reads it.
 ```
 Header (48 bytes):
 0    magic "GXT1"
-4    Format     u16 = 3
+4    Format     u16 = 4
 8    NormID     u32
 12   Epoch      u32
 16   Seq        u64     the ops ≤ Seq are in the documents
 24   docs       u32
-28   chunks     u32
+28   BodyCRC    u32     CRC32C of the body, as stored (compressed)
 32   expanded   u32
 36   entries    u32     bucket and garbage entries
 40   Grouping   u8
 44   CRC32C     u32     of bytes 0..44 and the tables
 Tables:
-  chunks × (first key u64 | Off u32 | Len u32 | CRC32C u32)
   expanded × key u64                              the expanded words, sorted
   entries × (group u16 | flags u8 | grouping u8 | hash u64)
             flags: 1 = garbage (grouping = its grouping), 2 = the bucket has a .db
-Chunks of 1000 documents, sorted by key:
-  per document: key (ID u32 | origin u8) | tokLen u16 | tokens
+Body, to the end of the object: DEFLATE (RFC 1951, compress/flate) of
+  vocabulary  len uvarint | token stream (§6) of every distinct token (key and
+              tail), the most frequent first, ties by key
+  gaps        per document, in key order: key − the previous key (the first:
+              its key), uvarint
+  counts      per document: its tokens, uvarint
+  numbers     per document, per token in position order: its index in the
+              vocabulary, uvarint
 ```
+
+The compaction reads and writes the object whole, so it has no chunks or
+offsets. Through the vocabulary a token takes about 11 bits instead of the
+20–40 of its units, and grouping the gaps, the counts and the numbers lets
+DEFLATE code each kind on its own: 10k product names take 134 KB against
+379 KB as plain token streams, 100k with IDs up to 1M take 971 KB against
+3.8 MB (`internal/tokens/compress_study_test.go`). A document's stream is
+rebuilt with `AppendTokens`, so a reader gets the same bytes `p.log` holds.
 
 The bucket entries hold the content hash of every bucket written, so an
 incremental compaction knows which ones changed. The garbage entries are
@@ -692,7 +731,7 @@ content changed.
    in position order, so every list comes out sorted.
 3. Compute each list's shape (§7.1) and DF.
 4. **Expansion threshold**, per slot: with D the bytes of all lists of the
-   slot, `T = max(MinSplit, √(ExpandCost · D))`, both 2 KB. A word expands if
+   slot, `T = max(MinSplit, √(ExpandCost · D))`, both 32 KB. A word expands if
    its list exceeds T, or if it was expanded before and its list still
    exceeds T/2 (hysteresis; the previous set is in `tokens`).
 
@@ -702,7 +741,8 @@ content changed.
    largest list a query reads from the `.db` is about T.
 5. Per bucket group, in key order (space, then slot):
    - `loc`: field for one posting, expanded, otherwise db; then per slot the
-     smallest db lists move inline within `InlineBudget`;
+     db lists move inline: all of them within `InlineSlot`, else the smallest
+     within `InlineBudget` (§10.6);
    - write the Keys, Fields and Inline sections and the words zone;
    - per expanded word: heads (§10.5) and combinations: for every document of
      the word, every other token anchored under it (§10.5) becomes a pair;
@@ -935,7 +975,8 @@ either in that word's head or cannot rank above the head's last entry
 ### 16.6 Round 2
 
 The full lists in the `.db` and the combination blocks become byte ranges,
-sorted, and merged when less than `CoalesceGap` (4 KB) apart, up to
+sorted, and merged when less than `CoalesceGap` (52 KiB: a smaller hole costs
+less to read than the GET it saves) apart, up to
 `MaxRequest` (1 MB) per range: S3 has no multi-range GET. They are read in
 parallel. Each range must come back with the ETag the `.idx` recorded and the
 requested length; otherwise (or on a 404) the bucket was rewritten between
@@ -1175,10 +1216,11 @@ There are no locks, no generations and no manifest. The rules:
 
 | Parameter | Default | |
 |---|---|---|
-| `MinSplit` | 2048 | minimum T |
-| `ExpandCost` | 2048 | cost of an expansion in the `.idx` |
+| `MinSplit` | 32 KB | minimum T |
+| `ExpandCost` | 32 KB | cost of an expansion in the `.idx` |
 | `HeadSize` | 64 | entries of a head |
-| `InlineBudget` | 2048 | bytes of inline lists per slot |
+| `InlineSlot` | 53 687 (`BytesPerGET`, 52 KiB) | a slot whose db lists fit keeps them all inline |
+| `InlineBudget` | 2048 | bytes of inline lists of a bigger slot, smallest first |
 | `ComboDictBudget` | 2048 | combination directory size before grouping co-keys by prefix |
 | `GroupWordDocs` | 100 | members per group that keep their group words |
 
@@ -1201,7 +1243,7 @@ everything is. Changing them only affects what is written from then on.
 | Parameter | Default | |
 |---|---|---|
 | `PrefixBudget` | 32 KB | `.db` bytes a prefix, near, group-word or typo expansion may read |
-| `CoalesceGap` | 4 KB | largest hole merged into one range read |
+| `CoalesceGap` | 53 687 (`BytesPerGET`, 52 KiB) | largest hole merged into one range read |
 | `MaxRequest` | 1 MB | largest merged range |
 | `Concurrency` | 16 | requests in flight per round |
 | `CacheBytes` | 64 MB (8 MB per partition under `Client`) | decoded `.idx` cache |
@@ -1217,7 +1259,6 @@ everything is. Changing them only affects what is written from then on.
 | Query words | 16 |
 | Search attempts | 8, backoff base 25 ms |
 | Append attempts | 16 |
-| `tokens` chunk | 1000 documents |
 
 ---
 
@@ -1301,8 +1342,10 @@ formats.
 | Unit tests | `go test ./...` (`-race` recommended) |
 | Ranking equals brute force | `TestMatchesBruteForce` (`internal/query`) |
 | Requests and rounds per search | `TestRoundsAndRequests`, `TestStaleBucket` |
-| Cost at scale (requests, bytes, sizes) | `GXS_EVAL_CSV=../../../scripts/perf/data/productos.csv go test ./internal/query -run Eval -v`; vary with `GXS_EVAL_GROUPING`, `GXS_EVAL_ORIGINS`, `GXS_EVAL_TEXTGROUPS` |
-| Effectiveness against BM25 | `GXS_BENCH=1 go test ./internal/query -run 'TestBench$' -v`; writes `testdata/bench/report.md` and fails on regressions against `testdata/bench/baseline.json` |
+| Cost at scale (dollars, requests, bytes, sizes; 10k and 100k) | `GXS_EVAL_CSV=$PWD/../scripts/perf/data/productos.csv go test ./internal/query -run Eval -v` (about 2 min); vary with `GXS_EVAL_GROUPING`, `GXS_EVAL_ORIGINS`, `GXS_EVAL_TEXTGROUPS` |
+| Effectiveness against BM25 | `GXS_BENCH=1 go test ./internal/query -run 'TestBench$' -v` (about 2 s); writes `testdata/bench/report.md` and fails on regressions against `testdata/bench/baseline.json` |
+| Choosing the index shape | `GXS_SWEEP=1 GXS_EVAL_CSV=… go test ./internal/query -run CostSweep -v -timeout 60m`: dollars per search, build, compaction and storage for each grouping, `InlineSlot`, `InlineBudget`, `ExpandCost` and `CoalesceGap`; results in [COST_STUDY.md](COST_STUDY.md) |
+| Compression of the objects | `GXS_COMPRESS=1 GXS_EVAL_CSV=… go test ./internal/bucket ./internal/tokens -run CompressStudy -v` (bits of each part under other codecs and ID shapes) and `… ./internal/query -run CompressCost -v -timeout 60m` (their dollars per search and per compaction); `GXS_COMPRESS_IDS` takes `random`, `sparse5`, `sparse10`, `del10`, `shuffled`, `csv`, `sorted`; results in [COMPRESSION_STUDY.md](COMPRESSION_STUDY.md) |
 | Real S3 | `GENIX_S3_TEST_BUCKET=<bucket> go test ./s3blob` |
 | Normalizer golden | `go test ./internal/normalize [-update]` |
 | CPU benchmarks | `go test ./internal/query -bench .` |
@@ -1313,9 +1356,11 @@ partial, typing, typo, accents, brand, numbers, plural, name+group, group,
 negative) with graded relevance judgments from a rule over the full text, and
 two references, BM25 (SQLite FTS5) and trigram BM25. Base A indexes names,
 base B names plus category groups. Metrics: S@1, S@10, MRR, nDCG@10, P@10,
-false hits, plus cold and warm GETs and KB per query. The gate fails if global
-nDCG or MRR drop more than 0.01, a category's more than 0.03, or cold GET/KB
-p50 rise more than 5 %. The scripts that build the data and references are in
+false hits, plus the cold cost per query: dollars per million searches, GETs,
+KB and rounds. The gate fails if global nDCG or MRR drop more than 0.01, a
+category's more than 0.03, or the average dollars per search rise more than
+5 % (GETs and KB are not gated apart). Every search runs cold on its own
+engine, all of them in parallel. The scripts that build the data and references are in
 `scripts/bench/`; to accept a change, copy `results.json` over
 `baseline.json`.
 
@@ -1403,7 +1448,55 @@ keys, expansions, heads); common flags `-root`, `-collection`, `-partition`,
 
 Why the design is the way it is, with the numbers measured when it was built
 (`productos.csv`, 10k and 100k products, `GroupingNone` unless said; the
-eval and tests default to `GroupingNone` so numbers stay comparable).
+eval and tests default to `GroupingNone` so numbers stay comparable). The
+paragraphs after the cost sweep were measured before it, with `InlineBudget`
+2 KB, `ExpandCost` and `MinSplit` 2 KB and `CoalesceGap` 4 KB.
+
+**Cost sweep (2026-10-06, `TestCostSweep`).** Dollars per million cold
+searches on S3 Express (4 500 searches of 1, 2 and 3 words drawn from the
+names; 10k is the catalogue, 100k to 1M its copies under new IDs). Every shape
+returns the same rankings. The full study, with every table and how to rerun
+it, is [COST_STUDY.md](COST_STUDY.md).
+
+| Shape | 10k dense | 10k random | 100k dense | 100k random | 400k random | 1M random |
+|---|---|---|---|---|---|---|
+| Before: es100, inline 2 KB, expand 2 KB, gap 4 KB | 0.0998 | 0.1194 | 0.1546 | 0.1694 | | |
+| `.idx` as a pure index (no inline lists), none | 0.1530 ¹ | 0.1547 ¹ | 0.1620 ¹ | 0.1675 ¹ | 0.1800 | 0.1976 |
+| Small inline only (2 KB smallest first), none, expand 32 KB | 0.0999 | 0.1165 | 0.1470 | 0.1584 | 0.1792 | 0.1980 |
+| Fixed inline 52 KiB per slot, none, expand 32 KB | 0.0970 | 0.0995 | 0.1112 ² | 0.1317 | 0.1893 | 0.2252 |
+| **Now:** `InlineSlot` 52 KiB, `InlineBudget` 0, expand 32 KB, none | 0.0970 | 0.0995 | 0.1104 | **0.1285** | **0.1699** | **0.1932** |
+| Same, es100 | 0.0968 | 0.1004 | 0.1158 | 0.1417 | | |
+
+¹ expand 2 KB (32 KB at 400k and 1M); 5 GETs and 2 rounds per search.
+² 64 KiB: 0.1100.
+
+- *More GETs to read fewer bytes does not pay.* A GET costs as much as
+  52 KiB, and a search reads 4 to 70 KB: GETs are 80–97 % of the bill. Taking
+  every list out of the `.idx` (a pure index) reads less than half the bytes
+  and costs 30–58 % more at 10k–100k; it only gets close at 1M (+2 %), where
+  few slots fit anyway.
+- *Fixed budgets fail at one end.* 52 KiB of smallest-first inline is the best
+  at 100k and 14 % worse than 2 KB at 1M: once a slot outgrows the budget,
+  the inline holds its rarest words, which few searches ask for, and every
+  search pays their bytes. All or nothing per slot (`InlineSlot`) is the best
+  or within 1 % at every size.
+- *Expansions:* `ExpandCost` 32 KB is within 1 % of the best at every size
+  (2 KB is 4.5 % worse at 10k, 131 KB 8 % worse at 1M); against 2 KB it also
+  cuts the compaction cost by 28–47 % at 400k–1M (fewer combinations to
+  rewrite).
+- *`CoalesceGap`* 52 KiB against 4 KB: 1–2 % cheaper when lists are in the
+  `.db`, the same otherwise.
+- *Grouping:* es100 and none make the same GETs; es100 reads more bytes (each
+  `.idx` holds several slots, each with its inline), +10 % per search at 100k,
+  equal at 10k. Its build costs a third (102 PUTs instead of 361: $0.00016
+  against $0.00045 at 100k); compactions cost the same. none pays off once a
+  partition serves about 22k searches per full build at 100k; at 10k es100 is
+  as cheap per search and cheaper to build. es100 stays the default.
+- *Where the `.idx` is bigger than the `.db`:* at 10k every slot fits in
+  `InlineSlot`, so there is no `.db` at all (the `.idx` total is 181 KB with
+  dense IDs, 380 KB random); at 1M the `.db` holds most of the bytes. The
+  size of the files is not the cost: a search reads one `.idx` per word,
+  whole (0.5–50 KB), and nothing else when its slots fit.
 
 **IDs.** A translation table from client IDs to dense numbers was rejected
 (an object to read and keep). Random `uint32` IDs cost 29.8 bits per posting
@@ -1412,6 +1505,28 @@ close to the minimum `log2(2^32/df)`; dense IDs shrink by themselves through
 the per-list width. With random IDs the query words land in different
 buckets, so requests do not drop and `CoalesceGap` changes less than 0.1
 request.
+
+**Compression (2026-10-06, [COMPRESSION_STUDY.md](COMPRESSION_STUDY.md)).**
+The realistic IDs are an autoincrement with deletions (1 in 5 alive; 1 in 10
+as the pessimistic case), not random `uint32`. With them a 100k search costs
+9–12 % less than with random IDs, through the per-list gap width alone. What
+else was measured, per cold search:
+- *The 5-bit letters* are 6 % of the `.idx` at 10k and under 1 % at 100k: a
+  better code would save 0.1 % of the bill.
+- *Better list codecs* (Rice gaps, a position width per list, gamma counts)
+  save 1.8–2.5 % at 100k and nearly nothing at 10k; the gaps are within
+  6–8 % of `log2 C(range, df)`. Not done.
+- *zstd, brotli or xz* on the `.idx`: 0–9 %, since the sections are bit
+  streams. Rejected.
+- *Numbering documents in the engine* with an ID table read after scoring:
+  +33 to +79 %. At 100k all the bytes of a search cost less than one GET.
+- *A local ID table per `.idx`* (lists as positions in it): 0 to −5 % of the
+  ID bits with realistic IDs, since a document appears in 1.14 lists of an
+  object and the table holds its full ID once.
+- *`tokens`* (§12): a vocabulary, the parts in columns and DEFLATE take
+  65–74 % off it, and 55 % off a compaction at 100k ($1.84 × 10⁻⁵ →
+  $0.82 × 10⁻⁵); searches do not change. The puts before a compaction (one
+  append each, $1.13 × 10⁻⁶) still cost more than the compaction.
 
 **Gap codecs (§7.1).** With random IDs the fixed width wins in 4 014 of 4 118
 lists; with name-ordered IDs 42 % of gaps are 1 and nibbles win. Choosing per
@@ -1459,8 +1574,8 @@ letter. Slots drop from 379 to 356.
 
 **Sizes (§10, §11).** The largest `.idx` is always `ca`: 4.0, 4.5, 5.4 and
 5.8 KB for 10k/100k with dense/random IDs. From 10k to 100k it grows 1.3×,
-the effect of the square root in T. `tokens` is 338 KB at 10k and 3.27 MB at
-100k. Buckets with a `.db`, of 379: 3 and 42 at 10k, 126 and 172 at 100k.
+the effect of the square root in T. `tokens` was 338 KB at 10k and 3.27 MB at
+100k as plain token streams (Format 3); see §12 for Format 4. Buckets with a `.db`, of 379: 3 and 42 at 10k, 126 and 172 at 100k.
 
 **Grouping (§8).** `es100` against `none` at 100k: objects 551 → 185, build
 PUTs 557 → 191, cold bytes ×1.7 (an `.idx` brings its neighbours; the largest
@@ -1504,7 +1619,7 @@ S@1 0.56 → 0.80, base B nDCG 0.912 → 0.929, no extra cost.
 compaction at 100k with 72 ops touches 62 of 379 buckets: 128 writes and
 11.3 MB (the previous design: 5 writes and 6.0 MB, rewriting everything).
 About 7.9 of the 9.9 MB of `.db` are rewritten, the largest `.db` is 757 KB,
-and `tokens` (3.3 MB) is rewritten every time. Buckets are rewritten when
+and `tokens` (3.3 MB then, about 1 MB in Format 4) is rewritten every time. Buckets are rewritten when
 their content hash differs rather than by computing which were touched; this
 also covers the pairs that move when an expansion changes. Recovering an
 expired lease does a full rewrite in a new epoch, because the alternative

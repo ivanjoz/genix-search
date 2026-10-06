@@ -11,8 +11,9 @@ type Counting struct {
 	Blob
 	Requests     atomic.Int64 // reads: GetRange and Get
 	BytesRead    atomic.Int64
-	Writes       atomic.Int64 // Put, Append and Delete
+	Writes       atomic.Int64 // Put and Append
 	BytesWritten atomic.Int64
+	Deletes      atomic.Int64 // free on S3, so apart from the writes
 }
 
 func (c *Counting) GetRange(ctx context.Context, key string, off, n int64) ([]byte, string, error) {
@@ -46,7 +47,7 @@ func (c *Counting) Append(ctx context.Context, key string, data []byte, offset i
 }
 
 func (c *Counting) Delete(ctx context.Context, keys ...string) error {
-	c.Writes.Add(1)
+	c.Deletes.Add(1)
 
 	return c.Blob.Delete(ctx, keys...)
 }
@@ -57,4 +58,5 @@ func (c *Counting) Reset() {
 	c.BytesRead.Store(0)
 	c.Writes.Store(0)
 	c.BytesWritten.Store(0)
+	c.Deletes.Store(0)
 }

@@ -2,15 +2,22 @@
 // the document → tokens state the index was built from, the expanded words and the
 // hash of every bucket. Only the compaction reads it, to know what a changed
 // document had and which buckets it has to rewrite; queries never do.
+//
+// The documents are stored through a vocabulary: every distinct token once,
+// the most frequent first, and each document as the numbers of its tokens,
+// all compressed with DEFLATE. The compaction reads and writes the object
+// whole, so nothing in it needs random access.
 package tokens
 
 import (
+	"bytes"
 	"cmp"
+	"compress/flate"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/crc32"
-	"math"
+	"io"
 	"slices"
 
 	"github.com/ivanjoz/genix-search/genix-s3/internal/docid"
@@ -18,16 +25,12 @@ import (
 )
 
 // Format is the layout version.
-const Format uint16 = 3
+const Format uint16 = 4
 
 const (
 	magic      = "GXT1"
 	headerSize = 48
-	dirEntry   = 20             // first key u64 | Off u32 | Len u32 | CRC32C u32
-	slotEntry  = 12             // group u16 | flags u8 | grouping u8 (garbage) | hash u64
-	docHead    = docid.Size + 2 // key (ID u32 | origin u8) | tokLen u16
-	// ChunkDocs is how many documents go in a chunk.
-	ChunkDocs = 1000
+	slotEntry  = 12 // group u16 | flags u8 | grouping u8 (garbage) | hash u64
 )
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
@@ -73,7 +76,7 @@ const (
 	flagDB      = 2
 )
 
-// Encode writes s.
+// Encode writes s. Every document's tokens must be a valid key5 token stream.
 func Encode(s *State) ([]byte, error) {
 	docs := s.Docs
 	if !slices.IsSortedFunc(docs, func(a, b Doc) int { return cmp.Compare(a.ID, b.ID) }) {
@@ -93,12 +96,11 @@ func Encode(s *State) ([]byte, error) {
 	})
 	garbage = slices.Compact(garbage)
 
-	chunks := (len(docs) + ChunkDocs - 1) / ChunkDocs
 	entries := len(slots) + len(garbage)
-	tables := chunks*dirEntry + len(s.Expanded)*8 + entries*slotEntry
+	tables := len(s.Expanded)*8 + entries*slotEntry
 	out := make([]byte, headerSize+tables)
 
-	at := headerSize + chunks*dirEntry
+	at := headerSize
 	for _, k := range s.Expanded {
 		binary.LittleEndian.PutUint64(out[at:], uint64(k))
 		at += 8
@@ -124,34 +126,12 @@ func Encode(s *State) ([]byte, error) {
 		at += slotEntry
 	}
 
-	for c := range chunks {
-		part := docs[c*ChunkDocs : min((c+1)*ChunkDocs, len(docs))]
-		off := len(out)
-
-		for i, doc := range part {
-			if i > 0 && doc.ID == part[i-1].ID || c > 0 && i == 0 && doc.ID == docs[c*ChunkDocs-1].ID {
-				return nil, fmt.Errorf("tokens: document %v twice", doc.ID)
-			}
-
-			if len(doc.Tokens) > math.MaxUint16 {
-				return nil, fmt.Errorf("tokens: document %v has %d bytes of tokens", doc.ID, len(doc.Tokens))
-			}
-
-			out = docid.Append(out, doc.ID)
-			out = binary.LittleEndian.AppendUint16(out, uint16(len(doc.Tokens)))
-			out = append(out, doc.Tokens...)
-		}
-
-		if len(out) > math.MaxUint32 {
-			return nil, errors.New("tokens: over 4 GiB: partition the collection")
-		}
-
-		e := out[headerSize+c*dirEntry:]
-		binary.LittleEndian.PutUint64(e, uint64(part[0].ID))
-		binary.LittleEndian.PutUint32(e[8:], uint32(off))
-		binary.LittleEndian.PutUint32(e[12:], uint32(len(out)-off))
-		binary.LittleEndian.PutUint32(e[16:], crc32.Checksum(out[off:], castagnoli))
+	body, err := encodeDocs(docs)
+	if err != nil {
+		return nil, err
 	}
+
+	out = append(out, body...)
 
 	copy(out, magic)
 	binary.LittleEndian.PutUint16(out[4:], Format)
@@ -159,7 +139,7 @@ func Encode(s *State) ([]byte, error) {
 	binary.LittleEndian.PutUint32(out[12:], s.Epoch)
 	binary.LittleEndian.PutUint64(out[16:], s.Seq)
 	binary.LittleEndian.PutUint32(out[24:], uint32(len(docs)))
-	binary.LittleEndian.PutUint32(out[28:], uint32(chunks))
+	binary.LittleEndian.PutUint32(out[28:], crc32.Checksum(body, castagnoli))
 	binary.LittleEndian.PutUint32(out[32:], uint32(len(s.Expanded)))
 	binary.LittleEndian.PutUint32(out[36:], uint32(entries))
 	out[40] = s.Grouping
@@ -170,8 +150,86 @@ func Encode(s *State) ([]byte, error) {
 	return out, nil
 }
 
-// Decode reads a whole object. The token streams alias data. A tokens object
-// of another normalizer is an error: the caller rebuilds from the source.
+// encodeDocs writes the body: DEFLATE of the vocabulary (its length and a
+// token stream of every distinct token, the most frequent first), then the
+// key gaps, then the token counts, then the token numbers of every document,
+// all uvarints.
+func encodeDocs(docs []Doc) ([]byte, error) {
+	toks := make([][]key5.Token, len(docs))
+	freq := map[key5.Token]int{}
+
+	for i, doc := range docs {
+		if i > 0 && doc.ID == docs[i-1].ID {
+			return nil, fmt.Errorf("tokens: document %v twice", doc.ID)
+		}
+
+		t, err := key5.ReadTokens(doc.Tokens)
+		if err != nil {
+			return nil, fmt.Errorf("tokens: document %v: %w", doc.ID, err)
+		}
+
+		toks[i] = t
+		for _, tk := range t {
+			freq[tk]++
+		}
+	}
+
+	vocab := make([]key5.Token, 0, len(freq))
+	for tk := range freq {
+		vocab = append(vocab, tk)
+	}
+
+	// The most frequent first, so most numbers take one byte; ties by key,
+	// so the object depends only on its documents.
+	slices.SortFunc(vocab, func(a, b key5.Token) int {
+		return cmp.Or(cmp.Compare(freq[b], freq[a]), cmp.Compare(a.Key, b.Key), cmp.Compare(a.Tail, b.Tail))
+	})
+
+	number := make(map[key5.Token]uint64, len(vocab))
+	for i, tk := range vocab {
+		number[tk] = uint64(i)
+	}
+
+	stream := key5.AppendTokens(nil, vocab)
+	raw := binary.AppendUvarint(nil, uint64(len(stream)))
+	raw = append(raw, stream...)
+
+	prev := docid.Key(0)
+	for _, doc := range docs {
+		raw = binary.AppendUvarint(raw, uint64(doc.ID-prev))
+		prev = doc.ID
+	}
+
+	for _, t := range toks {
+		raw = binary.AppendUvarint(raw, uint64(len(t)))
+	}
+
+	for _, t := range toks {
+		for _, tk := range t {
+			raw = binary.AppendUvarint(raw, number[tk])
+		}
+	}
+
+	var buf bytes.Buffer
+
+	w, err := flate.NewWriter(&buf, flate.BestCompression)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := w.Write(raw); err != nil {
+		return nil, err
+	}
+
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+// Decode reads a whole object. A tokens object of another normalizer is an
+// error: the caller rebuilds from the source.
 func Decode(data []byte, normID uint32) (*State, error) {
 	if len(data) < headerSize || string(data[:4]) != magic {
 		return nil, errors.New("tokens: not a tokens object")
@@ -190,12 +248,11 @@ func Decode(data []byte, normID uint32) (*State, error) {
 	}
 
 	count := int(binary.LittleEndian.Uint32(data[24:]))
-	chunks := int(binary.LittleEndian.Uint32(data[28:]))
 	expanded := int(binary.LittleEndian.Uint32(data[32:]))
 	slots := int(binary.LittleEndian.Uint32(data[36:]))
 
-	tables := chunks*dirEntry + expanded*8 + slots*slotEntry
-	if chunks < 0 || expanded < 0 || slots < 0 || tables > len(data)-headerSize {
+	tables := expanded*8 + slots*slotEntry
+	if expanded < 0 || slots < 0 || tables < 0 || tables > len(data)-headerSize {
 		return nil, errors.New("tokens: corrupt tables")
 	}
 
@@ -208,7 +265,7 @@ func Decode(data []byte, normID uint32) (*State, error) {
 		return nil, errors.New("tokens: written with another normalizer or other extra letters")
 	}
 
-	at := headerSize + chunks*dirEntry
+	at := headerSize
 	s.Expanded = make([]key5.Key, expanded)
 
 	for i := range s.Expanded {
@@ -228,42 +285,116 @@ func Decode(data []byte, normID uint32) (*State, error) {
 		at += slotEntry
 	}
 
-	s.Docs = make([]Doc, 0, count)
-
-	for c := range chunks {
-		e := data[headerSize+c*dirEntry:]
-		off, n := int(binary.LittleEndian.Uint32(e[8:])), int(binary.LittleEndian.Uint32(e[12:]))
-
-		if off < headerSize+tables || n > len(data) || off+n > len(data) {
-			return nil, fmt.Errorf("tokens: chunk %d out of range", c)
-		}
-
-		chunk := data[off : off+n]
-		if crc32.Checksum(chunk, castagnoli) != binary.LittleEndian.Uint32(e[16:]) {
-			return nil, fmt.Errorf("tokens: chunk %d CRC", c)
-		}
-
-		for at := 0; at < len(chunk); {
-			if len(chunk)-at < docHead {
-				return nil, fmt.Errorf("tokens: chunk %d is cut", c)
-			}
-
-			id := docid.Read(chunk[at:])
-			tokLen := int(binary.LittleEndian.Uint16(chunk[at+docid.Size:]))
-			at += docHead
-
-			if len(chunk)-at < tokLen {
-				return nil, fmt.Errorf("tokens: chunk %d is cut", c)
-			}
-
-			s.Docs = append(s.Docs, Doc{ID: id, Tokens: chunk[at : at+tokLen : at+tokLen]})
-			at += tokLen
-		}
+	body := data[at:]
+	if crc32.Checksum(body, castagnoli) != binary.LittleEndian.Uint32(data[28:]) {
+		return nil, errors.New("tokens: body CRC")
 	}
 
-	if len(s.Docs) != count {
-		return nil, fmt.Errorf("tokens: %d documents, the header says %d", len(s.Docs), count)
+	docs, err := decodeDocs(body, count)
+	if err != nil {
+		return nil, err
 	}
+
+	s.Docs = docs
 
 	return s, nil
+}
+
+var errCorrupt = errors.New("tokens: corrupt documents")
+
+// decodeDocs reads what encodeDocs wrote: count documents, each with its
+// token stream rebuilt.
+func decodeDocs(body []byte, count int) ([]Doc, error) {
+	raw, err := io.ReadAll(flate.NewReader(bytes.NewReader(body)))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errCorrupt, err)
+	}
+
+	r := &uvarints{data: raw}
+
+	streamLen := r.next()
+	if r.err != nil || streamLen > uint64(len(r.data)-r.at) {
+		return nil, errCorrupt
+	}
+
+	vocab, err := key5.ReadTokens(r.data[r.at : r.at+int(streamLen)])
+	if err != nil {
+		return nil, fmt.Errorf("%w: vocabulary: %v", errCorrupt, err)
+	}
+
+	r.at += int(streamLen)
+
+	// Every document takes at least a byte of gap and one of count.
+	if count < 0 || count > (len(r.data)-r.at)/2 {
+		return nil, errCorrupt
+	}
+
+	docs := make([]Doc, count)
+	key := uint64(0)
+
+	for i := range docs {
+		gap := r.next()
+		if i > 0 && gap == 0 || gap > uint64(docid.Max)-key {
+			return nil, fmt.Errorf("%w: key gap", errCorrupt)
+		}
+
+		key += gap
+		docs[i].ID = docid.Key(key)
+	}
+
+	counts := make([]uint64, count)
+	for i := range counts {
+		counts[i] = r.next()
+	}
+
+	var toks []key5.Token
+
+	for i := range docs {
+		if counts[i] > uint64(len(r.data)-r.at) {
+			return nil, fmt.Errorf("%w: token count", errCorrupt)
+		}
+
+		toks = toks[:0]
+
+		for range counts[i] {
+			n := r.next()
+			if n >= uint64(len(vocab)) {
+				return nil, fmt.Errorf("%w: token number", errCorrupt)
+			}
+
+			toks = append(toks, vocab[n])
+		}
+
+		docs[i].Tokens = key5.AppendTokens(nil, toks)
+	}
+
+	if r.err != nil || r.at != len(r.data) {
+		return nil, errCorrupt
+	}
+
+	return docs, nil
+}
+
+// uvarints reads uvarints one after the other; the first error sticks.
+type uvarints struct {
+	data []byte
+	at   int
+	err  error
+}
+
+func (r *uvarints) next() uint64 {
+	if r.err != nil {
+		return 0
+	}
+
+	v, n := binary.Uvarint(r.data[r.at:])
+	if n <= 0 {
+		r.err = errCorrupt
+
+		return 0
+	}
+
+	r.at += n
+
+	return v
 }
