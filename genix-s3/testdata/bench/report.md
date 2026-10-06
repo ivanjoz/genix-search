@@ -1,4 +1,4 @@
-# Benchmark de genix-s3 (PLAN_BENCH.md)
+# Benchmark de genix-s3
 
 IDs: row numbers. Corpus: 10010 productos, 225 consultas. Se genera con `GXS_BENCH=1 go test ./internal/query -run Bench -v`.
 
@@ -6,7 +6,7 @@ Efectividad contra los juicios de relevancia (qrels): S@1, S@10 y MRR sobre las 
 
 ## Base A: nombres
 
-Índice (es100): .idx 160 KB · .db 4 KB · tokens 379.4 KB · p.log 0 KB · 103 objetos · build 49 ms, 107 PUTs, 921 KB escritos.
+Índice (es100): .idx 160 KB · .db 4 KB · tokens 379.4 KB · p.log 0 KB · 103 objetos · build 43 ms, 107 PUTs, 921 KB escritos.
 
 ### Efectividad
 
@@ -54,7 +54,7 @@ En frío, promedio por consulta: GET .idx 2.68 · .db 0.08 · p.log 1.00 · otro
 
 ## Base B: nombres + grupos (categoría)
 
-Índice (es100): .idx 183 KB · .db 9 KB · tokens 515.9 KB · p.log 0 KB · 105 objetos · build 55 ms, 109 PUTs, 1223 KB escritos.
+Índice (es100): .idx 183 KB · .db 9 KB · tokens 515.9 KB · p.log 0 KB · 105 objetos · build 53 ms, 109 PUTs, 1223 KB escritos.
 
 ### Efectividad
 

@@ -1,9 +1,9 @@
-// Package key5 turns tokens into keys of 5-bit units (PLAN_5BIT.md §2–4):
+// Package key5 turns tokens into keys of 5-bit units:
 // a word is its first 8 letters, a number is NUM_n plus n units holding its
 // value in binary. The first two units are the key's slot.
 //
 // A word of one letter has no key of its own: it is a continuation of the
-// two words before it in the document (PLAN_BUCKETS.md §16). "Polo rojo M"
+// two words before it in the document. "Polo rojo M"
 // holds rojo›m and polo›m, each in the slot of its host word.
 package key5
 
@@ -42,7 +42,7 @@ const Slots = 1024
 // order of the index.
 type Key uint64
 
-// Space is the kind of a key (PLAN_BUCKETS.md §17.2). The space is outside
+// Space is the kind of a key. The space is outside
 // the 8 units: in the token stream it is a header unit, in a .idx the slot
 // directory, in a key stream a count; a Key carries it in bits 40–41.
 type Space uint8
@@ -66,7 +66,7 @@ func (k Key) Space() Space { return Space(k >> spaceShift) }
 // In is the key with the same units in space s.
 func (k Key) In(s Space) Key { return k&(1<<spaceShift-1) | Key(s)<<spaceShift }
 
-// Token is a key and the tail of the word it came from (§3.4).
+// Token is a key and the tail of the word it came from.
 type Token struct {
 	Key  Key
 	Tail uint8
@@ -149,8 +149,8 @@ func (k Key) Len() int {
 // MaxHost is the units of the host word a continuation keeps.
 const MaxHost = MaxUnits - 2
 
-// Continuation is the key of the one-letter word letter after the word host
-// (§16): host's first MaxHost units, End and the letter. It sorts right after
+// Continuation is the key of the one-letter word letter after the word host:
+// host's first MaxHost units, End and the letter. It sorts right after
 // host and lives in host's slot.
 func Continuation(host Key, letter uint8) Key {
 	n := min(host.Len(), MaxHost)
@@ -369,7 +369,7 @@ func NumberPrefixRanges(digits string) [][2]uint32 {
 // Segments is the most words a signature holds: 2 units each.
 const Segments = MaxUnits / 2
 
-// Signature is the key of a group's words (PLAN_BUCKETS.md §17.1): a segment
+// Signature is the key of a group's words: a segment
 // of 2 units per word, up to Segments words. The first word gives its 1st and
 // 2nd letters, so the signature lives in that word's slot; the others their
 // 1st and 3rd. A word of 2 letters gives both, one of 1 letter a 0 unit and
@@ -413,8 +413,8 @@ func segment(w string, first bool) (uint8, uint8) {
 	return Unit(w[0]), Unit(w[2])
 }
 
-// GroupTokens are the tokens of a document's group, after those of its text
-// (PLAN_BUCKETS.md §17.1): every word of 2 letters or more and every number
+// GroupTokens are the tokens of a document's group, after those of its text:
+// every word of 2 letters or more and every number
 // as a group word, in order, then the signature. Group words have no tail.
 func GroupTokens(words []string) []Token {
 	var out []Token

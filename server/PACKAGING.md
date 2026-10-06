@@ -98,7 +98,7 @@ gh auth switch --user <owner>
 
 ## Building the artefacts locally
 
-[`scripts/release_binaries.sh`](./scripts/release_binaries.sh) produces the
+[`scripts/release_binaries.sh`](../scripts/release_binaries.sh) produces the
 artefacts on any machine with `cargo` and Docker or Podman:
 
 ```sh
@@ -114,7 +114,7 @@ statically linked, then writes the tarballs and `SHA256SUMS` under `dist/`.
 
 Building one target at a time accumulates into the same `SHA256SUMS`, so a
 release can be assembled across several sessions. What a release consists of
-lives in one place, [`scripts/util/release_targets.sh`](./scripts/util/release_targets.sh),
+lives in one place, [`scripts/util/release_targets.sh`](../scripts/util/release_targets.sh),
 so the builder and the publisher cannot disagree about it.
 
 Three build details matter and are easy to get wrong by hand:
@@ -138,11 +138,11 @@ Three build details matter and are easy to get wrong by hand:
 For a plain local build, `cargo build --release --bin genixsearch` (run in `server/`) still
 produces a dynamically linked `server/target/release/genixsearch` against the host's
 glibc, which is fine for development. Container packaging is covered by the
-[`server/Dockerfile`](./server/Dockerfile); build it with `docker build server`.
+[`server/Dockerfile`](./Dockerfile); build it with `docker build server`.
 
 ## systemd
 
-[`scripts/install_service.py`](./scripts/install_service.py) installs
+[`scripts/install_service.py`](../scripts/install_service.py) installs
 GenixSearch as a hardened systemd service. It creates the `genixsearch` system
 user, installs the binary to `/usr/local/bin`, the config to
 `/etc/genixsearch/`, points `store.kv.path` at `/var/lib/genixsearch/`, and

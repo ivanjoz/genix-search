@@ -18,7 +18,7 @@ var ErrConflict = errors.New("collection: another compaction is in progress")
 // epoch u32. Only its holder writes buckets. A compaction that ends,
 // successfully or not, before writing any bucket deletes it; one that dies or
 // fails after leaves it, and whoever takes it over once it expires rewrites
-// every bucket in an epoch above the one it names (PLAN_BUCKETS.md §8).
+// every bucket in an epoch above the one it names.
 const (
 	leaseMagic = "GXC1"
 	leaseSize  = 24

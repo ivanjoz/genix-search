@@ -1,6 +1,6 @@
-// Package layout names every object of a collection in the bucket
-// (PLAN_BUCKETS.md §1), and groups the 1024 slots into the objects that hold
-// them (§14).
+// Package layout names every object of a collection in the bucket,
+// and groups the 1024 slots into the objects that hold
+// them.
 package layout
 
 import (

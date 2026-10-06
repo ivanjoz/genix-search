@@ -1,8 +1,8 @@
 // Package blob is the object store under the engine: S3 Express One Zone in
 // production, a directory on disk for tests and the CLI.
 //
-// The interface is exactly the subset of S3 the design relies on
-// (PLAN_5BIT.md §8): range reads, conditional puts, and the native append of
+// The interface is exactly the subset of S3 the design relies on:
+// range reads, conditional puts, and the native append of
 // directory buckets, whose write offset is what serialises concurrent writers.
 package blob
 
@@ -31,7 +31,7 @@ type PutCond struct {
 type Blob interface {
 	// GetRange reads n bytes at off; n < 0 reads to the end. The ETag is the
 	// whole object's, so a reader can tell the range came from the version it
-	// expected (PLAN_BUCKETS.md §7).
+	// expected.
 	GetRange(ctx context.Context, key string, off, n int64) (data []byte, etag string, err error)
 	Get(ctx context.Context, key string) (data []byte, etag string, err error)
 	Put(ctx context.Context, key string, data []byte, cond PutCond) (etag string, err error)

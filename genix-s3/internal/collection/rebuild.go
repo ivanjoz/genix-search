@@ -21,7 +21,7 @@ const rebuildAttempts = 4
 
 // Rebuild replaces the collection with the documents of source: the way to
 // reprocess it from the system of record, also after a change of normalizer
-// or of the extra letters, which keys cannot survive (PLAN_BUCKETS.md §9).
+// or of the extra letters, which keys cannot survive.
 //
 //  1. Take the lease, so no compaction commits meanwhile.
 //  2. Read p.log and note its last seq, S0, before reading the source.

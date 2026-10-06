@@ -1,5 +1,5 @@
-// Package postings is the bit-level codec of every list of the index
-// (PLAN_BUCKETS.md §2): the posting lists of a word, whose size the
+// Package postings is the bit-level codec of every list of the index:
+// the posting lists of a word, whose size the
 // dictionary computes from a few fields, and the self-delimiting lists of a
 // combination of two words and of a head, which are decoded front to back.
 package postings

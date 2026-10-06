@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PLAN_BENCH.md 2: the xlsx of products -> genix-s3/testdata/bench/productos.tsv.
+"""The xlsx of products -> genix-s3/testdata/bench/productos.tsv.
 
     python3 scripts/bench/prepare.py ~/Downloads/download6/productos.xlsx
 

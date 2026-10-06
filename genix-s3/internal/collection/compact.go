@@ -32,7 +32,7 @@ type CompactResult struct {
 	Requests, Writes, Bytes int64
 }
 
-// Compact folds the pending ops of p.log into the index (PLAN_BUCKETS.md §8):
+// Compact folds the pending ops of p.log into the index:
 //
 //  1. Take the lease.
 //  2. Read p.log and tokens; apply the ops to the document → tokens state.

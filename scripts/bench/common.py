@@ -1,4 +1,4 @@
-"""Shared by the scripts of PLAN_BENCH.md: the corpus, our normalization (a port
+"""Shared by the benchmark scripts: the corpus, our normalization (a port
 of genix-s3/internal/normalize, so that the judge and the engine read text the
 same way), the inverted index the generators and the judge use, and the paths.
 """

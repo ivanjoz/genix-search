@@ -1,6 +1,6 @@
 // Package collection is the write side of a collection: appends to p.log and
 // the compaction that folds p.log into the buckets of the index, rewriting
-// only those that changed (PLAN_BUCKETS.md §8–9).
+// only those that changed.
 package collection
 
 import (
@@ -34,8 +34,8 @@ type Options struct {
 	// it blocks the next one.
 	LeaseTimeout time.Duration
 	// CompactSpacing is the least time between two compactions: what lets a
-	// query trust a bucket the last compaction did not rewrite
-	// (PLAN_BUCKETS.md §7). It must exceed the query's RoundLimit.
+	// query trust a bucket the last compaction did not rewrite.
+	// It must exceed the query's RoundLimit.
 	CompactSpacing time.Duration
 	// StaleCompact is how old a pending compaction request gets before the
 	// next write asks again (plog.AppendOptions.StaleCompact).
@@ -130,8 +130,7 @@ type Doc struct {
 	Text     string
 	// Group is the text of the document's group, if it has one: a parent
 	// many documents share ("Juan Carlos" lives in "centro civico"). It only
-	// adds to the score of a search that names it, below the text
-	// (PLAN_BUCKETS.md §17).
+	// adds to the score of a search that names it, below the text.
 	Group string
 }
 
@@ -148,7 +147,7 @@ func (d Doc) Key() docid.Key { return docid.New(d.OriginID, d.ID) }
 func (r Ref) Key() docid.Key { return docid.New(r.OriginID, r.ID) }
 
 // Tokens is the key5 token stream of a document: the tokens of its text,
-// then those of its group (PLAN_BUCKETS.md §17.1).
+// then those of its group.
 func (c *Collection) Tokens(doc Doc) []byte {
 	tokens := key5.FromTokens(c.norm.Tokens(doc.Text))
 	if doc.Group != "" {

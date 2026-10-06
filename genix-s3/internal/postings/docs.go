@@ -10,8 +10,7 @@ import (
 
 // Columns are the lists of a combination: one per word, all over the same
 // documents, each sorted by (key, Pos). It is written front to back and
-// decoded the same way, so it carries what it needs to delimit itself
-// (PLAN_BUCKETS.md §2.2):
+// decoded the same way, so it carries what it needs to delimit itself:
 //
 //	docs        nibbles        documents
 //	first       nibbles        first key − base

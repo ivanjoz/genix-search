@@ -103,7 +103,7 @@ func (c candidate) cost() int64 {
 
 // planQuery selects the words of every term — its exact key, its prefix
 // ranges within the budget, typos when enabled and the term has neither —
-// and the combinations to read (PLAN_BUCKETS.md §6.1).
+// and the combinations to read.
 func planQuery(terms []Term, source indexSource, budget int64, fuzzy bool) *readPlan {
 	p := &readPlan{byKey: map[key5.Key]*pick{}, fuzzy: make([]bool, len(terms)), df: make([]int, len(terms))}
 
@@ -209,7 +209,7 @@ func planQuery(terms []Term, source indexSource, budget int64, fuzzy bool) *read
 	// A head stands for an expanded word only for one term, matched exactly
 	// or as a prefix: its order is the score of that term alone.
 	// So does it for a near word of under 8 letters: its postings all match
-	// alike, as an exact word's do (§19).
+	// alike, as an exact word's do.
 	for _, pk := range p.picks {
 		u := pk.uses[0]
 		pk.full = !pk.expanded() || len(pk.uses) > 1 || u.kind == fuzzyKey || (u.kind.near() && pk.w.Key.Len() >= key5.MaxUnits)
@@ -221,8 +221,8 @@ func planQuery(terms []Term, source indexSource, budget int64, fuzzy bool) *read
 }
 
 // addSignature adds the signatures of a virtual term: its own, and with 2
-// segments or more the longer ones that start with it, within the budget
-// (PLAN_BUCKETS.md §17.3). They are in the slot of the run's first word.
+// segments or more the longer ones that start with it, within the budget.
+// They are in the slot of the run's first word.
 func (p *readPlan) addSignature(t *Term, term int, source indexSource, budget int64) {
 	x := source(t.Sig.Key.Slot())
 	if x == nil {
@@ -249,7 +249,7 @@ func (p *readPlan) addSignature(t *Term, term int, source indexSource, budget in
 	}
 }
 
-// addNear adds the near words of a term (PLAN_BUCKETS.md §19), those its
+// addNear adds the near words of a term, those its
 // exact key and its prefix ranges do not already match, within the budget,
 // closest first. They are in the term's own bucket, read anyway: they cost
 // no request. It reports whether there was any.

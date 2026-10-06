@@ -8,8 +8,8 @@ import (
 // slots is the number of slots, key5.Slots: every pair of leading units.
 const slots = 1024
 
-// Grouping maps every slot to its group: the .idx/.db pair that holds it
-// (PLAN_BUCKETS.md §14). A group is a run of consecutive slots. It is fixed
+// Grouping maps every slot to its group: the .idx/.db pair that holds it.
+// A group is a run of consecutive slots. It is fixed
 // in the code and never learned from a collection: a query names the objects
 // it reads from the query alone.
 type Grouping struct {

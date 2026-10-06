@@ -1,7 +1,7 @@
 # GenixSearch Inner Workings
 
 This document walks through what happens inside GenixSearch when a client
-issues a command. It assumes you have read [`README.md`](README.md) for the
+issues a command. It assumes you have read [`README.md`](../README.md) for the
 big picture.
 
 ## 1. The shape of the index

@@ -1,4 +1,4 @@
-// Package s3blob is the object store on Amazon S3 (PLAN_5BIT.md §8).
+// Package s3blob is the object store on Amazon S3.
 //
 // On a directory bucket of S3 Express One Zone (its name ends in "--x-s3")
 // Append is the bucket's native append: a PutObject with WriteOffsetBytes,

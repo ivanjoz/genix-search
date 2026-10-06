@@ -10,7 +10,7 @@ import (
 	"github.com/ivanjoz/genix-search/genix-s3/internal/key5"
 )
 
-// Ranking tunables (PLAN_BUCKETS.md §17.5). Results are ordered by score
+// Ranking tunables. Results are ordered by score
 // alone, then by document key. Everything is computed from keys, tails and
 // positions: the index holds no text.
 const (
@@ -58,7 +58,7 @@ const (
 
 	// A term matched by the text also earns its rarity:
 	// round(IDFWeight · ln(N/df)), at most IDFMax: any word in under 1.8 % of
-	// the documents is rare enough (PLAN_BENCH.md 11: 8 ranks better than 15).
+	// the documents is rare enough (the benchmark ranks better with 8 than 15).
 	IDFWeight = 2
 	IDFMax    = 8
 )
@@ -99,12 +99,12 @@ func (k keyKind) near() bool { return k == longerKey || k == shorterKey }
 // classifyKey says how a dictionary key matches term t. fuzzy enables the
 // typo match for this term (the engine enables it only for terms the
 // dictionary does not have). A typo is never in the first two letters: the
-// key must be in the term's bucket (PLAN_BUCKETS.md §6.1).
+// key must be in the term's bucket.
 //
 // A one-letter term matches only its continuations, and no other term
 // matches a continuation: talla›m is neither a prefix nor a typo of talla. A
 // signature term matches only signatures, and a word only words and group
-// words (§17).
+// words.
 func (t *Term) classifyKey(k key5.Key, fuzzy bool, scratch []uint8) (keyKind, uint8) {
 	switch {
 	case t.virtual():
@@ -177,7 +177,7 @@ func (t *Term) classifyKey(k key5.Key, fuzzy bool, scratch []uint8) (keyKind, ui
 	return noKey, 0
 }
 
-// nearKey reports a near word (PLAN_BUCKETS.md §19): one whose letters are
+// nearKey reports a near word: one whose letters are
 // those of the term with 1 more or fewer at the end ("bolsas", "bolsa"), or
 // "es" more or fewer ("pan", "panes"), the shorter of the two of
 // NearMinLetters or more. It
@@ -296,8 +296,8 @@ type docScore struct {
 //
 // When the query has words besides those the document's group matched (the
 // run of its best signature), it is a name and a group, and the words of the
-// run count once: by the text or by the group, whichever earns more
-// (PLAN_BUCKETS.md §17.5). For "hidratante cuidado corporal", "Crema corporal
+// run count once: by the text or by the group, whichever earns more.
+// For "hidratante cuidado corporal", "Crema corporal
 // @ cuidado corporal" does not earn "corporal" twice, and "Crema hidratante @
 // cuidado corporal" ranks first. When the group matched the whole query, the
 // text and the group both count: a member whose name says it too ranks first.
@@ -525,7 +525,7 @@ type ranked struct {
 
 // idfs is the rarity bonus of every term. df of a term is the sum, over the
 // keys of the dictionary that match it, of the documents with the key: known
-// from the dictionary alone, without reading a list (PLAN_BUCKETS.md §6.2).
+// from the dictionary alone, without reading a list.
 // docs is the documents the dictionary describes.
 func idfs(df []int, docs int) []uint32 {
 	idf := make([]uint32, len(df))

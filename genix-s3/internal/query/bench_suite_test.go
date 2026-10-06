@@ -27,7 +27,7 @@ import (
 	"github.com/ivanjoz/genix-search/genix-s3/internal/normalize"
 )
 
-// TestBench is the standard benchmark of PLAN_BENCH.md: how well the engine
+// TestBench is the standard benchmark: how well the engine
 // finds (against relevance judgments and against BM25) and what it reads from
 // S3 (requests, bytes and rounds, cold and warm), on a fixed corpus of 10 010
 // products and 200 fixed queries. It writes testdata/bench/report.md and
@@ -423,7 +423,7 @@ type benchCost struct {
 	OtherBytes int64 `json:"other_bytes"`
 }
 
-// metrics of one ranking of one query (PLAN_BENCH.md 6).
+// metrics of one ranking of one query.
 type benchMetrics struct {
 	Top       []int   `json:"top"`
 	HasTarget bool    `json:"-"`
@@ -534,7 +534,7 @@ type benchResult struct {
 	Warm   benchCost     `json:"warm"`
 }
 
-// benchRow is the average of a set of results (PLAN_BENCH.md 8).
+// benchRow is the average of a set of results.
 type benchRow struct {
 	N       int `json:"n"`
 	Targets int `json:"targets"`
@@ -702,7 +702,7 @@ func (o benchOutput) write(path string) error {
 
 func TestBench(t *testing.T) {
 	if os.Getenv("GXS_BENCH") == "" {
-		t.Skip("set GXS_BENCH=1 (PLAN_BENCH.md)")
+		t.Skip("set GXS_BENCH=1")
 	}
 
 	ctx := context.Background()
@@ -857,8 +857,8 @@ func TestBench(t *testing.T) {
 	checkBaseline(t, out, filepath.Join(benchDir, "baseline"+suffix+".json"))
 }
 
-// checkBaseline fails when the result is worse than the accepted one
-// (PLAN_BENCH.md 7): the global nDCG@10 or MRR down by more than 0.01, a
+// checkBaseline fails when the result is worse than the accepted one:
+// the global nDCG@10 or MRR down by more than 0.01, a
 // category by more than 0.03, or the cold GETs or KB (p50) up by more than 5 %.
 func checkBaseline(t *testing.T, out benchOutput, path string) {
 	t.Helper()
@@ -943,7 +943,7 @@ func benchReport(out benchOutput, dbs map[string]*benchDB) string {
 
 	names := map[string]string{"A": "A: nombres", "B": "B: nombres + grupos (categoría)"}
 
-	fmt.Fprintf(&b, "# Benchmark de genix-s3 (PLAN_BENCH.md)\n\nIDs: %s. Corpus: %d productos, %d consultas. Se genera con `GXS_BENCH=1 go test ./internal/query -run Bench -v`.\n\n",
+	fmt.Fprintf(&b, "# Benchmark de genix-s3\n\nIDs: %s. Corpus: %d productos, %d consultas. Se genera con `GXS_BENCH=1 go test ./internal/query -run Bench -v`.\n\n",
 		out.IDs, len(dbs["A"].docs), len(distinctQueries(out.Queries)))
 
 	b.WriteString("Efectividad contra los juicios de relevancia (qrels): S@1, S@10 y MRR sobre las consultas con objetivo; nDCG@10 y P@10 sobre todas salvo las negativas; " +

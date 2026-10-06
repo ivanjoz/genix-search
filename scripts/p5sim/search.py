@@ -1,4 +1,4 @@
-# Measurements for the search-oriented 5-bit layout (PLAN_5BIT.md).
+# Measurements for the search-oriented 5-bit layout.
 import sys, os, re, math, collections
 sys.path.insert(0, os.path.dirname(__file__))
 from norm import docs

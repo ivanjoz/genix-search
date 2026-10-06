@@ -1,4 +1,4 @@
-# Requests and bytes READ per query for PLAN_5BIT.md section 6 (run from the repo root).
+# Requests and bytes READ per query (run from the repo root).
 # IDs are arbitrary uint32 (random), never dense. 3000 queries of 2-3 words taken from catalogue docs.
 import sys, os, random, collections, math
 sys.path.insert(0, os.path.dirname(__file__))
@@ -19,7 +19,7 @@ post = collections.defaultdict(list)                       # key -> [(id, pos)]
 for i, ks in enumerate(DT):
     for p, k in enumerate(ks): post[k].append((IDS[i], min(p, 15), i))
 
-# ---- size of one posting list (plan 5.2), first ID in the dictionary
+# ---- size of one posting list (INTERNALS.md §7.1), first ID in the dictionary
 def nib(v):
     n = 1
     while v >= 8: v >>= 3; n += 1

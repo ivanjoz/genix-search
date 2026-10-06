@@ -44,13 +44,13 @@ CROSS_VERSION="${CROSS_VERSION:-0.2.5}"
 # The layout is not cosmetic: `install_service.py` resolves the reference
 # config as `<script>/../genixsearch.cfg`, so it has to stay one directory
 # below the config to work straight out of the tarball. In the repo the config
-# lives in server/, so it is the one file that changes place.
+# lives in server/, so it and the server docs are the files that change place.
 EXTRA_FILES=(
   server/genixsearch.cfg:genixsearch.cfg
   README.md
   LICENSE.md
-  CONFIGURATION.md
-  PROTOCOL.md
+  server/CONFIGURATION.md:CONFIGURATION.md
+  server/PROTOCOL.md:PROTOCOL.md
   scripts/install_service.py
 )
 

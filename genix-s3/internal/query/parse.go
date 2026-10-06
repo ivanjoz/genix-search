@@ -1,4 +1,3 @@
-// Package query answers a search from k, p and p.log (PLAN_5BIT.md §7).
 package query
 
 import (
@@ -23,12 +22,12 @@ type Term struct {
 	Auto     bool // the last word: also matches as a prefix
 	Explicit bool // `foo*`: matches only as a prefix, and is required
 	// Conts are the keys of a one-letter term: its continuation of every
-	// host word of the query (PLAN_BUCKETS.md §16). "m talla" looks for
+	// host word of the query. "m talla" looks for
 	// talla›m. Nil for any other term.
 	Conts []key5.Key
 	// Sig is set on a virtual term: the signature of a run of words of the
-	// query, which matches the documents of a group with those words
-	// (PLAN_BUCKETS.md §17.3). It adds to the score but is not a word.
+	// query, which matches the documents of a group with those words.
+	// It adds to the score but is not a word.
 	Sig *Signature
 }
 
@@ -187,7 +186,7 @@ func Parse(norm *normalize.Normalizer, input string) Parsed {
 }
 
 // signatures are the virtual terms of every run of 1 to key5.Segments words
-// of the query that does not start with a letter (PLAN_BUCKETS.md §17.3):
+// of the query that does not start with a letter:
 // the query does not know which words are a group, so it tries them all. A
 // signature lives in the slot of its first word, which the query reads
 // anyway. The open last word joins a run only with its segment complete:

@@ -1,4 +1,4 @@
-# Postings and dictionary sizes for PLAN_5BIT.md section 5.1-6.1 (run from the repo root).
+# Postings and dictionary sizes (run from the repo root).
 import sys, json, random; sys.argv = ['x']
 g = {'__file__': __import__('os').path.join(__import__('os').path.dirname(__file__), 'search.py')}
 exec(open(__import__('os').path.join(__import__('os').path.dirname(__file__), 'search.py')).read().replace('print(', '(lambda *a, **k: None)('), g)

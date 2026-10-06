@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PLAN_BENCH.md 4: the 200 queries -> genix-s3/testdata/bench/queries.tsv.
+"""The 200 queries -> genix-s3/testdata/bench/queries.tsv.
 
     python3 scripts/bench/queries.py
 

@@ -184,7 +184,7 @@ func assemble(terms []Term, p *readPlan, data *dbData, pending map[docid.Key]plo
 // shortHeads returns the words read through their head whose head may hide a
 // document that belongs in the first need results: the head's last entry,
 // scored as a document with only that word, does not rank below the result
-// number need (PLAN_BUCKETS.md §6.1, step 6).
+// number need.
 func shortHeads(terms []Term, p *readPlan, idf []uint32, results []ranked, need int) []*pick {
 	explicit := -1
 
@@ -228,7 +228,7 @@ func headBounds(t *Term, u use, exp *bucket.Expansion, idf uint32) []ranked {
 
 	// A match of the text also earns its first position, its place in the
 	// query and its rarity; a group word or a signature earns the same in
-	// every document, and its head goes by key (PLAN_BUCKETS.md §17.5).
+	// every document, and its head goes by key.
 	bound := func(g *bucket.Group, base uint32, text bool) {
 		if g == nil || g.Complete() || len(g.Entries) == 0 {
 			return

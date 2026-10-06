@@ -61,7 +61,7 @@ func Distance(a, b []uint8, budget int) (int, bool) {
 // KeyDistance compares a dictionary key with the whole query word (all its
 // letters, not cut at 8). A key of 8 letters may be a longer word cut short,
 // so it is compared with the query's prefixes of 8−budget to 8+budget
-// letters and the best is kept (PLAN_5BIT.md §7.4): "chocoate" is one edit
+// letters and the best is kept: "chocoate" is one edit
 // from the key "chocolat".
 func KeyDistance(key, query []uint8, budget int) (int, bool) {
 	if len(key) < MaxUnits {

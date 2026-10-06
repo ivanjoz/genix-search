@@ -82,7 +82,7 @@ func AppendSlot(w *bits.Writer, keys []Key) ([]uint32, error) {
 
 // AppendBucket writes the keys of one slot and one space as AppendSlot does,
 // without restarts: what a bucket's dictionary holds, which is always decoded
-// whole (PLAN_BUCKETS.md §2.2). ReadSlot reads it.
+// whole. ReadSlot reads it.
 func AppendBucket(w *bits.Writer, keys []Key) error {
 	var prev Key
 
@@ -114,9 +114,9 @@ func AppendBucket(w *bits.Writer, keys []Key) error {
 
 // AppendKeys writes keys of any slot and space, sorted and distinct,
 // front-coded: a bit set when some keys are not words, and then how many
-// group words and signatures end the keys (nibble varints; PLAN_BUCKETS.md
-// §17.2); then per key the units it shares with the previous one (3 bits), its
-// units − 1 (3 bits), and its other units (§2.2).
+// group words and signatures end the keys (nibble varints); then per key the
+// units it shares with the previous one (3 bits), its
+// units − 1 (3 bits), and its other units.
 func AppendKeys(w *bits.Writer, keys []Key) error {
 	var spaces [Spaces]uint64
 
@@ -271,15 +271,15 @@ func ReadSlot(r *bits.Reader, slot uint16, space Space, n int) ([]Key, error) {
 	return keys, nil
 }
 
-// Header units of the token stream that mark the space of the next token
-// (PLAN_BUCKETS.md §17.2). A group word follows its mark as a word or a
+// Header units of the token stream that mark the space of the next token.
+// A group word follows its mark as a word or a
 // number does; a signature follows its mark as its length and its units.
 const (
 	GroupWordMark uint8 = 30
 	SignatureMark uint8 = 31
 )
 
-// AppendTokens writes a document's tokens (PLAN_5BIT.md §5.4): per token a
+// AppendTokens writes a document's tokens: per token a
 // header unit (1..8 = a word of that many letters, NUM_1..NUM_3 = a number,
 // after GroupWordMark or SignatureMark for the group's tokens) and its units,
 // then End, then a 2-bit tail per word of the text of 8 letters, then padding

@@ -17,7 +17,7 @@ import (
 	"github.com/ivanjoz/genix-search/genix-s3/internal/postings"
 )
 
-// Params tune how specific the index gets (PLAN_BUCKETS.md §5, §11). A
+// Params tune how specific the index gets. A
 // reader needs none of them: the .idx says what was expanded.
 type Params struct {
 	// T = max(MinSplit, √(ExpandCost × D)), D being the bytes of every list
@@ -31,7 +31,7 @@ type Params struct {
 	// co-keys share blocks by prefix.
 	ComboDictBudget int
 	// GroupWordDocs is the documents of each group whose group words are
-	// indexed: those of the smallest keys (PLAN_BUCKETS.md §17.1). 0 means
+	// indexed: those of the smallest keys. 0 means
 	// the default.
 	GroupWordDocs int
 }
@@ -104,7 +104,7 @@ func (b *Built) EncodeIdx(m Meta, dbETag string) []byte {
 }
 
 // Tombstone is the .idx of a bucket left without keys: a reader tells it
-// from a bucket that never existed (PLAN_BUCKETS.md §7).
+// from a bucket that never existed.
 func Tombstone(m Meta) []byte {
 	return encodeIdx(m, 0, "", 0, DBHeader, [5][]byte{})
 }
@@ -204,7 +204,7 @@ func Build(docs []Doc, prev map[key5.Key]bool, p Params, g *layout.Grouping) (*R
 	}
 
 	// By group, and within a group in the order of the keys: by space, then
-	// slot (PLAN_BUCKETS.md §17.2).
+	// slot.
 	slices.SortFunc(keys, func(a, b key5.Key) int {
 		return cmp.Or(cmp.Compare(g.Of(a.Slot()), g.Of(b.Slot())), cmp.Compare(a, b))
 	})
@@ -267,7 +267,7 @@ func Build(docs []Doc, prev map[key5.Key]bool, p Params, g *layout.Grouping) (*R
 }
 
 // CapGroupWords keeps the group words of the first n documents of each group,
-// in key order, and drops those of the rest (PLAN_BUCKETS.md §17.4): a group
+// in key order, and drops those of the rest: a group
 // is the sequence of its group words and its signature. n ≤ 0 means the
 // default. docs is not modified.
 func CapGroupWords(docs []Doc, n int) []Doc {
@@ -669,7 +669,7 @@ func groupByDoc(list []postings.Posting) []postings.Entry {
 // rank is the order of a head: documents where the word comes first, then
 // second, then the rest — the position bonus of a query of that word alone
 // — and by key within each. A group word or a signature scores the same
-// wherever it is (PLAN_BUCKETS.md §17.5): its head goes by key alone.
+// wherever it is: its head goes by key alone.
 func rank(k key5.Key, pos uint8) uint8 {
 	if k.Space() != key5.SpaceWord {
 		return 0
@@ -693,7 +693,7 @@ func FirstPos(e *postings.Entry, t uint8) (pos uint8, ok bool) {
 }
 
 // heads builds the groups of an expanded word: every document, and with two
-// tails or more one group per tail (PLAN_BUCKETS.md §3.3).
+// tails or more one group per tail.
 func (b *builder) heads(w *word, entries []postings.Entry) []Group {
 	tails := map[uint8]bool{}
 	for _, p := range w.list {

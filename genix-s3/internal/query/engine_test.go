@@ -332,7 +332,7 @@ func TestExtraLetters(t *testing.T) {
 }
 
 // TestNearWords: a word finds those with 1 or 2 letters more or fewer at the
-// end, below the word itself (PLAN_BUCKETS.md §19), wherever it is in the
+// end, below the word itself, wherever it is in the
 // query.
 func TestNearWords(t *testing.T) {
 	docs := []collection.Doc{
@@ -406,7 +406,7 @@ func TestQueryFirstWord(t *testing.T) {
 }
 
 // TestGroupCountsOnce: the words of the query that the document's group
-// matched count once, by the text or by the group (PLAN_BUCKETS.md §17.5),
+// matched count once, by the text or by the group,
 // and the group never lowers a score.
 func TestGroupCountsOnce(t *testing.T) {
 	docs := []collection.Doc{
@@ -1271,7 +1271,7 @@ func TestRegroupEngine(t *testing.T) {
 }
 
 // TestTextGroups: a group adds to the score of a search that names it, below
-// the text (PLAN_BUCKETS.md §17): the signature finds every member, the group
+// the text: the signature finds every member, the group
 // words the first ones of each group, and neither costs a request.
 func TestTextGroups(t *testing.T) {
 	docs := []collection.Doc{
@@ -1303,7 +1303,7 @@ func TestTextGroups(t *testing.T) {
 		return 0
 	}
 
-	// The example of PLAN_BUCKETS.md §17.5, plus the rarity of each word.
+	// The worked ranking example, plus the rarity of each word.
 	resp := search(t, e, "juan carlos centro civico", false)
 	if got := ids(resp.Hits); !slices.Equal(got, []uint32{1, 2, 3, 4, 5}) {
 		t.Fatalf("order %v", resp.Hits)

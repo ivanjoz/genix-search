@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PLAN_BENCH.md 14: 25 queries of the category `plural` -> appended to
+"""25 queries of the category `plural` -> appended to
 genix-s3/testdata/bench/queries.tsv as q201..q225.
 
     python3 scripts/bench/queries_plural.py

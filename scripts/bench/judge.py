@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PLAN_BENCH.md 5.2: grade every document for every query with a rule over the
+"""Grade every document for every query with a rule over the
 whole text (no 8-letter cut, no engine) -> genix-s3/testdata/bench/qrels.tsv.
 
     python3 scripts/bench/judge.py

@@ -34,7 +34,7 @@ import (
 // the index grouped. GXS_EVAL_ORIGINS=n spreads the documents at random over n
 // origins (n tables in one index), each with its own IDs: dense 1..N per
 // origin, or random. GXS_EVAL_TEXTGROUPS=n gives 2 of every 3 documents one
-// of n synthetic groups (PLAN_BUCKETS.md §17), and measures the queries that
+// of n synthetic groups, and measures the queries that
 // name it.
 func TestEval(t *testing.T) {
 	path := os.Getenv("GXS_EVAL_CSV")
@@ -603,7 +603,7 @@ func (f *fullText) matches(t *Term, tok string) (matchKind, uint8) {
 		}
 	}
 
-	// A near word (§19), with every letter.
+	// A near word, with every letter.
 	if t.Explicit || t.Number || normalize.IsNumber(tok) || t.letter() || t.virtual() {
 		return noMatch, 0
 	}

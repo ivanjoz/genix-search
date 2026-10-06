@@ -1,4 +1,4 @@
-// Package tokens is the tokens object of a partition (PLAN_BUCKETS.md §1, §8):
+// Package tokens is the tokens object of a partition:
 // the document → tokens state the index was built from, the expanded words and the
 // hash of every bucket. Only the compaction reads it, to know what a changed
 // document had and which buckets it has to rewrite; queries never do.

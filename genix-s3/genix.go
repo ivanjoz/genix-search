@@ -1,5 +1,5 @@
 // Package genix is a search index on S3 Express One Zone that returns ranked
-// IDs (PLAN_5BIT.md for the keys, PLAN_BUCKETS.md for the index). Words are
+// IDs. Words are
 // their first 8 letters in 5-bit units and numbers are their binary value;
 // the index stores document keys (origin and ID) and those keys, never text. A query reads p.log and
 // the index of the buckets of its words, <xy>.idx, in one round, and the
@@ -93,7 +93,7 @@ type Config struct {
 }
 
 // Grouping is how the index groups the 2-letter slots of its keys into
-// objects, a .idx and a .db per group (PLAN_BUCKETS.md §14). Fewer, bigger
+// objects, a .idx and a .db per group. Fewer, bigger
 // objects: fewer to write per compaction and to keep cached, more bytes per
 // .idx a search reads.
 type Grouping uint8

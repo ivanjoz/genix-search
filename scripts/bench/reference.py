@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PLAN_BENCH.md 3 and 5.1: the SQLite FTS5 reference databases and their top 10
+"""The SQLite FTS5 reference databases and their top 10
 -> genix-s3/bench/db/{names,groups}.sqlite and genix-s3/testdata/bench/reference.tsv
 
     python3 scripts/bench/reference.py

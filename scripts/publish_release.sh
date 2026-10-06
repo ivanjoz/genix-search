@@ -209,8 +209,8 @@ trap 'rm -f "$notes"' EXIT INT TERM
   echo "sha256sum -c SHA256SUMS --ignore-missing"
   echo '```'
   echo
-  echo "See [PACKAGING.md](https://github.com/$repo/blob/main/PACKAGING.md) for the"
-  echo "manual route and [CONFIGURATION.md](https://github.com/$repo/blob/main/CONFIGURATION.md)"
+  echo "See [PACKAGING.md](https://github.com/$repo/blob/main/server/PACKAGING.md) for the"
+  echo "manual route and [CONFIGURATION.md](https://github.com/$repo/blob/main/server/CONFIGURATION.md)"
   echo "for every config knob."
 } >"$notes"
 

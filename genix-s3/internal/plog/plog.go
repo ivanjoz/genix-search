@@ -1,9 +1,9 @@
-// Package plog is p.log, the change log every query reads (PLAN_5BIT.md §5.4,
-// PLAN_BUCKETS.md §7). It is plain bytes: a fixed Base, then one frame per
+// Package plog is p.log, the change log every query reads. It is plain
+// bytes: a fixed Base, then one frame per
 // append. It holds no text: each op carries the document's key (its origin and
 // ID, docid) and its 5-bit tokens.
 //
-// A collection under the index threshold (PLAN_5BIT.md §5.8) has no index:
+// A collection under the index threshold has no index:
 // its Base is flagged LogOnly and is followed by one Docs frame with every
 // document as of Base.LastSeq.
 package plog

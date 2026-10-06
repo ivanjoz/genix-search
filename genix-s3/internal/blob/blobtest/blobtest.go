@@ -1,5 +1,5 @@
 // Package blobtest is the contract every blob.Blob must meet: the semantics
-// the writer and the compaction rely on (PLAN_5BIT.md §8). It runs against the
+// the writer and the compaction rely on. It runs against the
 // local store in unit tests and against a real bucket in the S3 integration
 // test, so both are held to the same rules.
 package blobtest

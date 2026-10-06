@@ -46,7 +46,7 @@ func TestContract(t *testing.T) {
 }
 
 // TestLatency logs the round trip of each operation the writer and the query
-// use: what one round of PLAN_5BIT.md §7.2 costs on this bucket.
+// use: what one round of a search costs on this bucket.
 func TestLatency(t *testing.T) {
 	store, prefix := testStore(t)
 	ctx := context.Background()

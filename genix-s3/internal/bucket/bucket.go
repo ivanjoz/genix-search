@@ -2,7 +2,7 @@
 // (one slot, the keys that share their first two letters, unless the
 // collection is grouped): <xy>.idx, the dictionary with the small lists, the
 // heads and the combinations directory, and <xy>.db, the lists that do not
-// fit in it (PLAN_BUCKETS.md §3–4, §14). Both are plain bytes; every offset
+// fit in it. Both are plain bytes; every offset
 // is computed from sizes, never stored per key.
 package bucket
 
@@ -24,7 +24,7 @@ import (
 const Format uint16 = 4
 
 // spaceShift places the space of a run of keys above its slot in the slot
-// directory (PLAN_BUCKETS.md §17.2): a slot takes 10 bits.
+// directory: a slot takes 10 bits.
 const spaceShift = 14
 
 const (
@@ -75,7 +75,7 @@ func (w *Word) Bytes() (off, end uint64) {
 }
 
 // Group is a head: the first documents of a word in the order of a query of
-// that word alone (PLAN_BUCKETS.md §3.3–3.4).
+// that word alone.
 type Group struct {
 	Tail    uint8  // the tail of the documents in it, or AllTails
 	Total   uint32 // documents of the group, Entries being the first of them
@@ -200,7 +200,7 @@ func (x *Index) read(w *Word, data []byte, at uint64, dst []postings.Posting) ([
 
 // ReadMeta reads the version of a .idx from its header alone: a reader
 // decides from it whether the bucket belongs to the p.log it read, before it
-// decodes the rest (PLAN_BUCKETS.md §7).
+// decodes the rest.
 func ReadMeta(data []byte) (Meta, error) {
 	if len(data) < IdxHeader || string(data[:4]) != idxMagic {
 		return Meta{}, fmt.Errorf("%w: not a .idx", ErrCorrupt)

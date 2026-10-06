@@ -1,5 +1,4 @@
-// Package query answers a search from p.log and the buckets of the index
-// (PLAN_BUCKETS.md §6–7, §10).
+// Package query answers a search from p.log and the buckets of the index.
 package query
 
 import (
@@ -39,7 +38,7 @@ type Options struct {
 	CacheBytes int64
 	// RoundLimit: a cold first round, p.log and the .idx read together, that
 	// takes longer is repeated. It must stay below the writers'
-	// CompactSpacing (PLAN_BUCKETS.md §7).
+	// CompactSpacing.
 	RoundLimit time.Duration
 }
 
@@ -372,7 +371,7 @@ func (e *Engine) attempt(ctx context.Context, q Parsed, req Request, resp *Respo
 
 // answer assembles the candidates, ranks them and checks the ranking is
 // exact; when a head left room for a document it did not show, it reads the
-// whole list of that word and ranks again (PLAN_BUCKETS.md §6.1, step 6).
+// whole list of that word and ranks again.
 func (e *Engine) answer(ctx context.Context, q Parsed, req Request, p *readPlan, data *dbData, log *plog.Log, docs int, resp *Response, c *counters) error {
 	limit := req.Limit
 	if limit <= 0 {
@@ -467,7 +466,7 @@ func (e *Engine) fetchIdx(ctx context.Context, col layout.Collection, group uint
 }
 
 // validate decides whether an .idx read belongs to the p.log base read with
-// it (PLAN_BUCKETS.md §7). It returns the decoded index, nil for an empty
+// it. It returns the decoded index, nil for an empty
 // bucket, or errStale.
 func (e *Engine) validate(f fetched, base plog.Base, grouping *layout.Grouping) (*bucket.Index, error) {
 	touched := base.Touched.Has(int(f.group))
