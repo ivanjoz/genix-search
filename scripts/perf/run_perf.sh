@@ -5,19 +5,20 @@
 # runs three progressive PUSHI/QUERY phases against a sample of Spanish
 # product names (shipped in-repo at scripts/perf/data/productos.csv). All
 # logs (server log + per-phase ingest/query traces) land under
-# data/perf-logs/.
+# server/data/perf-logs/.
 #
 # Usage:
 #   scripts/perf/run_perf.sh                 # default 1k / 10k / 50k phases
 #   N1=2000 N2=20000 N3=80000 scripts/perf/run_perf.sh  # custom sizes
 #   CSV=/path/to/products.csv scripts/perf/run_perf.sh  # use an external CSV
-#   KEEP_DATA=1 scripts/perf/run_perf.sh     # preserve data/perf-store across runs
+#   KEEP_DATA=1 scripts/perf/run_perf.sh     # preserve server/data/perf-store across runs
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-cd "$ROOT_DIR"
+SERVER_DIR="$ROOT_DIR/server"
+cd "$SERVER_DIR"
 
 CSV="${CSV:-$SCRIPT_DIR/data/productos.csv}"
 N1="${N1:-1000}"
@@ -30,11 +31,11 @@ COLLECTION="${COLLECTION:-products}"
 BUCKET="${BUCKET:-all}"
 KEEP_DATA="${KEEP_DATA:-0}"
 
-DATA_DIR="$ROOT_DIR/data/perf-store"
-LOG_DIR="$ROOT_DIR/data/perf-logs"
+DATA_DIR="$SERVER_DIR/data/perf-store"
+LOG_DIR="$SERVER_DIR/data/perf-logs"
 CONFIG="$SCRIPT_DIR/genixsearch.cfg"
 CLIENT="$SCRIPT_DIR/perf_client.py"
-BIN="$ROOT_DIR/target/release/genixsearch"
+BIN="$SERVER_DIR/target/release/genixsearch"
 
 bold() { printf '\033[1m%s\033[0m\n' "$*"; }
 hr()   { printf '%.0s-' {1..78}; echo; }

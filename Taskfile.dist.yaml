@@ -9,6 +9,7 @@ tasks:
   doc:open:
     desc: Build and open Cargo docs.
     aliases: [doc]
+    dir: server
     cmd: cargo doc --no-deps --lib --open
 
   perf:
@@ -45,6 +46,7 @@ tasks:
 
   ci:
     desc: Runs all CI checks.
+    dir: server
     cmds:
       - task: lint:deps
       - cargo fmt --check
@@ -54,6 +56,7 @@ tasks:
 
   lint:deps:
     desc: Lints the dependency graph (advisories, licenses, supply-chain).
+    dir: server
     cmd: cargo deny check --show-stats
     sources:
       - Cargo.toml
@@ -66,7 +69,7 @@ tasks:
     desc: Lints Markdown files. You can pass a rule name to check it individually.
     aliases: [lint:md:*]
     silent: true
-    cmd: markdownlint-cli2 '**/*.md' '!target' '!LICENSE.md' 2>&1{{ if .MATCH }} | { ! grep {{ index .MATCH 0 }}; }{{ end }}
+    cmd: markdownlint-cli2 '**/*.md' '!server/target' '!LICENSE.md' 2>&1{{ if .MATCH }} | { ! grep {{ index .MATCH 0 }}; }{{ end }}
     preconditions:
       - sh: command -v markdownlint-cli2 >/dev/null
         msg: "`markdownlint-cli2` is required. See <https://github.com/DavidAnson/markdownlint-cli2#install>."
@@ -77,6 +80,7 @@ tasks:
     preconditions:
       - sh: command -v cargo-watch >/dev/null 2>&1
         msg: "Install `cargo-watch` using `cargo install cargo-watch`."
+    dir: server
     cmds:
       - task: doc:open
       - cmd: cargo watch -x 'doc --no-deps --lib'

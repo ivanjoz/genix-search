@@ -57,7 +57,7 @@ command -v gh >/dev/null 2>&1 \
   || die "the GitHub CLI (gh) is required: https://cli.github.com"
 
 if [ -z "$version" ]; then
-  version="v$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT_DIR/Cargo.toml" | head -1)"
+  version="v$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT_DIR/server/Cargo.toml" | head -1)"
   [ "$version" != "v" ] || die "could not read the version from Cargo.toml"
 fi
 case "$version" in v*) ;; *) version="v$version" ;; esac

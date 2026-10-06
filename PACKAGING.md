@@ -63,7 +63,7 @@ Releases are built on a developer machine and uploaded to GitHub. Nothing is
 compiled in CI: RocksDB comes from source for all three targets, which is far
 too heavy for a hosted runner.
 
-1. Bump the version in `Cargo.toml` (`[package] version = ...`) following
+1. Bump the version in `server/Cargo.toml` (`[package] version = ...`) following
    [Semantic Versioning](https://semver.org/), and commit.
 2. Build all three targets — expect this to take a while:
 
@@ -102,7 +102,7 @@ gh auth switch --user <owner>
 artefacts on any machine with `cargo` and Docker or Podman:
 
 ```sh
-scripts/release_binaries.sh                          # all three, version from Cargo.toml
+scripts/release_binaries.sh                          # all three, version from server/Cargo.toml
 scripts/release_binaries.sh --build=linux-arm64-ampere
 scripts/release_binaries.sh --version=v0.2.0 --out=./dist --keep-dirs
 ```
@@ -135,10 +135,10 @@ Three build details matter and are easy to get wrong by hand:
   threads that take the libc default. musl seeds that default from the ELF
   `PT_GNU_STACK` header, so linking with a 2 MiB stack covers them.
 
-For a plain local build, `cargo build --release --bin genixsearch` still
-produces a dynamically linked `./target/release/genixsearch` against the host's
+For a plain local build, `cargo build --release --bin genixsearch` (run in `server/`) still
+produces a dynamically linked `server/target/release/genixsearch` against the host's
 glibc, which is fine for development. Container packaging is covered by the
-[`Dockerfile`](./Dockerfile).
+[`server/Dockerfile`](./server/Dockerfile); build it with `docker build server`.
 
 ## systemd
 
@@ -192,7 +192,7 @@ from source, so the host needs a C/C++ toolchain and libclang on top of rustup,
 or a bare Rust install fails with `linker cc not found`. The script detects and
 installs them via `dnf`, `apt-get`, `zypper`, `pacman` or `apk`; pass
 `--no-install-build-deps` to fail with instructions instead. That build runs as
-`$SUDO_USER`, so `target/` does not become root-owned.
+`$SUDO_USER`, so `server/target/` does not become root-owned.
 
 Use `--name`/`--config-dir`/`--data-dir` to run several instances side by side.
 Re-running the installer overwrites the unit but keeps an existing config unless

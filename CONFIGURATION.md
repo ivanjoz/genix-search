@@ -3,7 +3,7 @@
 ## Sources
 
 GenixSearch reads its configuration as [TOML]. The default path is
-`./genixsearch.cfg`. Pass `--config <path>` (or `-c`) to override.
+`./genixsearch.cfg` (the reference copy is `server/genixsearch.cfg`). Pass `--config <path>` (or `-c`) to override.
 
 Every key can also be supplied through `GENIXSEARCH_` environment
 variables, which take precedence over the static file. The TOML path

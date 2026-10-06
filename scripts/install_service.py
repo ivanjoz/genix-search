@@ -59,9 +59,13 @@ try:
 except NameError:  # pragma: no cover - only when read from stdin
     REPO_ROOT = pathlib.Path.cwd()
 
+# In a checkout the Rust crate (Cargo.toml, genixsearch.cfg, target/) lives in
+# server/; an unpacked release tarball has the config at its root instead.
+SERVER_DIR = REPO_ROOT / "server" if (REPO_ROOT / "server" / "Cargo.toml").is_file() else REPO_ROOT
+
 # Only present when running from a checkout or an unpacked release tarball;
 # otherwise the reference config comes from the downloaded release.
-SOURCE_CONFIG = REPO_ROOT / "genixsearch.cfg"
+SOURCE_CONFIG = SERVER_DIR / "genixsearch.cfg"
 
 DEFAULT_NAME = "genixsearch"
 DEFAULT_PREFIX = pathlib.Path("/usr/local")
@@ -635,9 +639,9 @@ def cargo_build(args: argparse.Namespace) -> pathlib.Path:
         env["PATH"] = f"{home}/.cargo/bin:{env.get('PATH', '/usr/bin:/bin')}"
 
     log(f"building genixsearch ({args.profile}{f', {args.target}' if args.target else ''})")
-    run(cmd, dry_run=args.dry_run, user=user, cwd=REPO_ROOT, env=env)
+    run(cmd, dry_run=args.dry_run, user=user, cwd=SERVER_DIR, env=env)
 
-    out = REPO_ROOT / "target"
+    out = SERVER_DIR / "target"
     if args.target:
         out = out / args.target
     binary = out / args.profile / DEFAULT_NAME

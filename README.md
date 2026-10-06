@@ -57,13 +57,16 @@ how to reproduce the release builds locally.
 ## Quick start
 
 ```sh
+# the Rust server lives in server/
+cd server
+
 # build (debug)
 cargo build
 
 # build (release)
 cargo build --release
 
-# run with the default genixsearch.cfg in the working directory
+# run with the default genixsearch.cfg (server/genixsearch.cfg)
 ./target/release/genixsearch -c ./genixsearch.cfg
 ```
 
@@ -102,7 +105,7 @@ The repository ships a scripted perf rig that drives the TCP protocol with
 
 It builds a release binary, boots it against a clean data dir, runs three
 progressive PUSHI/QUERY phases (1k → 10k → 50k), and writes per-phase logs
-under `data/perf-logs/`. See the comments at the top of the script for
+under `server/data/perf-logs/`. See the comments at the top of the script for
 overridable env vars.
 
 ## Documentation

@@ -9,7 +9,10 @@
 
 ## Build, run, test
 
+The Rust server lives in `server/`; run every `cargo` command from there.
+
 ```sh
+cd server
 cargo build               # debug
 cargo build --release     # optimised
 cargo run -- -c ./genixsearch.cfg
@@ -24,7 +27,7 @@ For the protocol-level perf rig:
 
 It rebuilds release, starts `genixsearch`, runs three progressive PUSHI +
 QUERY phases against a Spanish product-name CSV, and writes detailed logs
-under `data/perf-logs/`. Override sizes via `N1=`, `N2=`, `N3=` env vars.
+under `server/data/perf-logs/`. Override sizes via `N1=`, `N2=`, `N3=` env vars.
 
 ## Reporting issues
 

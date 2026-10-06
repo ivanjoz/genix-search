@@ -49,7 +49,7 @@ raw UTF-8 token:
    repeated consecutive letters (`aaa → a`).
 2. Split the normalised text into non-overlapping two-character pairs.
 3. Map each pair to a `u8` group code from the frequency-ordered table in
-   `src/pair/spanish_bigrams.rs`. Code `255` is reserved.
+   `server/src/pair/spanish_bigrams.rs`. Code `255` is reserved.
 4. Numeric runs consume two `u8` units: `[NUM_FLAG=255][bucket(value)]`.
    `bucket()` is a fixed quantiser with finer resolution for small numbers
    (steps of 1 up to 80, then 5, then 15, …, capped at code 254).
@@ -73,7 +73,7 @@ A worked example:
 ## 3. Indexing a document — `PUSHI`
 
 The protocol layer parses `PUSHI <collection> <bucket> <int32> "<text>"`
-and routes it into `Executor::pushi` (`src/executor/direct.rs`). The flow:
+and routes it into `Executor::pushi` (`server/src/executor/direct.rs`). The flow:
 
 1. `pair::encode_text(text)` produces a `Vec<EncodedWord>`.
 2. `pair::pair_entries(&words)` builds the adjacent and wrap pair list,
@@ -98,8 +98,8 @@ There is no full-collection scan.
 
 ## 4. Querying — `QUERY`
 
-`Executor::search` (`src/executor/search.rs`) handles every query. All
-scoring constants referenced below live in `src/executor/scoring.rs` —
+`Executor::search` (`server/src/executor/search.rs`) handles every query. All
+scoring constants referenced below live in `server/src/executor/scoring.rs` —
 that file is the single tuning surface. The high-level flow:
 
 1. `pair::encode_prefix_text(terms)` produces:
@@ -188,7 +188,7 @@ prefixes scoped to the `(col_hash, bucket_hash)` pair.
 
 ## 6. The tasker
 
-`src/tasker/runtime.rs` runs every 10 seconds. It does two things:
+`server/src/tasker/runtime.rs` runs every 10 seconds. It does two things:
 
 1. **Janitor.** Drops cached RocksDB handles whose `last_used` is older
    than `store.kv.pool.inactive_after`.
@@ -200,10 +200,10 @@ needs draining.
 
 ## 7. The connection layer
 
-`src/channel/listen.rs` accepts TCP connections, spawns one thread per
-client, hands off to `src/channel/handle.rs`. The handle waits for the
+`server/src/channel/listen.rs` accepts TCP connections, spawns one thread per
+client, hands off to `server/src/channel/handle.rs`. The handle waits for the
 `START` line, then dispatches each subsequent line to one of the three
-mode-specific dispatchers in `src/channel/command.rs`.
+mode-specific dispatchers in `server/src/channel/command.rs`.
 
 Each command runs synchronously. `QUERY` is the exception: it emits a
 `PENDING <id>` line first and then the `EVENT QUERY <id> <results>` line
@@ -214,14 +214,14 @@ worker pools later.
 
 ## 8. Where to look in the code
 
-* `src/pair/` — encoding, signatures, key builders, `PostingMeta`
+* `server/src/pair/` — encoding, signatures, key builders, `PostingMeta`
   pack/unpack, posting codec.
-* `src/store/kv.rs` — RocksDB pool, acquire/close, prefix scans,
+* `server/src/store/kv.rs` — RocksDB pool, acquire/close, prefix scans,
   reverse-ref helpers, replace/delete.
-* `src/executor/direct.rs` — `PUSHI` / `POPI`.
-* `src/executor/search.rs` — the query path, ranking glue.
-* `src/executor/scoring.rs` — every scoring constant and helper; the
+* `server/src/executor/direct.rs` — `PUSHI` / `POPI`.
+* `server/src/executor/search.rs` — the query path, ranking glue.
+* `server/src/executor/scoring.rs` — every scoring constant and helper; the
   one place to tune ranking weights.
-* `src/channel/command.rs` — protocol dispatcher.
-* `src/query/` — the typed `Query` enum + builder + dispatch shim.
+* `server/src/channel/command.rs` — protocol dispatcher.
+* `server/src/query/` — the typed `Query` enum + builder + dispatch shim.
 * `scripts/perf/` — perf rig that drives the TCP protocol end-to-end.

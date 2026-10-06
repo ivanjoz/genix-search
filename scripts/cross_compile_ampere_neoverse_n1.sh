@@ -10,7 +10,7 @@
 set -euo pipefail
 
 ABSPATH=$(cd "$(dirname "$0")"; pwd)
-BASE_DIR="$ABSPATH/../"
+BASE_DIR="$ABSPATH/../server"
 
 CROSS_VERSION="${CROSS_VERSION:-0.2.5}"
 CONTAINER_ENGINE="${CONTAINER_ENGINE:-podman}"

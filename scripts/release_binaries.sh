@@ -31,19 +31,22 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+SERVER_DIR="$ROOT_DIR/server"
 
 source "$SCRIPT_DIR"/util/die.sh
 source "$SCRIPT_DIR"/util/release_targets.sh
 
 CROSS_VERSION="${CROSS_VERSION:-0.2.5}"
 
-# Extra files shipped inside every tarball, at their repo-relative paths.
+# Extra files shipped inside every tarball, as `<repo path>:<tarball path>`
+# (the tarball path is the repo path when omitted).
 #
 # The layout is not cosmetic: `install_service.py` resolves the reference
-# config as `<script>/../../genixsearch.cfg`, so it has to stay one directory
-# below the config to work straight out of the tarball.
+# config as `<script>/../genixsearch.cfg`, so it has to stay one directory
+# below the config to work straight out of the tarball. In the repo the config
+# lives in server/, so it is the one file that changes place.
 EXTRA_FILES=(
-  genixsearch.cfg
+  server/genixsearch.cfg:genixsearch.cfg
   README.md
   LICENSE.md
   CONFIGURATION.md
@@ -77,7 +80,7 @@ for build in "${builds[@]}"; do
 done
 
 if [ -z "$version" ]; then
-  version="v$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT_DIR/Cargo.toml" | head -1)"
+  version="v$(sed -n 's/^version = "\(.*\)"$/\1/p' "$SERVER_DIR/Cargo.toml" | head -1)"
   [ "$version" != "v" ] || die "could not read the version from Cargo.toml"
 fi
 # Tags carry the `v`, `cargo` does not. Normalise on the tag spelling.
@@ -121,7 +124,7 @@ for build in "${builds[@]}"; do
       || rustup target add "$target"
   fi
 
-  target_dir="$ROOT_DIR/target/release-$build"
+  target_dir="$SERVER_DIR/target/release-$build"
   rustflags="${RUSTFLAGS-}"
   if [ "$target_cpu" != "-" ]; then
     rustflags="$rustflags -C target-cpu=$target_cpu"
@@ -169,7 +172,7 @@ for build in "${builds[@]}"; do
   log_info "  rustflags:  ${rustflags:-<none>}"
   [ -z "$jemalloc_lg_page" ] || log_info "  page size:  $((2 ** jemalloc_lg_page)) bytes (jemalloc --with-lg-page=$jemalloc_lg_page)"
 
-  env "${build_env[@]}" cross build --locked --release --target "$target" --bin genixsearch
+  ( cd "$SERVER_DIR" && env "${build_env[@]}" cross build --locked --release --target "$target" --bin genixsearch )
 
   binary="$target_dir/$target/release/genixsearch"
   [ -f "$binary" ] || die "build finished but no binary at $binary"
@@ -193,7 +196,7 @@ for build in "${builds[@]}"; do
   mkdir -p "$stage"
   install -m 0755 "$binary" "$stage/genixsearch"
   for extra in "${EXTRA_FILES[@]}"; do
-    install -D -m 0644 "$ROOT_DIR/$extra" "$stage/$extra"
+    install -D -m 0644 "$ROOT_DIR/${extra%%:*}" "$stage/${extra##*:}"
   done
   chmod 0755 "$stage/scripts/install_service.py"
 

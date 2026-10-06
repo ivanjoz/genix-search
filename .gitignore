@@ -6,9 +6,9 @@ dist/
 .cargo
 .task
 
-data/store/kv/*
-data/perf-store/*
-data/perf-logs/*
+server/data/store/kv/*
+server/data/perf-store/*
+server/data/perf-logs/*
 __pycache__/
 *.pyc
 
