@@ -7,7 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.33.6
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.113.4
 	github.com/aws/smithy-go v1.28.2
-	github.com/ivanjoz/colbin v0.3.1
+	github.com/ivanjoz/colbin v0.6.2
 )
 
 require (
